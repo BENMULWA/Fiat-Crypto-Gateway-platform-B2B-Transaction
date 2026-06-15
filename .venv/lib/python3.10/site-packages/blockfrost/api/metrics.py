@@ -1,0 +1,42 @@
+import requests
+from ..utils import request_wrapper
+
+
+@request_wrapper
+def metrics(self, **kwargs):
+    """
+    History of your Blockfrost usage metrics in the past 30 days.
+
+    https://docs.blockfrost.io/#tag/metrics/GET/metrics
+
+    :param return_type: Optional. "object", "json" or "pandas". Default: "object".
+    :type return_type: str
+    :returns A list of objects.
+    :rtype [Namespace]
+    :raises ApiError: If API fails
+    :raises Exception: If the API response is somehow malformed.
+    """
+    return requests.get(
+        url=f"{self.url}/metrics",
+        headers=self.default_headers
+    )
+
+
+@request_wrapper
+def metrics_endpoints(self, **kwargs):
+    """
+    History of your Blockfrost usage metrics per endpoint in the past 30 days.
+
+    https://docs.blockfrost.io/#tag/metrics/GET/metrics/endpoints
+
+    :param return_type: Optional. "object", "json" or "pandas". Default: "object".
+    :type return_type: str
+    :returns A list of objects.
+    :rtype [Namespace]
+    :raises ApiError: If API fails
+    :raises Exception: If the API response is somehow malformed.
+    """
+    return requests.get(
+        url=f"{self.url}/metrics/endpoints",
+        headers=self.default_headers
+    )
