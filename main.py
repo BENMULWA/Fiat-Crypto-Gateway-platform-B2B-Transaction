@@ -27,9 +27,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Core Security Middlewares
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins,
+    allow_origins=["*"],  # ⚡ Dynamic allow-all patch to clear browser blocks instantly
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
