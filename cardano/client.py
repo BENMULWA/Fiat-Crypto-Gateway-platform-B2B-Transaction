@@ -2,8 +2,10 @@ import importlib.util
 import sys
 from pathlib import Path
 
-# Resolve the real implementation file by going up to the repository root
-_src = Path(__file__).resolve().parents[2] / "cardano-USDA" / "client.py"
+# Fix the path layout to look inside the correct backend folder level
+current_dir = Path(__file__).resolve().parent
+_src = current_dir.parent / "cardano-USDA" / "client.py"
+
 spec = importlib.util.spec_from_file_location("cardano.client", str(_src))
 _mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(_mod)
