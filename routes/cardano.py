@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Optional
+from bson import ObjectId
+from fastapi import APIRouter, Depends, Request, HTTPException
 
-from fastapi import APIRouter, Depends, HTTPException
 from database import get_db
-from models.schemas import CardanoWithdrawRequest, CardanoVerifyDepositRequest
 from auth import get_current_user
 from config import settings
+from models.schemas import CardanoWithdrawRequest, CardanoVerifyDepositRequest
+from pydantic import BaseModel
+from fastapi import Body
+from bson import ObjectId
 
-# router is defined immediately — cardano sub-module imports are deferred into
-# each endpoint so a missing package never prevents this module from loading.
+# Router is defined immediately at the top of the file
 router = APIRouter(prefix="/api/cardano", tags=["cardano"])
 
 
@@ -37,6 +41,7 @@ def _import_cardano():
             status_code=503,
             detail=f"Cardano packages not installed: {exc}. Run: pip install pycardano blockfrost-python",
         )
+    
 
 
 async def _wallet_for_user(db, current_user: dict):
@@ -68,13 +73,21 @@ async def get_wallet(db=Depends(get_db), current_user=Depends(get_current_user))
         except Exception:
             pass
 
+    # Estimated fee: expose a conservative fee estimate (in ADA) to the frontend
+    try:
+        estimated_fee_ada = settings.cardano_min_utxo_lovelace / 1_000_000
+    except Exception:
+        estimated_fee_ada = None
+
     return {
         "address": address,
         "network": settings.cardano_network,
         "ada_balance": balance.get("ada"),
         "usda_balance": balance.get("usda"),
+        "estimated_fee_ada": estimated_fee_ada,
         "usda_policy_id": settings.usda_policy_id,
         "usda_asset_name_hex": settings.usda_asset_name_hex,
+        "createdAt": datetime.utcnow().isoformat()
     }
 
 
@@ -107,6 +120,74 @@ async def get_transactions(
         return {"address": wallet.address_str, "transactions": txs}
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Blockfrost error: {exc}")
+
+
+    class FeeEstimateRequest(BaseModel):
+        to_address: str
+        amount: float
+        asset: str = "USDA"
+
+
+    @router.post("/estimate-fee")
+    async def estimate_fee(body: FeeEstimateRequest = Body(...), db=Depends(get_db), current_user=Depends(get_current_user)):
+        _cardano_guard()
+        CardanoWallet, get_or_create_wallet_index, usda_ops = _import_cardano()
+
+        # use the workspace wallet for estimating
+        wallet = await _wallet_for_user(db, current_user)
+
+        if body.asset.upper() != "USDA":
+            raise HTTPException(status_code=400, detail="Only USDA fee estimation is supported currently.")
+
+        try:
+            fee_lovelace = usda_ops.estimate_usda_fee(wallet, body.to_address, body.amount)
+            fee_ada = fee_lovelace / 1_000_000
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+        except Exception as exc:
+            # fallback conservative estimate
+            fee_ada = settings.cardano_min_utxo_lovelace / 1_000_000
+
+        fee_usd = None
+        if getattr(settings, "cardano_ada_usd_rate", None):
+            fee_usd = round(fee_ada * settings.cardano_ada_usd_rate, 6)
+
+        return {"estimated_fee_ada": fee_ada, "estimated_fee_usd": fee_usd}
+
+
+    class TopUpRequest(BaseModel):
+        to_address: str
+        amount: float
+        asset: str = "USDA"
+
+
+    @router.post("/topup", status_code=201)
+    async def platform_topup(body: TopUpRequest, db=Depends(get_db), current_user=Depends(get_current_user)):
+        # Only allow admin users
+        users = db.users
+        user_doc = await users.find_one({"_id": ObjectId(current_user["_id"])})
+        if not user_doc or user_doc.get("role") != "admin":
+            raise HTTPException(status_code=403, detail="Admin role required for platform top-up.")
+
+        _cardano_guard()
+        CardanoWallet, _, usda_ops = _import_cardano()
+
+        # Platform hot wallet derived from configured platform account index
+        platform_idx = getattr(settings, "cardano_platform_account_index", 0)
+        try:
+            platform_wallet = CardanoWallet(platform_idx)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+
+        if body.asset.upper() != "USDA":
+            raise HTTPException(status_code=400, detail="Only USDA top-up is supported via this endpoint.")
+
+        try:
+            tx_hash = usda_ops.send_usda(platform_wallet, body.to_address, body.amount)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Top-up transaction failed: {exc}")
+
+        return {"ok": True, "tx_hash": tx_hash}
 
 
 # ── POST /api/cardano/on-ramp/verify ─────────────────────────────────────────
@@ -259,36 +340,25 @@ async def withdraw_usda(
     return {
         "id": str(ramp_result.inserted_id),
         "tx_hash": tx_hash,
-        "usda_sent": body.amount,
-        "to_address": body.to_address,
+        "amount_sent": body.amount,
         "status": "submitted",
-        "message": f"Withdrawal submitted: {body.amount} USDA sent. Tx: {tx_hash}",
+        "message": f"Withdrawal of {body.amount} USDA has been submitted to the network.",
     }
 
 
-# ── GET /api/cardano/tx/{tx_hash} ─────────────────────────────────────────────
+# ── POST /api/cardano/webhook ─────────────────────────────────────────────────
 
-@router.get("/tx/{tx_hash}")
-async def get_transaction(
-    tx_hash: str,
-    db=Depends(get_db),
-    current_user=Depends(get_current_user),
-):
-    _cardano_guard()
-    try:
-        from cardano.client import get_blockfrost_api
-        api = get_blockfrost_api()
-        tx = api.transaction(tx_hash)
-        utxos = api.transaction_utxos(tx_hash)
-        return {
-            "tx_hash": tx_hash,
-            "block": tx.block,
-            "block_height": tx.block_height,
-            "fees": int(tx.fees) / 1_000_000,
-            "inputs": [{"address": i.address, "amount": i.amount} for i in utxos.inputs],
-            "outputs": [{"address": o.address, "amount": o.amount} for o in utxos.outputs],
-        }
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Blockfrost error: {exc}")
+@router.post("/webhook")
+async def provider_webhook(request: Request, db=Depends(get_db)):
+    """Receive provider callbacks for deposit confirmations."""
+    body = await request.json()
+    tx_hash = body.get("txHash") or body.get("tx_hash")
+    confirmations = int(body.get("confirmations", 0))
+    if not tx_hash:
+        raise HTTPException(status_code=400, detail="txHash required")
+
+    await db.ramp_entries.update_one(
+        {"cardanoTxHash": tx_hash}, 
+        {"$set": {"confirmations": confirmations, "status": "on" if confirmations >= 10 else "pending"}}
+    )
+    return {"ok": True}

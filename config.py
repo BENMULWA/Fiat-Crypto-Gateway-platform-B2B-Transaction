@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     jwt_algorithm: str = os.getenv("JWT_ALGORITHM", "HS256")
     jwt_expiry_hours: int = int(os.getenv("JWT_EXPIRY_HOURS", "24"))
     
+    # ── FIX: Added to prevent route module AttributeErrors ──────────────────
+    secret_key: str = os.getenv("SECRET_KEY", "changeme-super-secret-jwt-key-32chars")
+    
     # Crucial Fix: Read the list from .env, or use these live defaults
     cors_origins: list[str] = [
         "http://localhost:5173", 
@@ -29,6 +32,10 @@ class Settings(BaseSettings):
     usda_asset_name_hex: str = os.getenv("USDA_ASSET_NAME_HEX", "55534441")  # ASCII "USDA"
     usda_decimals: int = int(os.getenv("USDA_DECIMALS", "6"))
     cardano_min_utxo_lovelace: int = int(os.getenv("CARDANO_MIN_UTXO_LOVELACE", "2000000"))
+    # Optional: platform-wide account index used for hot wallet operations (top-ups)
+    cardano_platform_account_index: int = int(os.getenv("CARDANO_PLATFORM_ACCOUNT_INDEX", "0"))
+    # Optional ADA->USD conversion rate for UI display (set in .env for approximate USD values)
+    cardano_ada_usd_rate: Optional[float] = None if os.getenv("CARDANO_ADA_USD_RATE") is None else float(os.getenv("CARDANO_ADA_USD_RATE"))
 
     # Pydantic v2 Environment parsing rules
     model_config = SettingsConfigDict(
