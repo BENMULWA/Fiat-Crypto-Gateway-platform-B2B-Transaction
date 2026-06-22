@@ -1,19 +1,31 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict
 from bson import ObjectId
-from fastapi import APIRouter, Depends, Request, HTTPException
+from fastapi import APIRouter, Depends, Request, HTTPException, status 
+from pydantic import BaseModel, Field
+from fastapi import Body
+import os
 
 from database import get_db
 from auth import get_current_user
 from config import settings
 from models.schemas import CardanoWithdrawRequest, CardanoVerifyDepositRequest
-from pydantic import BaseModel
-from fastapi import Body
-from bson import ObjectId
 
-# Router is defined immediately at the top of the file
+from pycardano import (
+    TransactionBuilder,
+    TransactionOutput,
+    MultiAsset,
+    AssetName,
+    Value,
+    ScriptPubkey,
+    BlockFrostChainContext,
+    
+)
+from blockfrost import ApiUrls, BlockFrostApi
+
+# Initialize the router ONCE at the top
 router = APIRouter(prefix="/api/cardano", tags=["cardano"])
 
 
@@ -42,7 +54,6 @@ def _import_cardano():
             detail=f"Cardano packages not installed: {exc}. Run: pip install pycardano blockfrost-python",
         )
     
-
 
 async def _wallet_for_user(db, current_user: dict):
     CardanoWallet, get_or_create_wallet_index, _ = _import_cardano()
@@ -73,7 +84,6 @@ async def get_wallet(db=Depends(get_db), current_user=Depends(get_current_user))
         except Exception:
             pass
 
-    # Estimated fee: expose a conservative fee estimate (in ADA) to the frontend
     try:
         estimated_fee_ada = settings.cardano_min_utxo_lovelace / 1_000_000
     except Exception:
@@ -122,18 +132,17 @@ async def get_transactions(
         raise HTTPException(status_code=502, detail=f"Blockfrost error: {exc}")
 
 
-    class FeeEstimateRequest(BaseModel):
+class FeeEstimateRequest(BaseModel):
         to_address: str
         amount: float
         asset: str = "USDA"
 
 
-    @router.post("/estimate-fee")
-    async def estimate_fee(body: FeeEstimateRequest = Body(...), db=Depends(get_db), current_user=Depends(get_current_user)):
+@router.post("/estimate-fee")
+async def estimate_fee(body: FeeEstimateRequest = Body(...), db=Depends(get_db), current_user=Depends(get_current_user)):
         _cardano_guard()
         CardanoWallet, get_or_create_wallet_index, usda_ops = _import_cardano()
 
-        # use the workspace wallet for estimating
         wallet = await _wallet_for_user(db, current_user)
 
         if body.asset.upper() != "USDA":
@@ -145,7 +154,6 @@ async def get_transactions(
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc))
         except Exception as exc:
-            # fallback conservative estimate
             fee_ada = settings.cardano_min_utxo_lovelace / 1_000_000
 
         fee_usd = None
@@ -155,15 +163,14 @@ async def get_transactions(
         return {"estimated_fee_ada": fee_ada, "estimated_fee_usd": fee_usd}
 
 
-    class TopUpRequest(BaseModel):
+class TopUpRequest(BaseModel):
         to_address: str
         amount: float
         asset: str = "USDA"
 
 
-    @router.post("/topup", status_code=201)
-    async def platform_topup(body: TopUpRequest, db=Depends(get_db), current_user=Depends(get_current_user)):
-        # Only allow admin users
+@router.post("/topup", status_code=201)
+async def platform_topup(body: TopUpRequest, db=Depends(get_db), current_user=Depends(get_current_user)):
         users = db.users
         user_doc = await users.find_one({"_id": ObjectId(current_user["_id"])})
         if not user_doc or user_doc.get("role") != "admin":
@@ -172,7 +179,6 @@ async def get_transactions(
         _cardano_guard()
         CardanoWallet, _, usda_ops = _import_cardano()
 
-        # Platform hot wallet derived from configured platform account index
         platform_idx = getattr(settings, "cardano_platform_account_index", 0)
         try:
             platform_wallet = CardanoWallet(platform_idx)
@@ -263,7 +269,96 @@ async def verify_on_ramp(
         "message": f"On-ramp confirmed: {usda_amount} USDA credited to workspace.",
     }
 
+# ── POST /api/cardano/mint-real-usda ──────────────────────────────────────────
 
+@router.post("/mint-real-usda", status_code=201)
+async def mint_real_usda():
+    _cardano_guard()
+    CardanoWallet, _, usda_ops = _import_cardano()
+    
+    platform_wallet = CardanoWallet(0)
+    print(f"\n MY MASTER WALLET ADRESS IS: {platform_wallet.address_str}\n")
+    
+    project_id = os.getenv("BLOCKFROST_PROJECT_ID") or getattr(settings, "blockfrost_project_id", "")
+    
+    context = BlockFrostChainContext(
+        project_id = project_id,
+        base_url= ApiUrls.preprod.value
+    )
+
+    signing_key = platform_wallet.signing_key
+    verification_key = signing_key.to_verification_key()
+    
+    policy_script = ScriptPubkey(verification_key.hash())
+    policy_id = policy_script.hash()
+    
+    asset_name = AssetName(b"USDA")
+    raw_amount_to_mint = 1_000_000_000_000
+    
+    builder = TransactionBuilder(context)
+    builder.add_input_address(platform_wallet.address)
+    
+    builder.mint = MultiAsset.from_primitive({
+        policy_id.payload: {asset_name.payload: raw_amount_to_mint}
+    })
+    builder.native_scripts = [policy_script]
+    
+    builder.add_output(TransactionOutput(
+        platform_wallet.address,
+        Value(
+            coin=2000000, 
+            multi_asset=builder.mint
+        )
+    ))
+
+    signed_tx = builder.build_and_sign(
+        [signing_key], 
+        change_address=platform_wallet.address
+    )
+    
+    context.submit_tx(signed_tx.to_cbor())
+    
+    return {
+        "message": "Successfully printed 1,000,000 real Testnet USDA!",
+        "new_policy_id": str(policy_id),
+        "tx_hash": str(signed_tx.id),
+        "platform_address": str(platform_wallet.address)
+    }
+
+# USDA Policy ID is the unique fingerprint of your stablecoin on-chain
+USDA_POLICY_ID = os.getenv("USDA_POLICY_ID") 
+
+@router.get("/master-wallet/balance")
+async def get_master_balance():
+    api = BlockFrostApi(
+        project_id=settings.blockfrost_project_id,
+        base_url=ApiUrls.preprod.value  # Ensure this matches your network (preprod/mainnet)
+    )
+    
+    master_address = os.getenv("MASTER_WALLET_ADDRESS")
+    
+    try:
+        address_info = api.address(address=master_address)
+        
+        # Look for the USDA asset specifically
+        usda_balance = 0
+        for asset in address_info.amount:
+            # asset.unit is PolicyID + AssetName
+            if asset.unit.startswith(USDA_POLICY_ID):
+                # asset.quantity is returned in raw Lovelace/Smallest unit
+                # Adjust division if USDA does not have 6 decimals
+                usda_balance = int(asset.quantity) / 1_000_000
+                break
+                
+        return {
+            "balance": usda_balance,
+            "unit": "USDA",
+            # Fix: Use current timestamp instead of non-existent data_hash
+            "lastUpdated": datetime.utcnow().isoformat() 
+        }
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch balance: {str(e)}")
+    
 # ── POST /api/cardano/withdraw ────────────────────────────────────────────────
 
 @router.post("/withdraw", status_code=201)
@@ -320,23 +415,6 @@ async def withdraw_usda(
     }
     ramp_result = await db.ramp_entries.insert_one(ramp_doc)
 
-    ledger_doc = {
-        "date": now.strftime("%-d %b, %I:%M %p"),
-        "flow": "Off-Ramp",
-        "description": f"Cardano Off-Ramp: sent {body.amount:.6f} USDA — tx {tx_hash[:16]}…",
-        "debitWallet": "Cardano",
-        "creditWallet": "USDA Wallet",
-        "debitAmount": body.amount,
-        "creditAmount": body.amount,
-        "debitAsset": "USDA",
-        "creditAsset": "USDA",
-        "counterparty": body.counterparty or body.to_address[:20] + "…",
-        "workspaceId": current_user["workspaceId"],
-        "userId": current_user["_id"],
-        "createdAt": now,
-    }
-    await db.ledger_entries.insert_one(ledger_doc)
-
     return {
         "id": str(ramp_result.inserted_id),
         "tx_hash": tx_hash,
@@ -345,6 +423,76 @@ async def withdraw_usda(
         "message": f"Withdrawal of {body.amount} USDA has been submitted to the network.",
     }
 
+# ── POST /api/cardano/off-ramp ───────────────────────────────────────────────
+
+class OffRampRequest(BaseModel):
+    amount: float = Field(..., gt=0, description="The amount of USDA to withdraw")
+    phone_number: str = Field(..., description="The M-Pesa phone number to receive KES (e.g., 254712345678)")
+
+@router.post("/off-ramp", status_code=status.HTTP_202_ACCEPTED)
+async def execute_off_ramp(
+    body: OffRampRequest, 
+    db=Depends(get_db),
+    current_user: Dict = Depends(get_current_user)
+):
+    """
+    Executes a secure Web3 to Web2 Off-Ramp.
+    Sweeps USDA from the Hot Wallet back to the Master Wallet for Fiat payout.
+    """
+    _cardano_guard()
+    _, _, usda_ops = _import_cardano()
+    
+    try:
+        # 1. Get the Master Wallet Address from .env
+        master_address = os.getenv("MASTER_WALLET_ADDRESS")
+        if not master_address:
+            raise HTTPException(status_code=500, detail="Platform configuration error: Master address missing.")
+        
+        # 2. Derive the specific Hot Wallet for the logged-in user
+        user_hot_wallet = await _wallet_for_user(db, current_user)
+        
+        # 3. Build and Sign the Transaction
+        print(f"Sweeping {body.amount} USDA from Hot Wallet {user_hot_wallet.address_str} to Master Vault {master_address}...")
+        
+        # Use the existing send_usda function to sweep the funds back
+        tx_hash = usda_ops.send_usda(
+            from_wallet=user_hot_wallet, 
+            to_address=master_address, 
+            amount=body.amount
+        )
+        
+        # 4. Record the pending fiat payout in MongoDB
+        now = datetime.utcnow()
+        withdrawal_record = {
+            "direction": "off",
+            "channel": "M-Pesa",
+            "fromAsset": "USDA",
+            "toAsset": "KES",
+            "fromAmount": body.amount,
+            "toAmount": body.amount * 130.0, # Calculate actual KES based on your exchange rate
+            "rate": 130.0,
+            "fee": 0.0,
+            "counterparty": body.phone_number,
+            "status": "pending_fiat_payout",
+            "cardanoTxHash": tx_hash,
+            "cardanoAddress": master_address, # Funds sent here
+            "workspaceId": current_user["workspaceId"],
+            "userId": current_user["_id"],
+            "createdAt": now,
+        }
+        await db.ramp_entries.insert_one(withdrawal_record)
+        
+        return {
+            "success": True,
+            "message": "Crypto sweep initiated successfully. Processing fiat payout next.",
+            "tx_hash": tx_hash
+        }
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, 
+            detail=f"Off-ramp blockchain transaction failed: {exc}"
+        )
 
 # ── POST /api/cardano/webhook ─────────────────────────────────────────────────
 

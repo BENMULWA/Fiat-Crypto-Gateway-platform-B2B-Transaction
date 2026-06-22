@@ -77,11 +77,10 @@ class DiscountRateCreate(BaseModel):
 
 # Cardano 
 class CardanoVerifyDepositRequest(BaseModel):
-    tx_hash: str = Field(..., min_length=64, max_length=64, description="64-char Cardano tx hash")
+    tx_hash: str = Field(..., description="Cardano tx hash")
     counterparty: Optional[str] = None
 
-
 class CardanoWithdrawRequest(BaseModel):
-    to_address: str = Field(..., min_length=50, description="Destination bech32 Cardano address")
+    to_address: str = Field(..., description="Destination bech32 Cardano address")
     amount: float = Field(..., gt=0, description="USDA amount (e.g. 10.5)")
     counterparty: Optional[str] = None

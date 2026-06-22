@@ -107,11 +107,11 @@ def get_usda_transactions(address: str, limit: int = 20) -> list[dict]:
 
 
 # ── on-ramp verification ──────────────────────────────────────────────────────
+# ── on-ramp verification ──────────────────────────────────────────────────────
 
 def verify_deposit(tx_hash: str, expected_address: str) -> dict:
     """
     Verify that a given tx hash delivered USDA to expected_address.
-    Returns the USDA amount received or raises ValueError.
     """
     api = get_blockfrost_api()
     asset_id = _usda_asset_id()
@@ -121,12 +121,15 @@ def verify_deposit(tx_hash: str, expected_address: str) -> dict:
     for out in tx_utxos.outputs:
         if out.address == expected_address:
             for amt in out.amount:
-                if amt.unit == asset_id:
+                
+                # Check for USDA *OR* standard ADA (lovelace)
+                if amt.unit == asset_id or amt.unit == "lovelace":
                     usda_received += int(amt.quantity)
+                # ----------------------------------
 
     if usda_received == 0:
         raise ValueError(
-            f"Transaction {tx_hash} delivered no USDA to address {expected_address}."
+            f"Transaction {tx_hash} delivered no USDA (or ADA) to address {expected_address}."
         )
 
     return {
@@ -134,7 +137,6 @@ def verify_deposit(tx_hash: str, expected_address: str) -> dict:
         "usda_amount": _to_usda(usda_received),
         "usda_raw": usda_received,
     }
-
 
 # ── withdrawal (off-ramp) ─────────────────────────────────────────────────────
 
