@@ -21,26 +21,70 @@ from pycardano import (
     Value,
     ScriptPubkey,
     BlockFrostChainContext,
+    PaymentKeyPair,
+    PaymentSigningKey,
+    Network,
+    Address
+
     
 )
 from blockfrost import ApiUrls, BlockFrostApi
 
+# Import the security utility 
+from security.encryption import decrypt_private_key
+
 # Initialize the router ONCE at the top
 router = APIRouter(prefix="/api/cardano", tags=["cardano"])
 
+def get_master_signing_key() -> PaymentSigningKey:
+    """
+    Unlocks the company's Master Wallet Private Key from the .env vault.
+    Requires MAMLAKA_MASTER_PASSWORD to be set in the server environment.
+    """
+    encrypted_key = os.getenv("ENCRYPTED_MASTER_KEY")
+    salt = os.getenv("WALLET_SALT")
+    password = os.getenv("MAMLAKA_MASTER_PASSWORD") # This is imported on the servers terminal to inhect the password from here which is invisible servers RAM.
+                                                    # export MAMLAKA_MASTER_PASSWORD="password"
 
+    if not encrypted_key or not salt:
+        raise HTTPException(status_code=500, detail= "Server Error: Encrypted key or salt missing from .env")
+    
+    if not password:
+        raise HTTPException(status_code=500, detail="SERVER SECURE HALT: Master Password not provided. Cannot unlock treasury.")
+
+    try:
+        # Decrypt the cborHex string 
+        raw_cbor = decrypt_private_key(encrypted_key, salt, password)
+
+        # Convert it back into pycardano signing key
+        return PaymentSigningKey.from_cbor(raw_cbor)
+    except Exception as e:
+           raise HTTPException(status_code=403, detail="CRITICAL: Failed to unlock Master Wallet. Incorrect password?")
+
+
+#================================================
+# Checks  for New encrypted vault with set password from the server 
+#================================================
 def _cardano_guard():
-    if not settings.blockfrost_project_id:
+    if not os.getenv("BLOCKFROST_PROJECT_ID"):
         raise HTTPException(
             status_code=503,
             detail="Cardano not configured: set BLOCKFROST_PROJECT_ID in .env",
         )
-    if not settings.cardano_mnemonic:
+    
+    # NEW SECURITY GUARD: Check for the encrypted vault instead of the mnemonic
+    if not os.getenv("ENCRYPTED_MASTER_KEY") or not os.getenv("WALLET_SALT"):
         raise HTTPException(
             status_code=503,
-            detail="Cardano not configured: set CARDANO_MNEMONIC in .env",
+            detail="Vault Error: Missing ENCRYPTED_MASTER_KEY or WALLET_SALT in .env",
         )
-
+        
+    # Check if the terminal has the password injected in its memory
+    if not os.getenv("MAMLAKA_MASTER_PASSWORD"):
+        raise HTTPException(
+            status_code=503,
+            detail="Security Halt: Master Password not injected! Run 'export MAMLAKA_MASTER_PASSWORD=\"yourpassword\"' in your terminal.",
+        )
 
 def _import_cardano():
     """Lazy-import cardano sub-modules; raises 503 if packages are missing."""
@@ -65,39 +109,29 @@ async def _wallet_for_user(db, current_user: dict):
 
 
 # ── GET /api/cardano/wallet ───────────────────────────────────────────────────
-
 @router.get("/wallet")
-async def get_wallet(db=Depends(get_db), current_user=Depends(get_current_user)):
-    CardanoWallet, get_or_create_wallet_index, usda_ops = _import_cardano()
-
-    try:
-        idx = await get_or_create_wallet_index(db, current_user["workspaceId"])
-        wallet = CardanoWallet(idx)
-        address = wallet.address_str
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-
-    balance: dict = {"ada": None, "usda": None}
-    if settings.blockfrost_project_id:
-        try:
-            balance = usda_ops.get_balance(address)
-        except Exception:
-            pass
-
-    try:
-        estimated_fee_ada = settings.cardano_min_utxo_lovelace / 1_000_000
-    except Exception:
-        estimated_fee_ada = None
-
+async def get_deposit_wallet(current_user=Depends(get_current_user)):
+    """
+    Custodial Model: Returns the Company's Master Wallet address to user dashboard
+    for users to deposit their funds into.
+    """
+    import os
+    from dotenv import load_dotenv
+    
+    # Force reload .env to ensure we get the latest Mainnet address
+    load_dotenv(override=True)
+    
+    master_address = os.getenv("MASTER_WALLET_ADDRESS")
+    
+    if not master_address:
+        raise HTTPException(status_code=500, detail="Master Vault address not configured on server.")
+        
     return {
-        "address": address,
-        "network": settings.cardano_network,
-        "ada_balance": balance.get("ada"),
-        "usda_balance": balance.get("usda"),
-        "estimated_fee_ada": estimated_fee_ada,
-        "usda_policy_id": settings.usda_policy_id,
-        "usda_asset_name_hex": settings.usda_asset_name_hex,
-        "createdAt": datetime.utcnow().isoformat()
+        "address": master_address,
+        # Mock estimated fees for the UI
+        "estimated_fee_ada": 0.17,
+        "estimated_fee_usd": 0.06,
+        "message": "Deposit to Master Vault"
     }
 
 
@@ -326,16 +360,29 @@ async def mint_real_usda():
     }
 
 # USDA Policy ID is the unique fingerprint of your stablecoin on-chain
-USDA_POLICY_ID = os.getenv("USDA_POLICY_ID") 
 
 @router.get("/master-wallet/balance")
 async def get_master_balance():
-    api = BlockFrostApi(
-        project_id=settings.blockfrost_project_id,
-        base_url=ApiUrls.preprod.value  # Ensure this matches your network (preprod/mainnet)
-    )
+    import os
+    from datetime import datetime
+    from blockfrost import ApiUrls, BlockFrostApi
+    from dotenv import load_dotenv
     
+    # 1. Force reload .env so you don't have to restart the server
+    load_dotenv(override=True)
+    
+    # 2. Dynamically select Mainnet vs Preprod based on .env
+    current_network = os.getenv("CARDANO_NETWORK", "testnet").lower()
+    api_url = ApiUrls.mainnet.value if current_network == "mainnet" else ApiUrls.preprod.value
+    
+    api = BlockFrostApi(
+        project_id=os.getenv("BLOCKFROST_PROJECT_ID"),
+        base_url=api_url
+    )
+     
     master_address = os.getenv("MASTER_WALLET_ADDRESS")
+    usda_policy_id = os.getenv("USDA_POLICY_ID", "").lower()
+    usda_hex = "55534441" # 'USDA' encoded in hexadecimal on Cardano
     
     try:
         address_info = api.address(address=master_address)
@@ -343,24 +390,51 @@ async def get_master_balance():
         # Look for the USDA asset specifically
         usda_balance = 0
         for asset in address_info.amount:
-            # asset.unit is PolicyID + AssetName
-            if asset.unit.startswith(USDA_POLICY_ID):
+            unit_lower = asset.unit.lower()
+            
+            # Match either the Policy ID OR the exact token name 'USDA' in hex
+            if (usda_policy_id and unit_lower.startswith(usda_policy_id)) or unit_lower.endswith(usda_hex.lower()):
                 # asset.quantity is returned in raw Lovelace/Smallest unit
-                # Adjust division if USDA does not have 6 decimals
                 usda_balance = int(asset.quantity) / 1_000_000
                 break
                 
         return {
             "balance": usda_balance,
             "unit": "USDA",
-            # Fix: Use current timestamp instead of non-existent data_hash
-            "lastUpdated": datetime.utcnow().isoformat() 
+            "lastUpdated": datetime.utcnow().isoformat(),
+            "network": current_network
         }
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to fetch balance: {str(e)}")
-    
-# ── POST /api/cardano/withdraw ────────────────────────────────────────────────
+# ── GET /api/cardano/master/adress ─────────────────────────────
 
+@router.get("/master/address")
+async def get_master_address():
+    """
+    Generates a fresh Cardano wallet.
+    Dynamically checks .env to generate Mainnet (addr1) or Testnet (addr_test1) addresses.
+    """
+    # 1. generate a new cryptographic key pair
+    key_pair = PaymentKeyPair.generate()
+
+    # 2. Check the .env network setting
+    current_network = getattr(settings, "cardano_network", "testnet").lower()
+    is_mainnet = (current_network == "mainnet")
+    
+    network_enum = Network.MAINNET if is_mainnet else Network.TESTNET
+    network_label = "Mainnet" if is_mainnet else "Preprod Testnet"
+
+    # 3. derive the address from public verification key
+    new_address = Address(payment_part=key_pair.verification_key.hash(), network=network_enum)
+
+    return {
+        "address" : str(new_address),
+        "private_key": str(key_pair.signing_key),
+        "network": network_label,
+        "message": "SECURITY WARNING: This key controls REAL money. Store securely!" if is_mainnet else "We use this address as your counterparty for testing"
+    }
+
+# ── POST /api/cardano/withdraw ────────────────────────────────────────────────
 @router.post("/withdraw", status_code=201)
 async def withdraw_usda(
     body: CardanoWithdrawRequest,
@@ -396,6 +470,8 @@ async def withdraw_usda(
 
     now = datetime.utcnow()
 
+    # Status set to 'COMPLETED' here because the transaction 
+    # was already executed successfully above.
     ramp_doc = {
         "direction": "off",
         "channel": "Cardano",
@@ -406,7 +482,7 @@ async def withdraw_usda(
         "rate": 1.0,
         "fee": 0.0,
         "counterparty": body.counterparty or body.to_address[:20] + "…",
-        "status": "off",
+        "status": "COMPLETED", 
         "cardanoTxHash": tx_hash,
         "cardanoAddress": body.to_address,
         "workspaceId": current_user["workspaceId"],
@@ -419,8 +495,8 @@ async def withdraw_usda(
         "id": str(ramp_result.inserted_id),
         "tx_hash": tx_hash,
         "amount_sent": body.amount,
-        "status": "submitted",
-        "message": f"Withdrawal of {body.amount} USDA has been submitted to the network.",
+        "status": "COMPLETED",
+        "message": f"Withdrawal of {body.amount} USDA has been successfully processed.",
     }
 
 # ── POST /api/cardano/off-ramp ───────────────────────────────────────────────

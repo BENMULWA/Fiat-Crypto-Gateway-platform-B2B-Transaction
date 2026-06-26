@@ -7,23 +7,29 @@ The code uses path m/1852'/1815'/{account_index}'/0/0 to find exact branch asign
 - 1815': The official crypto code number for ADA coin.
 - {account_index}': This changes for every user! User A gets branch 0', User B gets branch 1', User C gets branch 2', and so on.
 """
-
 from __future__ import annotations
+import os
 
 from cardano.client import get_network #tels the structure to build a real money - connected to mainnet or dummy / fake money when connected to test net
 from config import settings
-
+from security.encryption import decrypt_private_key
 
 class CardanoWallet:
-    def __init__(self, account_index: int):
-        if not settings.cardano_mnemonic:
+    def __init__(self, account_index: int = 0):
+        # 1. We ignore 'account_index' now because Mamlaka is Custodial.
+        # Everyone uses the exact same Master Wallet!
+        
+        encrypted_key = os.getenv("ENCRYPTED_MASTER_KEY")
+        salt = os.getenv("WALLET_SALT")
+        password = os.getenv("MAMLAKA_MASTER_PASSWORD")
+
+        if not encrypted_key or not salt or not password:
             raise RuntimeError(
-                "CARDANO_MNEMONIC is not set. "
-                "Generate a 24-word mnemonic and add it to your .env file."
+                "Vault Error: Missing ENCRYPTED_MASTER_KEY, WALLET_SALT, or MAMLAKA_MASTER_PASSWORD in .env"
             )
+
         try:
             from pycardano import (
-                HDWallet,
                 PaymentSigningKey,
                 PaymentVerificationKey,
                 PaymentExtendedSigningKey,
@@ -32,58 +38,25 @@ class CardanoWallet:
         except ImportError:
             raise RuntimeError("pycardano is not installed. Run: pip install pycardano")
 
-        root = HDWallet.from_mnemonic(settings.cardano_mnemonic)
-        child = root.derive_from_path(f"m/1852'/1815'/{account_index}'/0/0")
-
-        # Prefer creating an extended payment signing key from the HDWallet child
-        # (this matches pycardano's expected ExtendedSigningKey payload layout).
+        # 2. Unlock the Master Vault in RAM
         try:
-            # If the HDWallet exposes extended private key material, build an
-            # extended signing key (preferred).
-            self._signing_key = PaymentExtendedSigningKey.from_hdwallet(child)
-        except Exception:
-            # Fallback for older pycardano versions: try to extract a 32-byte seed
-            priv = None
-            for attr in ("private_key", "xprivate_key", "sk", "to_xprv", "to_bytes"):
-                if hasattr(child, attr):
-                    priv = getattr(child, attr)
-                    break
+            raw_cbor = decrypt_private_key(encrypted_key, salt, password)
+            
+            # CLEANUP: Remove accidental quotes, commas, or spaces from copy-pasting
+            clean_cbor = raw_cbor.replace('"', '').replace("'", "").replace(",", "").strip()
+            
+            # Attempt to load as a standard signing key
+            try:
+                self._signing_key = PaymentSigningKey.from_cbor(clean_cbor)
+            except Exception:
+                # Fallback: If your wallet was generated as an Extended key
+                self._signing_key = PaymentExtendedSigningKey.from_cbor(clean_cbor)
+                
+        except Exception as e:
+            raise RuntimeError(f"Security Halt: Failed to decrypt Master Wallet. Incorrect password? Error: {str(e)}")
 
-            if priv is None:
-                raise RuntimeError("Unable to extract private key from HDWallet child; incompatible pycardano version")
-
-            # Normalize to bytes
-            if isinstance(priv, str):
-                try:
-                    priv_bytes = bytes.fromhex(priv)
-                except Exception:
-                    priv_bytes = priv.encode()
-            elif isinstance(priv, int):
-                priv_bytes = priv.to_bytes((priv.bit_length() + 7) // 8, "big")
-            else:
-                priv_bytes = priv
-
-            # Ensure 32-byte seed for NaCl SigningKey.
-            # Prefer left 32 bytes of extended private material if present.
-            if len(priv_bytes) == 32:
-                seed32 = priv_bytes
-            elif len(priv_bytes) >= 64:
-                # child.xprivate_key or similar may contain 64 bytes (kL||kR).
-                # Use the left 32 bytes (kL) as the seed for ed25519 signing.
-                seed32 = priv_bytes[:32]
-            elif len(priv_bytes) > 32:
-                seed32 = priv_bytes[:32]
-            else:
-                raise RuntimeError("Extracted private key is not long enough to derive a 32-byte seed")
-
-            self._signing_key = PaymentSigningKey.from_primitive(seed32)
-        # Derive verification key and address from the signing key.
-        # Both extended and non-extended signing keys support `from_signing_key`.
-        if hasattr(self._signing_key, "to_verification_key"):
-            vk = PaymentVerificationKey.from_signing_key(self._signing_key)
-        else:
-            vk = PaymentVerificationKey.from_signing_key(self._signing_key)
-
+        # 3. Derive the public address from the unlocked private key
+        vk = PaymentVerificationKey.from_signing_key(self._signing_key)
         self.address: Address = Address(payment_part=vk.hash(), network=get_network())
 
     @property
@@ -99,6 +72,7 @@ async def get_or_create_wallet_index(db, workspace_id: str) -> int:
     """
     Returns the account index for a workspace, creating one if it doesn't exist. Workspace is the Storage iD for each user
     Index is stored in the `cardano_wallets` collection.
+    (Kept for database compatibility, but not used for key derivation anymore).
     """
     doc = await db.cardano_wallets.find_one({"workspaceId": workspace_id})
     if doc:
