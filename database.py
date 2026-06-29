@@ -30,3 +30,14 @@ def get_tokens_col():
 
 def get_transactions_col():
     return get_db()["transactions"]
+
+
+# --- Add your Treasury Collections to show case the mockk data for the Nodes ---
+def get_system_vaults_col():
+    return get_db()["system_vaults"]
+
+def get_user_wallets_col():
+    return get_db()["user_wallets"]
+
+def get_settlement_logs_col():
+    return get_db()["settlement_logs"]

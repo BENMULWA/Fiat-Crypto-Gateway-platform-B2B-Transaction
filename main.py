@@ -4,8 +4,7 @@ from contextlib import asynccontextmanager
 from config import settings
 from database import get_client
 from routes import auth, dashboard, market_maker, trade, ramp, airtime_ledger, general_ledger, rates, tokens, cardano
-
-
+from routes import treasury
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Verify MongoDB connection on startup
@@ -47,6 +46,9 @@ app.include_router(general_ledger.router)
 app.include_router(rates.router)
 app.include_router(tokens.router)
 app.include_router(cardano.router)
+
+app.include_router(treasury.router)
+
 
 
 @app.get("/health")

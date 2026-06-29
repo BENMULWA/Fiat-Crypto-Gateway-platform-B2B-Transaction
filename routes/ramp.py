@@ -112,15 +112,50 @@ async def execute_internal_swap(
 @router.post("/execute", status_code=201)
 async def execute_ramp(body: RampExecute, db=Depends(get_db), current_user=Depends(get_current_user)):
     """
-    Executes a ramp. Automatically routes to Payout (Off-Ramp) or Collection (On-Ramp).
+    Executes a ramp. Automatically routes to Payout (Off-Ramp), Collection (On-Ramp), or Internal Swap.
     """
     receive = round(body.amount * body.rate - body.fee, 4)
     
     # Generate a unique Trade ID for tracking with Lipad
     trade_id = f"TRADE_{uuid.uuid4().hex[:8].upper()}"
 
+    # --- 1. INTERNAL SWAP INTERCEPTOR (Instant, Zero-Fee) ---
+    if body.direction == "swap":
+        # A) Update user wallet instantly (Atomic Transaction)
+        await db.wallets.update_one(
+            {"userId": current_user["_id"]},
+            {
+                "$inc": {
+                    f"balances.{body.from_asset}": -body.amount,
+                    f"balances.{body.to_asset}": receive
+                }
+            },
+            upsert=True
+        )
+        
+        # B) Save receipt instantly as "completed"
+        doc = {
+            "_id": trade_id,
+            "direction": body.direction,
+            "channel": body.channel,
+            "fromAsset": body.from_asset,
+            "toAsset": body.to_asset,
+            "fromAmount": body.amount,
+            "toAmount": receive,
+            "rate": body.rate,
+            "fee": body.fee,
+            "counterparty": body.counterparty,
+            "status": "completed", # <--- Instantly marked as completed
+            "workspaceId": current_user["workspaceId"],
+            "userId": current_user["_id"],
+            "createdAt": datetime.utcnow(),
+        }
+        await db.ramp_entries.insert_one(doc)
+        return {"id": trade_id, "receive": receive, "status": "completed", "message": "Internal Swap Executed instantly!"}
+
+    # --- 2. ON/OFF RAMP LOGIC (Requires Webhooks) ---
     doc = {
-        "_id": trade_id, # Use our generated ID as the Mongo ID so Lipad can reference it
+        "_id": trade_id,
         "direction": body.direction,
         "channel": body.channel,
         "fromAsset": body.from_asset,
@@ -171,7 +206,6 @@ async def execute_ramp(body: RampExecute, db=Depends(get_db), current_user=Depen
 
     # If it's not Mobile Money, return normally
     return {"id": trade_id, "receive": receive, "status": "processing"}
-
 @router.get("/history")
 async def get_ramp_history(db=Depends(get_db), current_user=Depends(get_current_user)):
     """
