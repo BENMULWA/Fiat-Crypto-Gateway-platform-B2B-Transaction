@@ -1,53 +1,105 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from datetime import datetime
-from database import get_system_vaults_col, get_user_wallets_col, get_settlement_logs_col
+import uuid
 
-router = APIRouter(prefix="/api/treasury", tags=["Treasury & Dealing Desk"])
+from database import get_db 
 
-class SwapSimulation(BaseModel):
+router = APIRouter(prefix="/api/treasury", tags=["Treasury & Market Maker"])
+
+# --- 1. PYDANTIC MODELS ---
+class SimulateSwapRequest(BaseModel):
     user_id: str
     from_asset: str
     to_asset: str
     amount: float
+    simulate_fail: bool = False
+    fail_reason: str = None
+
+# --- 2. CONFIGURATION & MAPPING ---
+# The massive starting capital injected into the system on Day 1
+STARTING_CAPITAL = {
+    "N1_TELKOM": 13050000.0, "N2_AIRTEL": 13050000.0, "N3_SAFARICOM": 13050000.0, 
+    "N4_MPESA": 30177200.0, "N5_AIRTEL_MONEY": 1000000.0, "N6_TKASH": 1000000.0,     
+    "N7_USDA": 170100.0, "N8_IMP": 100000.0, "N9_XLM": 1000000.0,       
+    "N10_USD": 100000.0, "N11_GOLD": 41.66, "N12_YESHARA": 95238.0     
+}
+
+ASSET_TO_NODE = {
+    "USDA": "N7", "KES": "N4", "AIRT": "N3", "IMP": "N8",
+    "XLM": "N9", "USD": "N10", "GOLD": "N11", "YESHARA": "N12"
+}
+
+MAMLAKA_RATES = {
+    "USDA_KES": 128.00, "KES_USDA": 1/132.00, "AIRT_IMP": 1.00, 
+    "IMP_AIRT": 1.00, "XLM_USD": 0.098, "USD_XLM": 1 / 0.102
+}
+TRUE_MARKET_RATES = { "USDA_KES": 130.50, "XLM_USD": 0.100 }
+
+def map_node_to_vault(node: str, asset: str) -> str:
+    """Translates raw Ledger node IDs to UI Vault Keys."""
+    if not node: return None
+    node = str(node).upper()
+    
+    mapping = {
+        "N1": "N1_TELKOM", "N2": "N2_AIRTEL", "N3": "N3_SAFARICOM",
+        "N4": "N4_MPESA", "N5": "N5_AIRTEL_MONEY", "N6": "N6_TKASH",
+        "N7": "N7_USDA", "N8": "N8_IMP", "N9": "N9_XLM",
+        "N10": "N10_USD", "N11": "N11_GOLD", "N12": "N12_YESHARA"
+    }
+    if node in mapping:
+        return mapping[node]
+        
+    # Handle Retail Bridge dynamic mapping
+    if node in ["TREASURY_HUB", "MARKET"]:
+        asset = str(asset).upper()
+        if "KES" in asset and "AIRTIME" not in asset: return "N4_MPESA"
+        if "AIRTIME" in asset: return "N3_SAFARICOM"
+        if "USDA" in asset: return "N7_USDA"
+        if "USD" in asset and "USDA" not in asset: return "N10_USD"
+        if "IMP" in asset: return "N8_IMP"
+        if "XLM" in asset: return "N9_XLM"
+        
+    return None
+
+# --- 3. CORE ENDPOINTS ---
 
 @router.get("/dashboard")
-async def get_treasury_dashboard():
-    """Fetches all system balances and recent settlements for the Market Maker page."""
-    vaults_col = get_system_vaults_col()
-    logs_col = get_settlement_logs_col()
-
-    # 1. Fetch or Auto-Seed the Treasury Vaults
-    vaults = await vaults_col.find_one({"_id": "master_treasury"})
-    if not vaults:
-        vaults = {
-            "_id": "master_treasury",
-            "N1_TELKOM": 320000.00,
-            "N2_AIRTEL": 4500000.00,
-            "N3_SAFARICOM": 10000000.00,
-            "N4_MPESA": 6500000.00,
-            "N5_AIRTEL_MONEY": 1200000.00,
-            "N6_TKASH": 850000.00,
-            "N7_USDA": 50000.00,
-            "N8_IMP": 30000.00,
-            "N9_XLM": 150000.00,
-            "N10_USD": 25000.00
-        }
-        await vaults_col.insert_one(vaults)
-
-    # 2. Fetch the latest 5 settlement logs
-    cursor = logs_col.find().sort("timestamp", -1).limit(6)
-    raw_logs = await cursor.to_list(length=5)
+async def get_treasury_dashboard(db = Depends(get_db)):
+    """
+    Dynamically aggregates the EXACT live balances based on all trades in the MongoDB Execution Tape.
+    """
+    vaults = STARTING_CAPITAL.copy()
     
-    settlements = []
-    for log in raw_logs:
-        settlements.append({
-            "id": str(log["_id"]),
-            "desc": log["desc"],
-            "time": log["time_str"],
-            "status": log["status"],
-            "profit": log["profit_str"]
-        })
+    # A) Aggregate all Credits (Incoming money to nodes)
+    credits_cursor = db["transactions"].aggregate([
+        {"$group": {"_id": {"node": "$to_node", "asset": "$asset"}, "total": {"$sum": "$amount"}}}
+    ])
+    credits = await credits_cursor.to_list(length=None)
+    
+    for c in credits:
+        v_key = map_node_to_vault(c["_id"].get("node", ""), c["_id"].get("asset", ""))
+        if v_key and v_key in vaults:
+            vaults[v_key] += c["total"]
+            
+    # B) Aggregate all Debits (Outgoing money from nodes)
+    debits_cursor = db["transactions"].aggregate([
+        {"$group": {"_id": {"node": "$from_node", "asset": "$asset"}, "total": {"$sum": "$amount"}}}
+    ])
+    debits = await debits_cursor.to_list(length=None)
+    
+    for d in debits:
+        v_key = map_node_to_vault(d["_id"].get("node", ""), d["_id"].get("asset", ""))
+        if v_key and v_key in vaults:
+            vaults[v_key] -= d["total"]
+
+    # C) Fetch recent settlements (P&L Ledger)
+    raw_logs = await db["settlement_logs"].find().sort("timestamp", -1).limit(10).to_list(length=10)
+    settlements = [{
+        "id": str(log.get("_id", uuid.uuid4())), "desc": log.get("desc", ""),
+        "time": log.get("time_str", ""), "status": log.get("status", "COMPLETED"), 
+        "profit": log.get("profit_str", "0.00")
+    } for log in raw_logs]
 
     return {
         "status": "success",
@@ -55,88 +107,71 @@ async def get_treasury_dashboard():
         "settlements": settlements
     }
 
+
 @router.post("/simulate-swap")
-async def execute_simulated_trade(req: SwapSimulation):
-    """Dynamic End-to-End Simulation handling both Off-Ramp and On-Ramp."""
-    vaults_col = get_system_vaults_col()
-    users_col = get_user_wallets_col()
-    logs_col = get_settlement_logs_col()
+async def simulate_treasury_swap(req: SimulateSwapRequest, db = Depends(get_db)):
+    """
+    Executes a swap and injects the double-entry accounting directly into the HFT Transactions ledger!
+    """
+    now = datetime.utcnow()
+    tx_id = f"TXN-{uuid.uuid4().hex[:8].upper()}"
 
-    # Market Maker Configuration (Mocked for simulation)
-    global_market_rate = 130.50 # True global value
-    mamlaka_bid_rate = 128.00   # What we BUY USDA from user for
-    mamlaka_ask_rate = 132.00   # What we SELL USDA to user for
-    
-    # 1. Ensure testing user exists with plenty of fake funds
-    user = await users_col.find_one({"_id": req.user_id})
-    if not user:
-        user = {"_id": req.user_id, "balances":
-                 {"USDA": 10000.00, "KES": 500000.00,
-                  "AIRT": 50000.00, "IMP": 50000.00,
-                  "XLM" : 100000.00, "USD" :  5000.00
-                  }}
-        await users_col.insert_one(user)
+    from_base = req.from_asset.split('-')[0]
+    to_base = req.to_asset.split('-')[0]
+    pair_key = f"{from_base}_{to_base}"
 
-        # Function to quickly log the receipt
-    async def log_receipt(desc, profit_str):
-        await logs_col.insert_one({
-            "desc": desc,
-            "time_str": "Just now",
-            "timestamp": datetime.now(),
-            "status": "COMPLETED",
-            "profit_str": profit_str
-        })    
- # --- SCENARIO A: USDA <-> KES (Remittance Spread) ---
-    if req.from_asset == "USDA" and req.to_asset == "KES":
-        payout = req.amount * 128.00 # Bid
-        profit = (130.50 - 128.00) * req.amount
-        await users_col.update_one({"_id": req.user_id}, {"$inc": {"balances.USDA": -req.amount, "balances.KES": payout}})
-        await vaults_col.update_one({"_id": "master_treasury"}, {"$inc": {"N7_USDA": req.amount, "N4_MPESA": -payout}})
-        await log_receipt(f"{req.amount:,.2f} USDA → {payout:,.2f} KES", f"+ {profit:,.2f} KES")
-        return {"status": "success"}
-        
-    elif req.from_asset == "KES" and req.to_asset == "USDA":
-        payout = req.amount / 132.00 # Ask
-        profit = req.amount - (payout * 130.50)
-        await users_col.update_one({"_id": req.user_id}, {"$inc": {"balances.KES": -req.amount, "balances.USDA": payout}})
-        await vaults_col.update_one({"_id": "master_treasury"}, {"$inc": {"N4_MPESA": req.amount, "N7_USDA": -payout}})
-        await log_receipt(f"{req.amount:,.2f} KES → {payout:,.2f} USDA", f"+ {profit:,.2f} KES")
-        return {"status": "success"}
+    rate = MAMLAKA_RATES.get(pair_key, 1.00) 
+    receive_amount = req.amount * rate
 
-    # --- SCENARIO B: AIRT <-> IMP (Synthetic Peg Minting) ---
-    elif req.from_asset == "AIRT" and req.to_asset == "IMP":
-        payout = req.amount * 1.00 # 1:1 Peg
-        profit = 0.00 # No spread on minting
-        await users_col.update_one({"_id": req.user_id}, {"$inc": {"balances.AIRT": -req.amount, "balances.IMP": payout}})
-        # Treasury gains Safaricom Airtime (Collateral), gives away IMP
-        await vaults_col.update_one({"_id": "master_treasury"}, {"$inc": {"N3_SAFARICOM": req.amount, "N8_IMP": -payout}})
-        await log_receipt(f"Minted {payout:,.2f} IMP", f"0.00 KES (Peg)")
-        return {"status": "success"}
-        
-    elif req.from_asset == "IMP" and req.to_asset == "AIRT":
-        payout = req.amount * 1.00 # 1:1 Peg
-        profit = 0.00
-        await users_col.update_one({"_id": req.user_id}, {"$inc": {"balances.IMP": -req.amount, "balances.AIRT": payout}})
-        # Treasury burns IMP, releases Safaricom Airtime
-        await vaults_col.update_one({"_id": "master_treasury"}, {"$inc": {"N8_IMP": req.amount, "N3_SAFARICOM": -payout}})
-        await log_receipt(f"Burned {req.amount:,.2f} IMP", f"0.00 KES (Peg)")
-        return {"status": "success"}
+    from_node_id = ASSET_TO_NODE.get(from_base, "MARKET")
+    to_node_id = ASSET_TO_NODE.get(to_base, "MARKET")
 
-    # --- SCENARIO C: XLM <-> USD (Global PSP Routing) ---
-    elif req.from_asset == "XLM" and req.to_asset == "USD":
-        payout = req.amount * 0.098 # Bid ($0.098 per XLM)
-        profit = (0.10 - 0.098) * req.amount # True market is $0.10
-        await users_col.update_one({"_id": req.user_id}, {"$inc": {"balances.XLM": -req.amount, "balances.USD": payout}})
-        await vaults_col.update_one({"_id": "master_treasury"}, {"$inc": {"N9_XLM": req.amount, "N10_USD": -payout}})
-        await log_receipt(f"{req.amount:,.2f} XLM → {payout:,.2f} USD", f"+ ${profit:,.2f} USD")
-        return {"status": "success"}
+    # 1. INCOMING ENTRY: User sends asset to our Vault
+    await db["transactions"].insert_one({
+        "txn_id": f"{tx_id}-IN",
+        "timestamp": now,
+        "from_node": "EXTERNAL",
+        "to_node": from_node_id,
+        "asset": from_base,
+        "amount": req.amount,
+        "internal_usd_value": req.amount / 130.5 if "KES" in from_base else req.amount,
+        "txn_type": "SIM_DEPOSIT",
+        "cycle": 0
+    })
 
-    elif req.from_asset == "USD" and req.to_asset == "XLM":
-        payout = req.amount / 0.102 # Ask ($0.102 per XLM)
-        profit = req.amount - (payout * 0.10)
-        await users_col.update_one({"_id": req.user_id}, {"$inc": {"balances.USD": -req.amount, "balances.XLM": payout}})
-        await vaults_col.update_one({"_id": "master_treasury"}, {"$inc": {"N10_USD": req.amount, "N9_XLM": -payout}})
-        await log_receipt(f"{req.amount:,.2f} USD → {payout:,.2f} XLM", f"+ ${profit:,.2f} USD")
-        return {"status": "success"}
+    # 2. OUTGOING ENTRY: We send the converted asset to the User
+    await db["transactions"].insert_one({
+        "txn_id": f"{tx_id}-OUT",
+        "timestamp": now,
+        "from_node": to_node_id,
+        "to_node": "EXTERNAL",
+        "asset": to_base,
+        "amount": receive_amount,
+        "internal_usd_value": receive_amount / 130.5 if "KES" in to_base else receive_amount,
+        "txn_type": "SIM_PAYOUT",
+        "cycle": 0
+    })
 
-    raise HTTPException(status_code=400, detail=f"Pair {req.from_asset} to {req.to_asset} not supported.")
+    # 3. Calculate Profit & Write to Settlement Log
+    profit_str = "0.00"
+    if pair_key == "USDA_KES":
+        profit_str = f"+ {(TRUE_MARKET_RATES['USDA_KES'] - rate) * req.amount:,.2f} KES"
+    elif pair_key == "KES_USDA":
+        profit_str = f"+ {(1/rate - TRUE_MARKET_RATES['USDA_KES']) * receive_amount:,.2f} KES"
+
+    await db["settlement_logs"].insert_one({
+        "_id": tx_id,
+        "desc": f"{req.amount:,.2f} {from_base} → {receive_amount:,.2f} {to_base}",
+        "time_str": now.strftime("%I:%M:%S %p"),
+        "timestamp": now, "status": "COMPLETED", "profit_str": profit_str
+    })
+
+    return {"status": "success"}
+
+
+@router.post("/reset-sandbox")
+async def reset_treasury_sandbox(db = Depends(get_db)):
+    """Wipes the database cleanly so you can restart the simulation."""
+    await db["transactions"].delete_many({}) 
+    await db["settlement_logs"].delete_many({}) 
+    return {"status": "success", "message": "Sandbox reset to Genesis balances."}

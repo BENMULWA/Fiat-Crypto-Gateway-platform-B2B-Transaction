@@ -1,67 +1,73 @@
 from fastapi import APIRouter, Depends
-from typing import Optional
 from database import get_db
-from auth import get_current_user
 
-router = APIRouter(prefix="/api/ledger", tags=["ledger"])
+# This prefix matches exactly what React is looking for: /api/ledger
+router = APIRouter(prefix="/api/ledger", tags=["General Ledger"])
 
-MOCK_ENTRIES = [
-    {"id": "1", "date": "Jun 12, 03:32 PM", "flow": "FX Deal", "description": "Bought 3.00 USD @ 125.0000 USD/KES", "debitWallet": "USD Wallet", "creditWallet": "KES Wallet", "counterparty": "Abc"},
-    {"id": "2", "date": "Jun 12, 12:00 PM", "flow": "FX Deal", "description": "Bought 10.00 USD @ 125.0000 USD/KES", "debitWallet": "USD Wallet", "creditWallet": "KES Wallet", "debitAmount": 10.0, "creditAmount": 10.0, "debitAsset": "USD", "creditAsset": "USD", "counterparty": "test"},
-]
+@router.get("/feed")
+async def get_live_ledger_feed(limit: int = 50, search: str = None, db = Depends(get_db)):
+    """
+    Fetches the most recent transactions from the MongoDB Immutable Ledger.
+    Includes server-side searching to find old transactions that fell off the top 50.
+    """
+    query = {}
+    if search:
+        # Search across multiple columns case-insensitively
+        query = {
+            "$or": [
+                {"txn_id": {"$regex": search, "$options": "i"}},
+                {"from_node": {"$regex": search, "$options": "i"}},
+                {"to_node": {"$regex": search, "$options": "i"}},
+                {"txn_type": {"$regex": search, "$options": "i"}}
+            ]
+        }
 
+    # Query MongoDB: Get top transactions matching query, sorted by newest first
+    cursor = db["transactions"].find(query).sort("timestamp", -1).limit(limit)
+    records = await cursor.to_list(length=limit)
+    
+    formatted_feed = []
+    for r in records:
+        # 1. Determine the color of the text based on the transaction type
+        type_color = "text-blue-400"
+        # Handle both 'txn_type' and 'type' depending on how it was saved
+        txn_type = r.get("txn_type", r.get("type", "TRANSFER"))
+        
+        if txn_type in ["MINT", "SYSTEM_FUND"]:
+            type_color = "text-emerald-400"
+        elif txn_type in ["LIQUIDATE", "PROCURE"]:
+            type_color = "text-orange-400"
+        elif txn_type == "CELO_EXIT":
+            type_color = "text-purple-400"
 
+        # 2. Format time safely
+        timestamp = r.get("timestamp")
+        time_str = timestamp.strftime("%H:%M:%S.%f")[:-3] if timestamp else "00:00:00"
+        
+        # 3. Format value safely
+        int_val = r.get('internal_usd_value', 0)
+        amount_val = r.get('amount', 0)
+        asset_str = r.get('asset', '').replace('_KES', '')
+
+        # 4. Construct the UI-ready object
+        formatted_feed.append({
+            "time": time_str,
+            "id": r.get("txn_id", str(r.get("_id", ""))),
+            "from": r.get("from_node", ""),
+            "to": r.get("to_node", ""),
+            "amount": f"{amount_val:,.2f} {asset_str}",
+            "intValue": f"${int_val:,.2f}",
+            "type": txn_type,
+            "typeColor": type_color
+        })
+        
+    return {"status": "success", "feed": formatted_feed}
+
+# --- Legacy fallback routes to prevent other 404s ---
 @router.get("/summary")
-async def get_summary(db=Depends(get_db), current_user=Depends(get_current_user)):
-    workspace_id = current_user["workspaceId"]
-    total = await db.ledger_entries.count_documents({"workspaceId": workspace_id})
-    distinct = len(await db.ledger_entries.distinct("flow", {"workspaceId": workspace_id}))
-    if total == 0:
-        return {"totalEntries": 2, "distinctFlows": 1, "grossValueBooked": 13.0}
-    return {"totalEntries": total, "distinctFlows": max(distinct, 1), "grossValueBooked": 13.0}
-
+async def get_ledger_summary():
+    return {"status": "success", "data": {}}
 
 @router.get("/entries")
-async def get_entries(
-    flow: Optional[str] = None,
-    search: Optional[str] = None,
-    db=Depends(get_db),
-    current_user=Depends(get_current_user),
-):
-    workspace_id = current_user["workspaceId"]
-    query: dict = {"workspaceId": workspace_id}
-    if flow:
-        query["flow"] = flow
-    if search:
-        query["$or"] = [
-            {"description": {"$regex": search, "$options": "i"}},
-            {"counterparty": {"$regex": search, "$options": "i"}},
-        ]
-
-    cursor = db.ledger_entries.find(query).sort("createdAt", -1).limit(100)
-    entries = []
-    async for e in cursor:
-        entries.append({
-            "id": str(e["_id"]),
-            "date": e.get("date", ""),
-            "flow": e.get("flow", ""),
-            "description": e.get("description", ""),
-            "debitWallet": e.get("debitWallet", ""),
-            "creditWallet": e.get("creditWallet", ""),
-            "debitAmount": e.get("debitAmount"),
-            "creditAmount": e.get("creditAmount"),
-            "debitAsset": e.get("debitAsset"),
-            "creditAsset": e.get("creditAsset"),
-            "counterparty": e.get("counterparty"),
-        })
-
-    if not entries:
-        filtered = MOCK_ENTRIES
-        if flow:
-            filtered = [e for e in filtered if e["flow"] == flow]
-        if search:
-            sl = search.lower()
-            filtered = [e for e in filtered if sl in e["description"].lower() or sl in (e.get("counterparty") or "").lower()]
-        entries = filtered
-
-    return {"entries": entries}
+async def get_ledger_entries(flow: str = None, search: str = None):
+    return {"status": "success", "data": []}
