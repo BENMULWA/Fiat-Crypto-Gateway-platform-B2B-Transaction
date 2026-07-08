@@ -1,88 +1,153 @@
-from fastapi import APIRouter, Depends
-from database import get_db
-from models.schemas import MintRequest, RedeemRequest
-from auth import get_current_user
+from fastapi import APIRouter, HTTPException, Depends
+from pydantic import BaseModel
+import uuid
+from typing import Optional
 from datetime import datetime
+from database import get_db
 
-router = APIRouter(prefix="/api/airtime", tags=["airtime"])
+# Import our Mam-laka service
+from services.safaricom_daraja import DarajaService
 
+router = APIRouter(prefix="/api/airtime", tags=["Airtime Ledger"])
+mam_laka = DarajaService()
 
-async def _get_summary(db, workspace_id) -> dict:
-    mint_pipeline = [
-        {"$match": {"workspaceId": workspace_id, "type": "mint"}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}},
-    ]
-    redeem_pipeline = [
-        {"$match": {"workspaceId": workspace_id, "type": "redeem"}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}},
-    ]
-    minted_res = await db.airtime_entries.aggregate(mint_pipeline).to_list(1)
-    redeemed_res = await db.airtime_entries.aggregate(redeem_pipeline).to_list(1)
-    minted = minted_res[0]["total"] if minted_res else 112.0
-    redeemed = redeemed_res[0]["total"] if redeemed_res else 0.0
-    in_circulation = minted - redeemed
-    usda_reserve = -(in_circulation)
-    collateral = (usda_reserve / max(in_circulation, 0.0001)) * 100 if in_circulation else -78.6
+# --- Pydantic Models for Security ---
+class MintRequest(BaseModel):
+    amount: float
+    network: str
+    country: str
+    note: Optional[str] = ""
+
+class RedeemRequest(BaseModel):
+    amount: float
+    phone: str
+    provider: str
+    user_id: Optional[str] = "test_user_123" 
+
+@router.post("/mint")
+async def mint_airtime(req: MintRequest, db=Depends(get_db)):
+    txn_id = f"MINT-{uuid.uuid4().hex[:8].upper()}"
+    
+    doc = {
+        "txn_id": txn_id,
+        "timestamp": datetime.utcnow(),
+        "type": "mint",
+        "amount": req.amount,
+        "network": req.network,
+        "country": req.country,
+        "usd": req.amount,
+        "status": "completed"
+    }
+    await db["airtime_history"].insert_one(doc)
+    
     return {
-        "airtInCirculation": round(in_circulation, 4),
-        "usdaReserve": round(usda_reserve, 2),
-        "collateralRatio": round(collateral, 1),
+        "status": "success", 
+        "message": f"Successfully minted {req.amount} IMP",
+        "tx_id": txn_id
     }
 
+@router.post("/redeem")
+async def redeem_airtime(req: RedeemRequest, db=Depends(get_db)):
+    # 1. INTERNAL BALANCE CHECK
+    user_wallet = await db["user_wallets"].find_one({"_id": req.user_id})
+    balances = user_wallet.get("balances", {}) if user_wallet else {}
+    current_airt_balance = balances.get("AIRT", 0)
+    
+    if current_airt_balance < req.amount:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Insufficient Internal Airtime. You have {current_airt_balance} AIRT, but tried to redeem {req.amount}."
+        )
+
+    txn_id = f"AIRT-{uuid.uuid4().hex[:8].upper()}"
+    
+    print(f"🚀 Triggering Live Airtime Disbursement: {req.amount} to {req.phone} via {req.provider}")
+    
+    # 2. TRIGGER MAM-LAKA API
+    result = mam_laka.disburse_airtime(
+        phone_number=req.phone,
+        amount=int(req.amount),
+        transaction_id=txn_id,
+        provider=req.provider
+    )
+    
+    # 3. HANDLE MAM-LAKA ERRORS
+    if result.get("status") == "error":
+        # 🚨 FIX: LOG THE FAILED ATTEMPT TO HISTORY BEFORE RAISING ERROR!
+        failed_doc = {
+            "txn_id": txn_id,
+            "timestamp": datetime.utcnow(),
+            "type": "failed",
+            "amount": req.amount,
+            "network": req.provider,
+            "country": "Kenya", 
+            "usd": 0.0,
+            "status": "failed",
+            "error": result.get("message", "Unknown API error")
+        }
+        await db["airtime_history"].insert_one(failed_doc)
+        
+        # Now raise the error to frontend
+        raise HTTPException(status_code=400, detail=result.get("message"))
+        
+    # 4. ATOMIC DEDUCTION (Only happens on success)
+    await db["user_wallets"].update_one(
+        {"_id": req.user_id},
+        {"$inc": {"balances.AIRT": -req.amount}}
+    )
+        
+    # 5. LOG SUCCESS TO HISTORY
+    doc = {
+        "txn_id": txn_id,
+        "timestamp": datetime.utcnow(),
+        "type": "redeem",
+        "amount": req.amount,
+        "network": req.provider,
+        "country": "Kenya", 
+        "usd": -req.amount,
+        "status": "completed"
+    }
+    await db["airtime_history"].insert_one(doc)
+
+    return {
+        "status": "success", 
+        "message": "Airtime successfully sent to phone!",
+        "provider_receipt": result
+    }
 
 @router.get("/summary")
-async def get_summary(db=Depends(get_db), current_user=Depends(get_current_user)):
-    return await _get_summary(db, current_user["workspaceId"])
-
+async def get_airtime_summary():
+    balance_res = mam_laka.get_merchant_balance()
+    artm_balance = 0.0
+    
+    if balance_res.get("status") == "success":
+        data = balance_res.get("data", {})
+        artm_balance = data.get("artmBalance", 0.0)
+        
+    return {
+        "status": "success",
+        "live_artm_balance": artm_balance
+    }
 
 @router.get("/history")
-async def get_history(db=Depends(get_db), current_user=Depends(get_current_user)):
-    workspace_id = current_user["workspaceId"]
-    cursor = db.airtime_entries.find({"workspaceId": workspace_id}).sort("createdAt", -1).limit(50)
-    entries = []
-    async for e in cursor:
-        created = e.get("createdAt")
-        entries.append({
-            "id": str(e["_id"]),
-            "type": e["type"],
-            "amount": e["amount"],
-            "network": e["network"],
-            "country": e["country"],
-            "usdaAmount": e["amount"] if e["type"] == "mint" else -e["amount"],
-            "timeAgo": created.strftime("%-d %b") if created else "—",
+async def get_airtime_history(db=Depends(get_db)):
+    cursor = db["airtime_history"].find().sort("timestamp", -1).limit(10)
+    records = await cursor.to_list(length=10)
+    
+    history = []
+    for r in records:
+        time_str = r["timestamp"].strftime("%b %d, %H:%M")
+        history.append({
+            "id": r["txn_id"],
+            "type": r.get("type", "unknown"),
+            "amount": r["amount"],
+            "network": r["network"],
+            "phone": r.get("phone", None),
+            "country": r.get("country", "KE"),
+            "time": time_str,
+            "usd": r.get("usd", 0.0),
+            # Pass the error message to frontend if it's a failed transaction
+            "error": r.get("error", None)
         })
-
-    if not entries:
-        entries = [
-            {"id": "1", "type": "redeem", "amount": 10.0, "network": "Telkom", "country": "KE", "usdaAmount": -10.0, "timeAgo": "2d ago"},
-            {"id": "2", "type": "mint", "amount": 12.0, "network": "Telkom", "country": "KE", "usdaAmount": 12.0, "timeAgo": "2d ago"},
-            {"id": "3", "type": "redeem", "amount": 90.0, "network": "Telkom", "country": "KE", "usdaAmount": -90.0, "timeAgo": "4d ago"},
-        ]
-    return {"entries": entries}
-
-
-async def _insert_entry(db, entry_type: str, amount: float, network: str, country: str, note: str | None, workspace_id, user_id):
-    doc = {
-        "type": entry_type,
-        "amount": amount,
-        "network": network,
-        "country": country,
-        "note": note,
-        "workspaceId": workspace_id,
-        "userId": user_id,
-        "createdAt": datetime.utcnow(),
-    }
-    result = await db.airtime_entries.insert_one(doc)
-    return str(result.inserted_id)
-
-
-@router.post("/mint", status_code=201)
-async def mint(body: MintRequest, db=Depends(get_db), current_user=Depends(get_current_user)):
-    entry_id = await _insert_entry(db, "mint", body.amount, body.network, body.country, body.note, current_user["workspaceId"], current_user["_id"])
-    return {"id": entry_id, "type": "mint", "amount": body.amount}
-
-
-@router.post("/redeem", status_code=201)
-async def redeem(body: RedeemRequest, db=Depends(get_db), current_user=Depends(get_current_user)):
-    entry_id = await _insert_entry(db, "redeem", body.amount, body.network, body.country, body.note, current_user["workspaceId"], current_user["_id"])
-    return {"id": entry_id, "type": "redeem", "amount": body.amount}
+        
+    return {"status": "success", "history": history}

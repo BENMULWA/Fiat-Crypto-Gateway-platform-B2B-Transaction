@@ -89,3 +89,5 @@ app.include_router(treasury.router)
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "meshex-api"}
+
+
