@@ -1,17 +1,16 @@
 import os
 import asyncio
 import json
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from web3 import Web3
-
-# Web3 v7 renamed the middleware, so we use a try/except to handle both versions!
-try:
-    from web3.middleware import geth_poa_middleware
-except ImportError:
-    from web3.middleware import ExtraDataToPOAMiddleware as geth_poa_middleware
-
+from web3.middleware import geth_poa_middleware
 from dotenv import load_dotenv
 from eth_account import Account
 
+
+# load environment variables from .env file
 load_dotenv()
 Account.enable_unaudited_hdwallet_features()
 
@@ -20,13 +19,32 @@ ERC20_ABI = json.loads('[{"constant":false,"inputs":[{"name":"_to","type":"addre
 
 class CorridorIntegrations:
     def __init__(self):
-        
-        # We enforce live mode to hit the actual blockchain
         self.live_mode = True 
-        
-        # Connect to Celo Mainnet via Forno RPC
         self.celo_rpc_url = os.getenv("CELO_RPC_URL", "https://forno.celo.org")
-        self.w3 = Web3(Web3.HTTPProvider(self.celo_rpc_url))
+        
+        # =========================================================
+        # 🚀 AWS PRODUCTION UPGRADE: The Bulletproof Web3 Provider
+        # =========================================================
+        # 1. Create a persistent session
+        session = requests.Session()
+        
+        # 2. Configure an aggressive Auto-Retry strategy for Cloud environments
+        retry_strategy = Retry(
+            total=5,  # Try up to 5 times if the network drops
+            backoff_factor=0.5,  # Wait 0.5s, then 1s, then 2s between retries
+            status_forcelist=[429, 500, 502, 503, 504], # Retry on these specific server errors
+            allowed_methods=["POST", "GET", "OPTIONS"]
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+
+        # 3. Inject the Session and a 60-second timeout into Web3
+        self.w3 = Web3(Web3.HTTPProvider(
+            self.celo_rpc_url,
+            session=session,
+            request_kwargs={'timeout': 60} # Force AWS to wait up to 60 seconds for blockchain confirmation
+        ))
         
         # Celo uses Proof-of-Authority (PoA) consensus, requiring this middleware
         self.w3.middleware_onion.inject(geth_poa_middleware, layer=0)
@@ -36,8 +54,7 @@ class CorridorIntegrations:
         if seed_phrase:
             account = Account.from_mnemonic(seed_phrase)
             self.treasury_private_key = account.key.hex()
-            # For this test, we will just set the Exit address to the same wallet
-            self.exit_address = account.address
+            self.exit_address = os.getenv("CELO_EXIT_ADDRESS")
         else:
             self.treasury_private_key = None
             self.exit_address = None
@@ -70,7 +87,7 @@ class CorridorIntegrations:
         print(f"\n🌐 WEB3 ENGINE: Initiating on-chain settlement of {amount_usd} USDC...")
         
         if not self.treasury_private_key or not self.exit_address:
-            raise ValueError("Missing CELO_MNEMONIC in .env file.")
+            raise ValueError("Missing CELO_MNEMONIC or CELO_EXIT_ADDRESS in .env file.")
 
         if not self.w3.is_connected():
             raise ConnectionError("Failed to connect to the Celo Blockchain RPC.")
@@ -78,6 +95,7 @@ class CorridorIntegrations:
         # 1. Load the Hot Wallet Account
         account = self.w3.eth.account.from_key(self.treasury_private_key)
         print(f"   ↳ Treasury Wallet Loaded: {account.address}")
+        print(f"   ↳ Target Exit Vault: {self.exit_address}")
 
         # 2. Instantiate the USDC Smart Contract
         usdc_contract = self.w3.eth.contract(
@@ -112,7 +130,6 @@ class CorridorIntegrations:
         print(f"   ↳ Broadcasting to Celo Network...")
         
         # 7. Broadcast the raw hex to the global network!
-        # Web3 v7 changed rawTransaction to raw_transaction
         raw_tx = getattr(signed_tx, 'raw_transaction', getattr(signed_tx, 'rawTransaction', None))
         tx_hash = self.w3.eth.send_raw_transaction(raw_tx)
         
