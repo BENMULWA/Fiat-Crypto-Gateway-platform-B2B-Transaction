@@ -5,7 +5,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from web3 import Web3
-from web3.middleware import geth_poa_middleware
+from web3.middleware import ExtraDataToPOAMiddleware
 from dotenv import load_dotenv
 from eth_account import Account
 
@@ -46,9 +46,8 @@ class CorridorIntegrations:
             request_kwargs={'timeout': 60} # Force AWS to wait up to 60 seconds for blockchain confirmation
         ))
         
-        # Celo uses Proof-of-Authority (PoA) consensus, requiring this middleware
-        self.w3.middleware_onion.inject(geth_poa_middleware, layer=0)
-        
+        # Celo uses Proof-of-Authority (PoA) consensus, requiring this middleware to handle the extra data in blocks
+        self.w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)        
         # Auto-derive the Hot Wallet from your 12 words!
         seed_phrase = os.getenv("CELO_MNEMONIC")
         if seed_phrase:
