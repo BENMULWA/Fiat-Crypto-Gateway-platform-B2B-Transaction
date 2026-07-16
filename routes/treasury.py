@@ -6,16 +6,102 @@ import uuid
 
 from database import get_db
 from Brain_Engine.corridor_1_airtime import AirtimeCeloCorridor
+
+# 🚀 1. Import your Live Daraja Service
 from services.safaricom_daraja import DarajaService
 
 router = APIRouter(prefix="/api/treasury", tags=["Treasury"])
-mam_laka = DarajaService()
+
+# 🚀 2. Instantiate the service so it's ready to fetch
+daraja = DarajaService()
+
+class CorridorRequest(BaseModel):
+    amount_kes: float
+
+@router.post("/corridor/airtime-celo")
+async def trigger_airtime_celo_corridor(req: CorridorRequest, db=Depends(get_db)):
+    if req.amount_kes <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be greater than zero.")
+
+    try:
+        # Initialize the live engine with your MongoDB transactions collection
+        corridor = AirtimeCeloCorridor(db_collection=db["transactions"])
+        
+        # Execute the entire live flow
+        result = await corridor.execute_from_kes(deployed_kes=req.amount_kes)
+        
+        return {
+            "status": "success",
+            "message": f"Airtel -> Celo Corridor executed. Yielded {result['yield_percent']}%",
+            "data": result
+        }
+        
+    except Exception as e:
+        traceback.print_exc() 
+        print(f"Corridor Execution Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# 🟢 DYNAMIC HFT EXECUTION ROUTE
+class HFTExecuteRequest(BaseModel):
+    amount: float
+    corridor_id: str
+
+@router.post("/corridor/execute-hft")
+async def execute_dynamic_hft_corridor(req: HFTExecuteRequest, db=Depends(get_db)):
+    if req.amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be greater than zero.")
+
+    try:
+        from Brain_Engine.state_engine import ImmutableLedger, HFTCorridorFSM, FSMState
+        
+        ledger = ImmutableLedger(db_collection=db["transactions"])
+        
+        # Dynamically build the configuration based on the requested corridor
+        config = {}
+        if req.corridor_id == "telkom_5x":
+            config = {
+                "cycles": 5, "discount": 0.10, "fx_edge": 0.05, 
+                "node_procure": "N1", "node_liquidate": "N4"
+            }
+        elif req.corridor_id == "airtel_5x":
+            config = {
+                "cycles": 5, "discount": 0.06, "fx_edge": 0.00, 
+                "node_procure": "N2", "node_liquidate": "N5"
+            }
+        else:
+            raise HTTPException(status_code=400, detail="Unknown corridor ID")
+            
+        # Boot the dynamic State Machine
+        bot = HFTCorridorFSM(ledger=ledger, starting_capital_usd=req.amount, config=config)
+        await bot.boot_system()
+        
+        # Run the loops
+        while bot.state != FSMState.COMPLETED and bot.state != FSMState.HALTED:
+            await bot.tick()
+            
+        if bot.state == FSMState.HALTED:
+            raise Exception("Corridor halted due to internal error or low liquidity.")
+            
+        return {
+            "status": "success",
+            "message": f"{config['cycles']}x Rollover Complete via {config['node_procure']}! Exited to Celo.",
+            "data": {
+                "starting_usd": req.amount,
+                "final_usd": bot.current_usd_principal,
+                "profit": bot.current_usd_principal - req.amount
+            }
+        }
+        
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
 # --- Dashboard APIs ---
 @router.get("/dashboard")
 async def get_treasury_dashboard(db=Depends(get_db)):
-    """Serves the Main Treasury Dashboard with live vaults and the settlements tape."""
+    """Serves the Main Treasury Dashboard with LIVE vaults and the settlements tape."""
     try:
+        # 1. Fetch latest settlements tape
         cursor = db["transactions"].find().sort("timestamp", -1).limit(10)
         records = await cursor.to_list(length=10)
         
@@ -35,7 +121,7 @@ async def get_treasury_dashboard(db=Depends(get_db)):
                 "profit": profit_str
             })
 
-        # Calculate Vaults Dynamically based on Transaction Ledger
+        # 2. Calculate Default Vaults Dynamically based on Transaction Ledger (For Crypto)
         vaults = {
             "N7_USDA": 0.0, "N4_MPESA": 0.0, "N1_TELKOM": 0.0, "N2_AIRTEL": 0.0,
             "N3_SAFARICOM": 0.0, "N8_IMP": 0.0, "N9_XLM": 0.0, "N10_USD": 0.0, "N11_GOLD": 0.0
@@ -52,10 +138,29 @@ async def get_treasury_dashboard(db=Depends(get_db)):
             if frm in vaults: vaults[frm] -= amt
             if to in vaults: vaults[to] += amt
 
+        # 🚀 3. THE MAGIC: Fetch live Mam-laka Web2 Balances and OVERRIDE the Ledger
+        # This guarantees your fiat and airtime numbers are always 100% physically accurate!
+        mam_laka_res = daraja.get_merchant_balance()
+        fiat_balances = mam_laka_res.get("data", {}) if mam_laka_res.get("status") == "success" else {}
+        
+        mam_laka_total = 0.0
+
+        if fiat_balances:
+            # Route the ARTM float to the Airtel Node since that's our live corridor
+            vaults["N2_AIRTEL"] = fiat_balances.get("artmBalance", 0.0) 
+            # Live KES Payout Float
+            vaults["N4_MPESA"] = fiat_balances.get("kesBalance", 0.0)   
+            # Live IMP Treasury
+            vaults["N8_IMP"] = fiat_balances.get("impaBalance", 0.0)    
+            
+            # Extract the Web2 Grand Total
+            mam_laka_total = fiat_balances.get("totalBalance", 0.0)
+
         return {
             "status": "success",
             "vaults": vaults,
-            "settlements": settlements
+            "settlements": settlements,
+            "web2_total_kes": mam_laka_total  # <-- Pass it to React here!
         }
     except Exception as e:
         traceback.print_exc()
@@ -72,15 +177,21 @@ async def reset_treasury_sandbox(db=Depends(get_db)):
     ]
     await db["transactions"].insert_many(genesis_entries)
     
-    from services.cache import memory_cache
-    memory_cache.set("system:kill_switch", False)
+    try:
+        from Brain_Engine.cache import memory_cache
+        memory_cache.set("system:kill_switch", False)
+    except:
+        pass
     
     return {"status": "success", "message": "Sandbox reset to Genesis. Kill switch lifted."}
 
 @router.post("/kill-switch")
 async def toggle_kill_switch(req: dict):
-    from services.cache import memory_cache
-    memory_cache.set("system:kill_switch", req.get("active", False))
+    try:
+        from Brain_Engine.cache import memory_cache
+        memory_cache.set("system:kill_switch", req.get("active", False))
+    except:
+        pass
     return {"status": "success"}
 
 class SimSwapReq(BaseModel):
@@ -93,27 +204,3 @@ class SimSwapReq(BaseModel):
 async def simulate_swap(req: SimSwapReq, db=Depends(get_db)):
     from routes.ramp import execute_internal_swap
     return await execute_internal_swap(req, db)
-
-class CorridorRequest(BaseModel):
-    amount_kes: float
-
-@router.post("/corridor/airtime-celo")
-async def trigger_airtime_celo_corridor(req: CorridorRequest, db=Depends(get_db)):
-    if req.amount_kes <= 0:
-        raise HTTPException(status_code=400, detail="Amount must be greater than zero.")
-
-    try:
-        corridor = AirtimeCeloCorridor(db_collection=db["transactions"])
-        # Pass the KES amount directly to our updated function
-        result = await corridor.execute_from_kes(deployed_kes=req.amount_kes)
-        
-        return {
-            "status": "success",
-            "message": f"Airtel -> Celo Corridor executed. Yielded {result['yield_percent']}%",
-            "data": result
-        }
-        
-    except Exception as e:
-        traceback.print_exc() 
-        print(f"Corridor Execution Error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Backend Error: {str(e)}")

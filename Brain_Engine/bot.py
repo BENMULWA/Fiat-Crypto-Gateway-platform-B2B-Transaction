@@ -1,105 +1,92 @@
 import asyncio
-from Brain_Engine.state_engine import ImmutableLedger, HFTCorridorFSM, FSMState
+from Brain_Engine.state_engine import ImmutableLedger
 from Brain_Engine.cache import memory_cache
+from Brain_Engine.Discovery_Engine import IMMDiscoveryEngine
 
 class DecisionEngine:
-    """
-    The Algorithmic Decision Engine (Section 5 of the White Paper).
-    Runs continuously, monitoring nodes and triggering FSM Corridors.
-    """
     def __init__(self):
         self.is_running = False
         self.total_portfolio_usd = 0.0
+        self.discovery_api = IMMDiscoveryEngine() 
 
     async def scan_and_evaluate(self, ledger: ImmutableLedger):
-        """
-        Step 1 & 2: Query Vault Allocation & Calculate Liquidity Scores.
-        """
         # Fetch live balances from the Immutable Ledger
-        n1_airt = await ledger.get_balance("N1", "AIRTIME_KES")
-        n4_kes = await ledger.get_balance("N4", "KES")
-        n7_usda = await ledger.get_balance("N7", "USDA")
+        n1_airt = await ledger.get_balance("N1_TELKOM", "AIRTIME_KES")
+        n2_airt = await ledger.get_balance("N2_AIRTEL", "AIRTIME_KES")
+        n4_kes = await ledger.get_balance("N4_MPESA", "KES")
+        n7_usda = await ledger.get_balance("N7_USDA", "USDA")
         
-        # Calculate Total Portfolio Value (Simplified for N1, N4, N7)
-        self.total_portfolio_usd = (
-            (n1_airt / 130.50) + 
-            (n4_kes / 130.50) + 
-            n7_usda
-        )
-
-        # Calculate Node Liquidity Percentages
-        if self.total_portfolio_usd > 0:
-            n4_pct = (n4_kes / 130.50) / self.total_portfolio_usd
-            n7_pct = n7_usda / self.total_portfolio_usd
-        else:
-            n4_pct = n7_pct = 1.0
+        self.total_portfolio_usd = ((n1_airt + n2_airt + n4_kes) / 130.50) + n7_usda
+        
+        n4_pct = (n4_kes / 130.50) / self.total_portfolio_usd if self.total_portfolio_usd > 0 else 1.0
+        n7_pct = n7_usda / self.total_portfolio_usd if self.total_portfolio_usd > 0 else 1.0
 
         return {"N4_PCT": n4_pct, "N7_PCT": n7_pct, "N7_BAL": n7_usda}
 
-    async def pathfind_roi(self) -> float:
-        """
-        Step 3: Calculate projected ROI based on external cache rates.
-        """
-        binance_rate = memory_cache.get("rates:binance_usdt_kes")
-        telkom_discount = 0.10 # 10%
-        internal_mint = 118.75 # Internal KES to USDA cost
+    async def rank_opportunities(self) -> dict:
+        print("   🔍 Scanning available live corridors...")
         
-        # Projected Multiplier for 1 cycle: (125 / 0.9) / 118.75 = 1.169x
-        # For 5 cycles, we approximate compound yield.
-        projected_roi = 1.2865 
-        return projected_roi
+        airtel_data = self.discovery_api.project_corridor_yield(discount_rate=0.06, fx_edge_pct=0.0)
+        telkom_data = self.discovery_api.project_corridor_yield(discount_rate=0.10, fx_edge_pct=0.05)
+        
+        opportunities = [
+            {"name": "SAFARICOM/AIRTEL LIVE", "discount": 0.06, "roi": airtel_data["projected_profit_pct"], "is_live": True},
+            {"name": "TELKOM SIMULATED", "discount": 0.10, "roi": telkom_data["projected_profit_pct"], "is_live": False}
+        ]
+        
+        live_opps = [opp for opp in opportunities if opp["is_live"]]
+        live_opps.sort(key=lambda x: x["roi"], reverse=True)
+        
+        winner = live_opps[0]
+        print(f"   🏆 Highest LIVE ROI Opportunity: {winner['name']} (+{winner['roi']}%)")
+        return winner
 
     async def start(self, db):
         self.is_running = True
-        print("\n🟢 HFT Decision Engine Started: Scanning 12-Node Matrix...")
+        print("\n🟢 HFT Decision Engine Started: Scanning Matrix for LIVE Execution...")
         
         ledger = ImmutableLedger(db_collection=db["transactions"])
         
         while self.is_running:
-            # 1. Check Global Kill Switch
             if memory_cache.get("system:kill_switch"):
-                print("🛑 SYSTEM_HALT: Engine paused via Admin Kill Switch.")
+                print("🛑 SYSTEM_HALT: Engine paused via Admin Kill Switch.") #
                 await asyncio.sleep(5)
                 continue
 
-            # 2. Scan & Evaluate Nodes
             node_health = await self.scan_and_evaluate(ledger)
-            
-            # 3. CIRCUIT BREAKER (Check if any core node < 5% liquidity)
-            if node_health["N4_PCT"] < 0.05 or node_health["N7_PCT"] < 0.05:
-                print(f"⚠️ CIRCUIT BREAKER FIRED: Core node liquidity below 5%.")
-                print("   Action: Freezing Corridors. Awaiting OTC Rebalance.")
-                memory_cache.set("system:kill_switch", True) # Auto-trip the kill switch
-                continue
+            best_route = await self.rank_opportunities()
+            target_roi = memory_cache.get("corridor:target_roi") or 1.0 
 
-            # 4. Pathfinding
-            expected_roi = await self.pathfind_roi()
-            target_roi = memory_cache.get("corridor:target_roi")
-
-            # 5. Execute
-            # DYNAMIC ALLOCATION: Only trade 10% of the available N7_USDA balance to manage risk
-            trade_allocation = node_health["N7_BAL"] * 0.10
-            
-            if expected_roi >= target_roi and trade_allocation >= 50:
-                print(f"\n⚡ EXECUTE: Deploying ${trade_allocation:,.2f} USDA into FSM Corridor...")
+            if best_route["roi"] >= target_roi:
+                live_trade_allocation_kes = 5.0 
+                print(f"\n⚡ EXECUTE: Deploying {live_trade_allocation_kes} KES into {best_route['name']}...")
                 
-                # Spawn the 5-Step Finite State Machine with DYNAMIC CAPITAL
-                fsm = HFTCorridorFSM(ledger=ledger, starting_capital_usd=trade_allocation)
-                await fsm.boot_system()
+                try:
+                    from Brain_Engine.corridor_1_airtime import AirtimeCeloCorridor
+                    live_corridor = AirtimeCeloCorridor(db_collection=db["transactions"])
+                    
+                    result = await live_corridor.execute_from_kes(deployed_kes=live_trade_allocation_kes)
+                    
+                    print(f"✅ LIVE TRADE SUCCESS: +${result['profit_usda']:.4f} USDC Captured.")
+                    print(f"🔗 Celo TxHash: {result['tx_hash']}")
+                    
+                    # 🟢 FIX: The Single-Shot Safety Lock
+                    print("🛑 [SAFETY LOCK] Auto-tripping Kill Switch after 1 successful live trade to prevent float drain.")
+                    memory_cache.set("system:kill_switch", True)
+                    
+                except Exception as e:
+                    print(f"❌ LIVE EXECUTION FAILED: {str(e)}")
+                    print("🛑 Tripping Global Kill Switch to protect funds.")
+                    memory_cache.set("system:kill_switch", True)
                 
-                while fsm.state != FSMState.COMPLETED and self.is_running:
-                    await fsm.tick()
-                    await asyncio.sleep(0.5) # Slowed down slightly so you can watch the UI update!
-                
-                print("💤 Corridor Complete. Engine resting for 10s...")
-                await asyncio.sleep(10)
+                print("💤 Corridor Complete. Waiting for Admin to resume...")
+                await asyncio.sleep(5)
             else:
-                print(f"⏳ Engine Tick: Insufficient capital (${trade_allocation:,.2f}) or low ROI. Resting.")
+                print(f"⏳ Engine Tick: Best route (+{best_route['roi']}%) is below threshold. Resting.")
                 await asyncio.sleep(5)
 
     def stop(self):
         print("\n🛑 HFT Decision Engine Shutting Down...")
         self.is_running = False
 
-# Singleton Export
 hft_bot = DecisionEngine()

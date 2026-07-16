@@ -5,6 +5,8 @@ from datetime import datetime
 from pydantic import BaseModel, Field
 from typing import List, Dict, Optional
 
+from Brain_Engine.celo_integrations import corridor_api
+
 # =====================================================================
 # 1. SCHEMAS & DATA MODELS
 # =====================================================================
@@ -15,7 +17,7 @@ class TransactionType(str, Enum):
     MINT = "MINT"
     TRANSFER = "TRANSFER"
     CELO_EXIT = "CELO_EXIT"
-    SYSTEM_FUND = "SYSTEM_FUND"
+    SYSTEM_FUND = "SYSTEM_c import corridor_apiFUND"
 
 class FSMState(str, Enum):
     IDLE = "IDLE"
@@ -103,36 +105,44 @@ class ImmutableLedger:
 
 class HFTCorridorFSM:
     """
-    Executes the N1 -> N4 -> N7 -> N9 compounding strategy.
+    Executes dynamic compounding strategies (e.g. N1->N4->N7->N9 or N2->N5->N7->N9).
     Strictly transitions through states to prevent gas-fee leakage.
-    Now entirely asynchronous for FastAPI integration.
     """
-    def __init__(self, ledger: ImmutableLedger, starting_capital_usd: float):
+    def __init__(self, ledger: ImmutableLedger, starting_capital_usd: float, config: dict = None):
         self.ledger = ledger
         self.state = FSMState.IDLE
-        self.current_cycle = 1
-        self.max_cycles = 5
         
-        # Working variables for the state machine
+        # --- DYNAMIC CONFIGURATION INJECTED FROM THE DEALING DESK ---
+        config = config or {}
+        self.current_cycle = 1
+        self.max_cycles = config.get("cycles", 5)
+        
         self.current_usd_principal = starting_capital_usd
         self.current_kes_float = 0.0
         
-        # Hardcoded FSM Math Vectors
-        self.BASE_RATE = 125.00
-        self.TELKOM_DISCOUNT = 0.10 # 10%
-        self.INTERNAL_FX_RATE = 107.95 # The exact rate needed to hit the 1.28x multiplier from the UI
+        # Dynamic Math Vectors
+        self.BASE_RATE = config.get("baseline_rate", 129.50)
+        self.DISCOUNT = config.get("discount", 0.06) 
+        self.FX_EDGE = config.get("fx_edge", 0.0)
+        self.INTERNAL_FX_RATE = self.BASE_RATE * (1 - self.FX_EDGE)
+        
+        # Dynamic Routing Nodes
+        self.NODE_PROCURE = config.get("node_procure", "N2") # Default to Airtel
+        self.NODE_LIQ = config.get("node_liquidate", "N5")   # Default to Airtel Money
+        self.NODE_MINT = "N7"
+        self.NODE_EXIT = "N9"
 
     async def boot_system(self):
         # System Boot: Fund the Master Wallet (N7) secretly to start the machine
         await self.ledger.append(LedgerEntry(
-            from_node="EXTERNAL", to_node="N7", asset="USDA", 
+            from_node="EXTERNAL", to_node=self.NODE_MINT, asset="USDA", 
             amount=self.current_usd_principal, internal_usd_value=self.current_usd_principal,
             txn_type=TransactionType.SYSTEM_FUND, cycle=0
         ))
 
     async def tick(self):
         """
-        The heartbeat of the FSM. Called continuously by the background worker.
+        The heartbeat of the FSM. led continuously by the background worker.
         """
         if self.state == FSMState.COMPLETED or self.state == FSMState.HALTED:
             return
@@ -162,21 +172,30 @@ class HFTCorridorFSM:
 
     # --- STATE 1: PROCURE ---
     async def _execute_procure(self):
-        """N7 (USDA) -> N1 (Telkom Airtime). Capture 10% wholesale discount."""
-        print(f"\n[CYCLE {self.current_cycle}] STATE 1: PROCURE")
+        """Master Wallet -> Airtime Node. Capture wholesale discount."""
+        print(f"\n[CYCLE {self.current_cycle}] STATE 1: PROCURE via {self.NODE_PROCURE}")
         
-        airtime_value_kes = (self.current_usd_principal * self.BASE_RATE) / (1 - self.TELKOM_DISCOUNT)
+        try:
+            # 🚀 EXTERNAL API CALL: Buy Airtime
+            airtime_value_kes = await corridor_api.buy_telkom_airtime(
+                self.current_usd_principal, 
+                self.DISCOUNT
+            )
+        except Exception as e:
+            print(f"  ↳ ❌ EXTERNAL API FAILED: {e}")
+            self.state = FSMState.HALTED
+            return
         
-        # 1. Debit N7 (Master Wallet)
+        # 1. Debit Master Wallet
         await self.ledger.append(LedgerEntry(
-            from_node="N7", to_node="MARKET", asset="USDA",
+            from_node=self.NODE_MINT, to_node="MARKET", asset="USDA",
             amount=self.current_usd_principal, internal_usd_value=self.current_usd_principal,
             txn_type=TransactionType.TRANSFER, cycle=self.current_cycle
         ))
         
-        # 2. Credit N1 (Telkom Airtime Node)
+        # 2. Credit Airtime Node
         await self.ledger.append(LedgerEntry(
-            from_node="MARKET", to_node="N1", asset="AIRTIME_KES",
+            from_node="MARKET", to_node=self.NODE_PROCURE, asset="AIRTIME_KES",
             amount=airtime_value_kes, internal_usd_value=self.current_usd_principal,
             txn_type=TransactionType.PROCURE, cycle=self.current_cycle
         ))
@@ -187,33 +206,41 @@ class HFTCorridorFSM:
 
     # --- STATE 2: LIQUIDATE ---
     async def _execute_liquidate(self):
-        """N1 (Telkom Airtime) -> N4 (M-Pesa Float). Fiat Realization."""
-        print(f"[CYCLE {self.current_cycle}] STATE 2: LIQUIDATE")
+        """Airtime Node -> Mobile Money Float. Fiat Realization."""
+        print(f"[CYCLE {self.current_cycle}] STATE 2: LIQUIDATE via {self.NODE_LIQ}")
+        
+        try:
+            # 🚀 EXTERNAL API CALL: Liquidate to Fiat
+            await corridor_api.liquidate_to_fiat(self.current_kes_float)
+        except Exception as e:
+            print(f"  ↳ ❌ EXTERNAL API FAILED: {e}")
+            self.state = FSMState.HALTED
+            return
         
         await self.ledger.append(LedgerEntry(
-            from_node="N1", to_node="N4", asset="KES",
+            from_node=self.NODE_PROCURE, to_node=self.NODE_LIQ, asset="KES",
             amount=self.current_kes_float, internal_usd_value=self.current_usd_principal,
             txn_type=TransactionType.LIQUIDATE, cycle=self.current_cycle
         ))
         
-        print(f"  ↳ Liquidated Airtime to {self.current_kes_float:,.2f} KES in M-Pesa Super-Agent (N4)")
+        print(f"  ↳ Liquidated Airtime to {self.current_kes_float:,.2f} KES Float")
         await self._transition_to(FSMState.MINT)
 
     # --- STATE 3: MINT ---
     async def _execute_mint(self):
-        """N4 (M-Pesa Float) -> N7 (USDA). Spread Capture."""
+        """Mobile Money Float -> USDA. Spread Capture."""
         print(f"[CYCLE {self.current_cycle}] STATE 3: MINT USDA")
         
         new_usda_amount = self.current_kes_float / self.INTERNAL_FX_RATE
         profit = new_usda_amount - self.current_usd_principal
         
         await self.ledger.append(LedgerEntry(
-            from_node="N4", to_node="N7", asset="USDA",
+            from_node=self.NODE_LIQ, to_node=self.NODE_MINT, asset="USDA",
             amount=new_usda_amount, internal_usd_value=new_usda_amount,
             txn_type=TransactionType.MINT, cycle=self.current_cycle
         ))
         
-        print(f"  ↳ Minted ${new_usda_amount:,.2f} USDA. (Profit: +${profit:,.2f})")
+        print(f"  ↳ Minted ${new_usda_amount:,.4f} USDA. (Profit: +${profit:,.4f})")
         self.current_usd_principal = new_usda_amount
         await self._transition_to(FSMState.ROLLOVER)
 
@@ -230,17 +257,25 @@ class HFTCorridorFSM:
 
     # --- STATE 5: CELO EXIT ---
     async def _execute_celo_exit(self):
-        """N7 (USDA) -> N9 (USDC). Final blockchain settlement."""
-        print(f"\n[FINAL] STATE 5: CELO EXIT")
+        """USDA -> USDC. Final blockchain settlement."""
+        print(f"\n[FINAL] STATE 5: CELO EXIT via {self.NODE_EXIT}")
+        
+        try:
+            # 🚀 EXTERNAL API CALL: Swap USDA to USDC on Celo Blockchain
+            tx_hash = await corridor_api.execute_celo_dex_swap(self.current_usd_principal)
+            print(f"  ↳ 🔗 Blockchain Hash: {tx_hash}")
+        except Exception as e:
+            print(f"  ↳ ❌ SMART CONTRACT FAILED: {e}")
+            self.state = FSMState.HALTED
+            return
         
         await self.ledger.append(LedgerEntry(
-            from_node="N7", to_node="N9", asset="USDC",
+            from_node=self.NODE_MINT, to_node=self.NODE_EXIT, asset="USDC",
             amount=self.current_usd_principal, internal_usd_value=self.current_usd_principal,
-            txn_type=TransactionType.CELO_EXIT, cycle=5
+            txn_type=TransactionType.CELO_EXIT, cycle=self.current_cycle
         ))
         
         print(f"  ↳ 🚀 SUCCESS: ${self.current_usd_principal:,.2f} USDC settled on Celo Blockchain.")
-        print(f"  ↳ Only 1 blockchain gas fee paid across 5 arbitrage cycles.")
         await self._transition_to(FSMState.COMPLETED)
 
 # =====================================================================

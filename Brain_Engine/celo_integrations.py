@@ -49,10 +49,13 @@ class CorridorIntegrations:
         # Celo uses Proof-of-Authority (PoA) consensus, requiring this middleware to handle the extra data in blocks
         self.w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)        
         # Auto-derive the Hot Wallet from your 12 words!
+        # Auto-derive the Hot Wallet from your 12 words!
         seed_phrase = os.getenv("CELO_MNEMONIC")
         if seed_phrase:
             account = Account.from_mnemonic(seed_phrase)
             self.treasury_private_key = account.key.hex()
+            
+            # MAKE SURE IT SAYS THIS 
             self.exit_address = os.getenv("CELO_EXIT_ADDRESS")
         else:
             self.treasury_private_key = None
@@ -63,7 +66,7 @@ class CorridorIntegrations:
 
     async def buy_telkom_airtime(self, usd_principal: float, discount_rate: float) -> float:
         """STATE 1: Procure wholesale airtime (Simulated for Celo testing)"""
-        base_rate = 130.50
+        base_rate = 129.50
         kes_value = (usd_principal * base_rate) / (1 - discount_rate)
         
         if not self.live_mode:

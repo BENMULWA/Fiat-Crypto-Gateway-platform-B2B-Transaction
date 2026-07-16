@@ -1,3 +1,6 @@
+# Excute the celo integration credentials script to generate the wallet address 
+# and private key for the treasury wallet. This script reads the CELO_MNEMONIC from the .env file and derives the wallet credentials.
+
 import os
 from dotenv import load_dotenv
 from eth_account import Account

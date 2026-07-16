@@ -8,10 +8,15 @@ from config import settings
 from database import get_client, get_db
 
 # Routers (The Web Traffic)
-from routes import auth, dashboard, market_maker, trade, ramp, airtime_ledger, general_ledger, rates, tokens, cardano, treasury
+from routes import auth, dashboard, market_maker, trade, ramp, airtime_ledger, general_ledger, rates, tokens, cardano, treasury, retail
 
 # The Background HFT Engine (The Brain)
 from Brain_Engine.bot import hft_bot
+
+# Valora Router
+from routes.valora import router as valora
+
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -84,10 +89,12 @@ app.include_router(rates.router)
 app.include_router(tokens.router)
 app.include_router(cardano.router)
 app.include_router(treasury.router)
+app.include_router(retail.router)
+
+#valora router
+app.include_router(valora)
 
 # Basic Health Check Route
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "meshex-api"}
-
-
