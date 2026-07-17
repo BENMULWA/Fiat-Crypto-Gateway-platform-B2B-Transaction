@@ -3,9 +3,13 @@ from pydantic import BaseModel
 from datetime import datetime
 import uuid
 import requests
+import json
+import re
 
 from database import get_db
+from routes.auth import get_current_user
 from services.safaricom_daraja import DarajaService
+from broadcast import broadcast_manager
 
 router = APIRouter(prefix="/api/ramp", tags=["Ramp & Swaps"])
 mam_laka = DarajaService()
@@ -21,8 +25,8 @@ class RampExecute(BaseModel):
     counterparty: str
 
 @router.post("/execute", status_code=201)
-async def execute_ramp(body: RampExecute, db=Depends(get_db)):
-    current_user = {"_id": "test_user_123"}
+async def execute_ramp(body: RampExecute, db=Depends(get_db), current_user=Depends(get_current_user)):
+    current_user = current_user
     trade_id = f"TRADE_{uuid.uuid4().hex[:8].upper()}"
     
     # Hardcoded for testing to prevent cache crash
@@ -116,17 +120,78 @@ async def execute_ramp(body: RampExecute, db=Depends(get_db)):
 
 @router.post("/b2c/result") 
 async def mamlaka_stk_callback(payload: dict, db=Depends(get_db)):
-    external_id = payload.get("externalId", "") 
-    if external_id.startswith("TRADE_"):
+    """
+    Bulletproof Webhook Catcher.
+    Safaricom/Aggregators nest their JSON unpredictably. This scans the entire 
+    raw payload to find the TRADE_ID and automatically settles the transaction.
+    """
+    payload_str = json.dumps(payload)
+    print(f"🔔 RAW WEBHOOK RECEIVED: {payload_str}")
+    
+    # Aggressive Regex Search for our exact Trade ID format
+    match = re.search(r'(TRADE_[A-Z0-9]{8})', payload_str)
+    external_id = match.group(1) if match else None
+
+    if external_id:
+        print(f"✅ Match Found! Settling Trade: {external_id}")
+        
+        # 1. Update the Ramp History Table to 'completed'
         await db["ramp_entries"].update_one(
             {"_id": external_id}, {"$set": {"status": "completed"}}
         )
+        
+        # 2. Add funds to the user's actual Wallet Balance!
+        updated = await db["ramp_entries"].find_one({"_id": external_id})
+        if updated:
+            user_id = updated.get("userId")
+            
+            # If it's a deposit, we credit their KES wallet
+            if updated.get("direction") == 'on':
+                inc_amount = float(updated.get("fromAmount", 0))
+                await db["retail_wallets"].update_one(
+                    {"userId": user_id}, 
+                    {"$inc": {"KES": inc_amount}}, 
+                    upsert=True
+                )
+                print(f"💰 Credited {inc_amount} KES to User: {user_id}")
+                
+            # Attempt WebSocket broadcast (fail silently if not connected)
+            try:
+                entry_data = {
+                    "type": "ramp_update",
+                    "entry": {
+                        "id": str(updated.get("_id")),
+                        "direction": updated.get("direction"),
+                        "channel": updated.get("channel"),
+                        "fromAsset": updated.get("fromAsset"),
+                        "toAsset": updated.get("toAsset"),
+                        "fromAmount": updated.get("fromAmount"),
+                        "toAmount": updated.get("toAmount"),
+                        "status": "completed",
+                        "date": updated.get("date"),
+                        "timeAgo": "Just now"
+                    }
+                }
+                await broadcast_manager.send_user(user_id, entry_data)
+                
+                wallet = await db["retail_wallets"].find_one({"userId": user_id})
+                balances = {
+                    "KES": wallet.get("KES", 0) if wallet else 0,
+                    "USDA": wallet.get("USDA", 0) if wallet else 0,
+                    "IMP": wallet.get("IMP", 0) if wallet else 0,
+                }
+                await broadcast_manager.send_user(user_id, {"type": "wallet_update", "balances": balances})
+            except Exception:
+                pass
+    else:
+        print("⚠️ Ignored Webhook: No TRADE_ id found in payload.")
+
     return {"status": "acknowledged"}
 
 @router.get("/history")
-async def get_ramp_history(db=Depends(get_db)):
-    current_user = {"_id": "test_user_123"}
-    cursor = db["ramp_entries"].find({"userId": current_user["_id"]}).sort("_id", -1).limit(20)
+async def get_ramp_history(db=Depends(get_db), current_user=Depends(get_current_user)):
+    user_id = current_user["_id"]
+    cursor = db["ramp_entries"].find({"userId": user_id}).sort("_id", -1).limit(20)
     entries = await cursor.to_list(length=20)
     
     formatted_entries = []

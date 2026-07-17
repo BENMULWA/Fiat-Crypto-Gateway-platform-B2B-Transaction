@@ -101,7 +101,8 @@ async def signup(data: dict, db=Depends(get_db)):
         "password": hashed, 
         "displayName": display, 
         "role": "admin", 
-        "workspaceId": workspace_id_str
+        "workspaceId": workspace_id_str,
+        "kycStatus": "pending"
     }
     res = await users.insert_one(user_doc)
     user_doc["_id"] = str(res.inserted_id)
@@ -125,6 +126,16 @@ async def signup(data: dict, db=Depends(get_db)):
         "workspaceId": workspace_id_str,
         "walletAddress": user_doc.get("walletAddress")
     })
+    # Initialize an empty retail wallet for this user
+    try:
+        await db["retail_wallets"].insert_one({
+            "userId": user_doc["_id"],
+            "KES": 0.0,
+            "USDA": 0.0,
+            "IMP": 0.0
+        })
+    except Exception:
+        pass
     
     return {
         "access_token": token, 
@@ -134,7 +145,8 @@ async def signup(data: dict, db=Depends(get_db)):
             "displayName": display, 
             "role": user_doc["role"], 
             "workspaceId": workspace_id_str,
-            "walletAddress": user_doc.get("walletAddress")
+            "walletAddress": user_doc.get("walletAddress"),
+            "kycStatus": user_doc.get("kycStatus", "pending")
         }
     }
 
@@ -181,6 +193,7 @@ async def login(data: dict, db=Depends(get_db)):
             "displayName": user.get("displayName"), 
             "role": user.get("role", "user"), 
             "workspaceId": workspace,
-            "walletAddress": wallet_address
+            "walletAddress": wallet_address,
+            "kycStatus": user.get("kycStatus", "pending")
         }
     }
