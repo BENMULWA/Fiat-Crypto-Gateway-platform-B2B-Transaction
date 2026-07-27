@@ -100,7 +100,7 @@ async def signup(data: dict, db=Depends(get_db)):
         "email": email.lower(), 
         "password": hashed, 
         "displayName": display, 
-        "role": "admin", 
+        "role": "retail", 
         "workspaceId": workspace_id_str,
         "kycStatus": "pending"
     }
@@ -197,3 +197,13 @@ async def login(data: dict, db=Depends(get_db)):
             "kycStatus": user.get("kycStatus", "pending")
         }
     }
+
+
+#=============================================
+# Checks iff the user is still logged in when they refrsh the page.
+#=============================================
+
+@router.get("/me")
+async def get_me(current_user: dict = Depends(get_current_user)):
+    """Returns the current user's data based on their token"""
+    return {"user": current_user}

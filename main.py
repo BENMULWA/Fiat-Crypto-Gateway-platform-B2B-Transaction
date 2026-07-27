@@ -7,16 +7,18 @@ import asyncio
 from config import settings
 from database import get_client, get_db
 
-# Routers (The Web Traffic)
-from routes import auth, dashboard, market_maker, trade, ramp, airtime_ledger, general_ledger, rates, tokens, cardano, treasury, retail
-
 # The Background HFT Engine (The Brain)
-from Brain_Engine.bot import hft_bot
+try:
+    from Brain_Engine.bot import hft_bot
+except ImportError:
+    hft_bot = None
 
-# Valora Router
-from routes.valora import router as valora
-
-
+# Routers (The Web Traffic)
+from routes import (
+    auth, dashboard, market_maker, trade, ramp, 
+    airtime_ledger, general_ledger, rates, tokens, 
+    cardano, treasury, retail, otc_admin, swap_engine, valora
+)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -33,14 +35,14 @@ async def lifespan(app: FastAPI):
         await client.admin.command("ping")
         print("✓ Connected to MongoDB")
         
-        # Start the HFT Bot in the background!
-        # create_task ensures it runs without blocking your web traffic
-        db = get_db()
-        bot_task = asyncio.create_task(hft_bot.start(db))
-        print("✓ HFT Background Bot Initiated")
-        
+        # Start the HFT Bot in the background
+        if hft_bot:
+            db = get_db()
+            bot_task = asyncio.create_task(hft_bot.start(db))
+            print("✓ HFT Background Bot Initiated")
+            
     except Exception as e:
-        print(f"✗ MongoDB connection failed: {e}")
+        print(f"✗ Startup Error: {e}")
         
     # ==========================================
     # 2. RUNTIME (Server handles web requests here)
@@ -52,13 +54,14 @@ async def lifespan(app: FastAPI):
     # ==========================================
     print("🛑 Shutting down Meshex Server...")
     
-    if bot_task:
+    if bot_task and hft_bot:
         hft_bot.stop()
         await bot_task
         print("✓ HFT Background Bot safely stopped.")
         
     client.close()
     print("✓ MongoDB connection closed.")
+
 
 # Initialize FastAPI Application
 app = FastAPI(
@@ -68,16 +71,16 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Core Security Middlewares
+# Configure CORS (Dynamic allow-all patch to clear browser blocks instantly)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # ⚡ Dynamic allow-all patch to clear browser blocks instantly
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Register all API routes
+# Register all API routes securely
 app.include_router(auth.router)
 app.include_router(dashboard.router)
 app.include_router(market_maker.router)
@@ -90,11 +93,15 @@ app.include_router(tokens.router)
 app.include_router(cardano.router)
 app.include_router(treasury.router)
 app.include_router(retail.router)
+app.include_router(otc_admin.router)
+app.include_router(swap_engine.router)
+app.include_router(valora.router)
 
-#valora router
-app.include_router(valora)
+# Health Check Routes
+@app.get("/")
+async def root():
+    return {"message": "Mamlaka API is running", "status": "ok"}
 
-# Basic Health Check Route
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "meshex-api"}
