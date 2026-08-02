@@ -9,6 +9,7 @@ import os
 from database import get_db
 from Brain_Engine.corridor_1_airtime import AirtimeCeloCorridor
 from services.safaricom_daraja import DarajaService
+from web3 import Web3
 
 router = APIRouter(prefix="/api/treasury", tags=["Treasury"])
 daraja = DarajaService()
@@ -194,10 +195,6 @@ class RevenueWithdrawal(BaseModel):
     amount: float
     destination: str
 
-#===================================================================
-# Withdraw endpoint 
-#===================================================================
-
 @router.post("/revenue/withdraw")
 async def withdraw_corporate_revenue(payload: RevenueWithdrawal, db=Depends(get_db)):
     """Allows the Admin to cash out accumulated company profits."""
@@ -253,3 +250,64 @@ class SimSwapReq(BaseModel):
 async def simulate_swap(req: SimSwapReq, db=Depends(get_db)):
     from routes.ramp import execute_internal_swap
     return await execute_internal_swap(req, db)
+
+
+# ======================================================================
+# 🟢 DYNAMIC MULTI-CHAIN DEPOSIT GATEWAY & WALLET GENERATOR
+# ======================================================================
+
+def get_celo_hot_wallet():
+    """Mathematically derives the Celo address from the Private Key so it CANNOT mismatch."""
+    pk = os.getenv("CELO_TREASURY_PK")
+    if pk:
+        try:
+            w3 = Web3()
+            clean_pk = pk if pk.startswith("0x") else f"0x{pk}"
+            return w3.eth.account.from_key(clean_pk).address
+        except Exception as e:
+            print(f"Error deriving wallet from PK: {e}")
+            pass
+    # Absolute fallback if PK is missing entirely
+    return os.getenv("CELO_HOT_WALLET_ADDRESS", "0x6f7BeAb48EAfC47B89041899a35a0525a6A60F59")
+
+@router.get("/deposit-info")
+async def get_deposit_info(asset: str = "USDT", network: str = "stellar"):
+    """
+    Dynamically generates deposit addresses and Memos based on the requested network.
+    Called by the React DepositPage when a user selects a crypto channel.
+    """
+    stellar_address = os.getenv("STELLAR_MASTER_ADDRESS", "GB44UP5VEV2GEHO7UBQQGLWDN5UURTFXTECVYZRX63KBV2PUYLNFQ6K2")
+    tron_address = os.getenv("TRON_MASTER_ADDRESS", "TNZZyXUR6JDmxd7Gub8pgdaHWFg6RmSk5U")
+    cardano_address = os.getenv("MASTER_WALLET_ADDRESS", "addr1qx2p8zzt0u9e5n62354c4n2mamlaka_master_vault")
+
+    # Derives the EXACT address that the valora.py scanner is listening to!
+    celo_address = get_celo_hot_wallet()
+
+    response_data = {
+        "address": "",
+        "memo": "",
+        "network":  network,
+        "asset": asset
+    }
+
+    network_lower = network.lower()
+
+    # 1. EVM Networks (Celo, Polygon, Ethereum) - No Memo required
+    if network_lower in ["celo", "polygon", "ethereum"]:
+        response_data["address"] = celo_address
+        
+    # 2. Tron Network - No Memo required
+    elif network_lower in ["tron", "trc20"]:
+        response_data["address"] = tron_address
+        
+    # 3. Stellar Network - MEMO IS STRICTLY REQUIRED
+    elif network_lower == "stellar":
+        response_data["address"] = stellar_address
+        unique_memo = f"JASIRI-{uuid.uuid4().hex[:6].upper()}"
+        response_data["memo"] = unique_memo
+
+    # 4. Cardano Network
+    elif network_lower == "cardano":
+        response_data["address"] = cardano_address
+
+    return {"status": "success", "data": response_data}

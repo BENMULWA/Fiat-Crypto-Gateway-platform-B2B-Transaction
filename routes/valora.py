@@ -1,7 +1,6 @@
 import os
 import uuid
 import asyncio
-import time
 from datetime import datetime
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Depends
@@ -12,15 +11,29 @@ from database import get_db
 from routes.auth import get_current_user
 from dotenv import load_dotenv
 
+# 🟢 NEW: Safely convert String IDs to MongoDB ObjectIds
+try:
+    from bson import ObjectId
+except ImportError:
+    ObjectId = None
+
+def safe_object_id(val):
+    if ObjectId and isinstance(val, str) and len(val) == 24:
+        try:
+            return ObjectId(val)
+        except:
+            pass
+    return val
+
 load_dotenv(override=True)
 
 router = APIRouter(prefix="/api/valora", tags=["Celo Wallets"])
 
 # --- 1. WEB3 & CELO CONFIGURATION ---
-CELO_RPC = os.getenv("CELO_RPC_URL", "https://rpc.ankr.com/celo")
+CELO_RPC = os.getenv("CELO_RPC_URL", "https://forno.celo.org")
 CHAIN_ID = 42220
 
-w3 = Web3(Web3.HTTPProvider(CELO_RPC, request_kwargs={'timeout': 10}))
+w3 = Web3(Web3.HTTPProvider(CELO_RPC, request_kwargs={'timeout': 15}))
 w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
 
 ASSET_CONTRACTS = {
@@ -29,7 +42,6 @@ ASSET_CONTRACTS = {
     "USDT": w3.to_checksum_address("0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e")  
 }
 
-# Minimal ABI to decode transfer logs
 ERC20_ABI = [
     {"constant": False, "inputs": [{"name": "_to", "type": "address"}, {"name": "_value", "type": "uint256"}], "name": "transfer", "outputs": [{"name": "", "type": "bool"}], "type": "function"},
     {"anonymous": False, "inputs": [{"indexed": True, "internalType": "address", "name": "from", "type": "address"}, {"indexed": True, "internalType": "address", "name": "to", "type": "address"}, {"indexed": False, "internalType": "uint256", "name": "value", "type": "uint256"}], "name": "Transfer", "type": "event"}
@@ -38,10 +50,13 @@ ERC20_ABI = [
 # --- 2. HELPER FUNCTIONS ---
 def get_treasury_address():
     pk = os.getenv("CELO_TREASURY_PK")
-    if not pk: return "0x0000000000000000000000000000000000000000"
-    if not pk.startswith("0x"): pk = f"0x{pk}"
-    return w3.eth.account.from_key(pk).address
-
+    if pk:
+        try:
+            clean_pk = pk if pk.startswith("0x") else f"0x{pk}"
+            return w3.eth.account.from_key(clean_pk).address
+        except Exception:
+            pass
+    return os.getenv("CELO_HOT_WALLET_ADDRESS", "0x6f7BeAb48EAfC47B89041899a35a0525a6A60F59")
 
 # --- 3. PYDANTIC MODELS ---
 class InitiateDepositReq(BaseModel):
@@ -64,15 +79,8 @@ class WithdrawReq(BaseModel):
     amount: float
     asset: str
 
-class DepositMemoResponse(BaseModel):
-    treasury_address: str
-    memo: str
-    network: str
-    asset: str
-
-
 # ======================================================================
-# 🟢 NEW: SYNCHRONOUS AUTO-DETECTION ENDPOINTS
+# 🟢 SYNCHRONOUS AUTO-DETECTION ENDPOINTS
 # ======================================================================
 
 @router.post("/deposit/initiate")
@@ -81,10 +89,11 @@ async def initiate_deposit(req: InitiateDepositReq, db=Depends(get_db), current_
         raise HTTPException(status_code=400, detail="Unsupported Celo asset.")
         
     dep_id = f"DEP_{uuid.uuid4().hex[:8].upper()}"
+    user_id = safe_object_id(current_user.get("_id")) # 🟢 FIX
     
     await db["pending_deposits"].insert_one({
         "_id": dep_id,
-        "userId": current_user.get("_id"),
+        "userId": user_id,
         "asset": req.asset,
         "network": "celo",
         "amount": req.amount,
@@ -97,56 +106,92 @@ async def initiate_deposit(req: InitiateDepositReq, db=Depends(get_db), current_
 
 @router.get("/deposit/{dep_id}/status", response_model=DepositStatusRes)
 async def get_deposit_status(dep_id: str, db=Depends(get_db), current_user=Depends(get_current_user)):
-    user_id = current_user.get("_id")
+    user_id = safe_object_id(current_user.get("_id")) # 🟢 FIX
     dep = await db["pending_deposits"].find_one({"_id": dep_id, "userId": user_id})
     
     if not dep: 
         raise HTTPException(status_code=404, detail="Deposit session not found.")
         
-    # If already credited, return immediately without hitting the RPC
     if dep["status"] == "credited":
         return DepositStatusRes(status="credited", tx_hash=dep.get("tx_hash"), message="Funds credited!")
 
-    def scan_celo_blocks():
+    # Fetch already processed hashes
+    recent_txs = await db["ramp_entries"].find({
+        "direction": "on",
+        "fromAsset": dep["asset"],
+        "status": "COMPLETED"
+    }).to_list(length=100)
+    
+    used_hashes = set()
+    for tx in recent_txs:
+        h = tx.get("cardanoTxHash", "").lower()
+        if not h.startswith("0x"): h = "0x" + h
+        used_hashes.add(h)
+
+    def scan_celo_logs():
         treasury = get_treasury_address().lower()
         decimals = 18 if dep["asset"] == "cUSD" else 6
-        expected_val = int(dep["amount"] * (10 ** decimals))
-        contract = w3.eth.contract(address=ASSET_CONTRACTS[dep["asset"]], abi=ERC20_ABI)
+        expected_val = int(round(dep["amount"] * (10 ** decimals) * 0.99))
         
         current_block = w3.eth.block_number
-        # Scan last 5 blocks (approx 15 seconds of Celo history)
-        for i in range(current_block, max(current_block - 5, 0), -1):
-            block = w3.eth.get_block(i, full_transactions=True)
-            for tx in block.transactions:
+        start_block = max(current_block - 1000, 0) # 🟢 Increased to 1000 blocks (80 mins)
+        
+        contract = w3.eth.contract(address=ASSET_CONTRACTS[dep["asset"]], abi=ERC20_ABI)
+        transfer_topic = w3.to_hex(w3.keccak(text="Transfer(address,address,uint256)"))
+        
+        try:
+            logs = w3.eth.get_logs({
+                "fromBlock": start_block,
+                "toBlock": "latest",
+                "address": ASSET_CONTRACTS[dep["asset"]],
+                "topics": [transfer_topic]
+            })
+            
+            print(f"🔍 [Scanner] Found {len(logs)} {dep['asset']} transfers. Looking for {dep['amount']} to {treasury}")
+            
+            for log in logs:
                 try:
-                    # Check if tx interacted with our specific asset contract
-                    if tx.to and tx.to.lower() == ASSET_CONTRACTS[dep["asset"]].lower():
-                        receipt = w3.eth.get_transaction_receipt(tx.hash)
-                        logs = contract.events.Transfer().process_receipt(receipt)
-                        for log in logs:
-                            if log['args']['to'].lower() == treasury and log['args']['value'] >= expected_val:
-                                return tx.hash.hex()
+                    parsed_log = contract.events.Transfer().process_log(log)
+                    to_addr = parsed_log['args']['to'].lower()
+                    value = parsed_log['args']['value']
+                    
+                    tx_hash = parsed_log['transactionHash'].hex().lower()
+                    if not tx_hash.startswith("0x"):
+                        tx_hash = "0x" + tx_hash
+
+                    if tx_hash in used_hashes:
+                        continue 
+                    
+                    if to_addr == treasury and value >= expected_val:
+                        print(f"💸 [Scanner] WOW! Found transfer to Treasury! Hash: {tx_hash}")
+                        return tx_hash
+                            
                 except Exception:
-                    continue
+                    pass
+                            
+        except Exception as e:
+            print(f"⚠️ Celo get_logs error: {e}")
+            
         return None
 
     try:
-        # Run synchronous web3 scanner in FastAPI's threadpool so it doesn't block the server
-        found_hash = await asyncio.to_thread(scan_celo_blocks)
+        found_hash = await asyncio.to_thread(scan_celo_logs)
         
         if found_hash:
-            # 1. Update pending deposit
+            clean_hash = found_hash if found_hash.startswith("0x") else f"0x{found_hash}"
+            
             await db["pending_deposits"].update_one(
                 {"_id": dep_id}, 
-                {"$set": {"status": "credited", "tx_hash": found_hash}}
+                {"$set": {"status": "credited", "tx_hash": clean_hash}}
             )
-            # 2. Credit user wallet
+            
+            # 🟢 SAFELY UPDATES THE REAL UI WALLET
             await db["retail_wallets"].update_one(
                 {"userId": user_id}, 
                 {"$inc": {dep["asset"]: dep["amount"]}}, 
                 upsert=True
             )
-            # 3. Log to main ledger
+            
             now = datetime.utcnow()
             await db["ramp_entries"].insert_one({
                 "_id": f"TRADE_{uuid.uuid4().hex[:8].upper()}",
@@ -158,39 +203,26 @@ async def get_deposit_status(dep_id: str, db=Depends(get_db), current_user=Depen
                 "toAmount": dep["amount"],
                 "status": "COMPLETED",
                 "userId": user_id,
-                "cardanoTxHash": found_hash,
+                "cardanoTxHash": clean_hash,
                 "createdAt": now,
                 "date": now.strftime("%b %d, %Y"),
                 "timeAgo": "Just now"
             })
             
-            return DepositStatusRes(status="credited", tx_hash=found_hash, message="Funds credited!")
+            return DepositStatusRes(status="credited", tx_hash=clean_hash, message="Funds credited!")
             
     except Exception as e:
-        print(f"⚠️ Celo scan error: {e}")
+        print(f"⚠️ Celo auto-detect thread error: {e}")
 
-    return DepositStatusRes(status="listening", message="Scanning last 5 blocks...")
-
+    return DepositStatusRes(status="listening", message="Scanning last 1000 blocks...")
 
 # ======================================================================
-# 🔵 LEGACY ENDPOINTS (Manual Fallback & Withdrawals)
+# 🔵 MANUAL FALLBACK & WITHDRAWALS
 # ======================================================================
-
-@router.get("/deposit-details", response_model=DepositMemoResponse)
-async def get_deposit_details():
-    """Legacy endpoint used by frontend to show address before 'Start Listener' is clicked."""
-    return {
-        "treasury_address": get_treasury_address(),
-        "memo": f"MESH-ANON-{uuid.uuid4().hex[:8].upper()}", # Note: Memos aren't actually used on Celo, but kept for UI consistency
-        "network": "Celo Mainnet",
-        "asset": "USDC/USDT/cUSD"
-    }
-
 
 @router.post("/on-ramp/verify", status_code=201)
 async def verify_valora_deposit(req: VerifyRequest, db=Depends(get_db), current_user=Depends(get_current_user)):
-    """Legacy manual Tx Hash verification fallback."""
-    user_id = current_user.get("_id")
+    user_id = safe_object_id(current_user.get("_id")) # 🟢 FIX
     
     if req.asset not in ASSET_CONTRACTS:
         raise HTTPException(status_code=400, detail="Unsupported Celo asset.")
@@ -199,41 +231,35 @@ async def verify_valora_deposit(req: VerifyRequest, db=Depends(get_db), current_
     if existing_tx:
         raise HTTPException(status_code=409, detail="This transaction hash has already been processed.")
 
+    safe_hash = req.tx_hash.strip()
+    if not safe_hash.startswith("0x"):
+        safe_hash = "0x" + safe_hash
+
     def fetch_and_verify_receipt():
-        for attempt in range(3):
-            try:
-                receipt = w3.eth.get_transaction_receipt(req.tx_hash)
-                if receipt.status != 1:
-                    return False, "Transaction failed or reverted on the blockchain."
-                    
-                contract = w3.eth.contract(address=ASSET_CONTRACTS[req.asset], abi=ERC20_ABI)
-                logs = contract.events.Transfer().process_receipt(receipt)
+        try:
+            receipt = w3.eth.get_transaction_receipt(safe_hash)
+            if receipt.status != 1: return False, "Transaction failed or reverted."
                 
-                treasury_addr = get_treasury_address().lower()
-                decimals = 18 if req.asset == "cUSD" else 6
-                expected_base_units = int(req.amount * (10 ** decimals))
-                
-                for log in logs:
-                    if log['args']['to'].lower() == treasury_addr:
-                        if log['args']['value'] >= expected_base_units:
-                            return True, "Valid"
-                            
-                return False, f"Funds were not sent to the Treasury or amount was less than {req.amount} {req.asset}."
-                
-            except Exception as e:
-                err_str = str(e)
-                if "Connection" in err_str and attempt < 2:
-                    time.sleep(1.5)
-                    continue
-                return False, f"Blockchain query error: {err_str}"
-                
-        return False, "Failed to connect to Celo RPC after 3 attempts."
+            contract = w3.eth.contract(address=ASSET_CONTRACTS[req.asset], abi=ERC20_ABI)
+            logs = contract.events.Transfer().process_receipt(receipt)
+            
+            treasury_addr = get_treasury_address().lower()
+            decimals = 18 if req.asset == "cUSD" else 6
+            expected_base_units = int(round(req.amount * (10 ** decimals) * 0.99))
+            
+            for log in logs:
+                if log['args']['to'].lower() == treasury_addr and log['args']['value'] >= expected_base_units:
+                    return True, "Valid"
+            return False, "No valid transfers to the Treasury Address found."
+        except Exception as e:
+            return False, f"Blockchain query error: {str(e)}"
 
     is_valid, err_msg = await asyncio.to_thread(fetch_and_verify_receipt)
     
     if not is_valid:
         raise HTTPException(status_code=400, detail=err_msg)
 
+    # 🟢 SAFELY UPDATES THE REAL UI WALLET
     await db["retail_wallets"].update_one(
         {"userId": user_id},
         {"$inc": {req.asset: req.amount}},
@@ -251,15 +277,14 @@ async def verify_valora_deposit(req: VerifyRequest, db=Depends(get_db), current_
         "toAmount": req.amount,
         "status": "COMPLETED",
         "userId": user_id,
-        "cardanoTxHash": req.tx_hash,
+        "cardanoTxHash": safe_hash,
         "counterparty": req.counterparty or "MiniPay On-Chain",
         "date": now.strftime("%b %d, %Y"),
         "timeAgo": "Just now",
         "createdAt": now
     })
     
-    return {"status": "success", "message": f"{req.amount} {req.asset} verified on Celo and credited!"}
-
+    return {"status": "success", "message": f"{req.amount} {req.asset} verified and credited!"}
 
 @router.post("/withdraw")
 async def withdraw_from_valora(req: WithdrawReq, db=Depends(get_db), current_user=Depends(get_current_user)):

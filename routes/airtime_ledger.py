@@ -3,6 +3,8 @@ from datetime import datetime
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from database import get_db
+# 🟢 ADDED: Import authentication to know WHO is making the request
+from routes.auth import get_current_user
 from services.safaricom_daraja import DarajaService
 
 router = APIRouter(prefix="/api/airtime", tags=["Airtime Tokenization"])
@@ -32,25 +34,32 @@ async def get_summary(db=Depends(get_db)):
     
     return {
         "live_artm_balance": live_artm,
-        "internal_airt": live_artm, # We pass the live balance to the UI
-        "internal_imp": live_artm   # Bypass the UI's IMP requirement
+        "internal_airt": live_artm, 
+        "internal_imp": live_artm   
     }
 
+# 🟢 FIXED: Secured History Endpoint
 @router.get("/history")
-async def get_history(db=Depends(get_db)):
-    """Fetches airtime tokenization history from MongoDB."""
-    cursor = db["airtime_history"].find({"user_id": "test_user_123"}).sort("timestamp", -1).limit(20)
-    history = await cursor.to_list(length=20)
+async def get_history(db=Depends(get_db), current_user=Depends(get_current_user)):
+    """Fetches airtime tokenization history ONLY for the logged-in user."""
+    # 1. Get the real User ID from the JWT token
+    user_id = current_user.get("_id")
+    
+    # 2. Query MongoDB strictly for THIS user's data
+    cursor = db["airtime_history"].find({"user_id": user_id}).sort("timestamp", -1).limit(50)
+    history = await cursor.to_list(length=50)
     
     formatted = []
     for h in history:
         formatted.append({
             "id": str(h["_id"]),
-            "type": h.get("type"),
+            "type": h.get("type", "Redemption"),
             "amount": h.get("amount", 0.0),
             "usd": h.get("usd", 0.0),
-            "network": h.get("network", "Airtel"),
+            "network": h.get("network", "Unknown"),
             "country": h.get("country", "Kenya"),
+            # 🟢 ADDED: React UI needs this exact "status" key to show the green/red badges
+            "status": h.get("status", "Completed"), 
             "time": h.get("timestamp").strftime("%b %d, %H:%M") if h.get("timestamp") else "Just now"
         })
     return {"status": "success", "history": formatted}
@@ -60,9 +69,13 @@ async def mint_imp(req: MintRequest, db=Depends(get_db)):
     """Legacy Minting Route (Kept for UI compatibility)"""
     return {"status": "success", "message": f"Minted {req.amount} IMP"}
 
+# 🟢 FIXED: Secured Redeem Endpoint
 @router.post("/redeem")
-async def redeem_airtime(req: RedeemRequest, db=Depends(get_db)):
+async def redeem_airtime(req: RedeemRequest, db=Depends(get_db), current_user=Depends(get_current_user)):
     """DIRECT WITHDRAWAL: Disburses physical Airtime bypassing internal DB limits."""
+    
+    # 1. Get the real User ID
+    user_id = current_user.get("_id")
     
     txn_id = uuid.uuid4().hex[:8].upper()
     provider = req.provider.upper()
@@ -70,9 +83,9 @@ async def redeem_airtime(req: RedeemRequest, db=Depends(get_db)):
     if provider not in ["AIRTEL", "SAFARICOM", "TELKOM"]:
         provider = "AIRTEL"
         
-    print(f"🚀 ATTEMPTING DIRECT LIVE WITHDRAWAL: {req.amount} KES to {req.phone} via {provider}")
+    print(f"🚀 ATTEMPTING DIRECT LIVE WITHDRAWAL: {req.amount} KES to {req.phone} via {provider} for User: {user_id}")
         
-    # 🚀 TRIGGER MAM-LAKA EXTERNAL API DIRECTLY
+    # 2. Trigger Mam-laka External API Directly
     result = mam_laka.disburse_airtime(
         phone_number=req.phone,
         amount=int(req.amount),
@@ -85,14 +98,15 @@ async def redeem_airtime(req: RedeemRequest, db=Depends(get_db)):
         print(f"❌ Mam-laka API Error: {result.get('message')}")
         raise HTTPException(status_code=400, detail=f"Provider Error: {result.get('message')}")
     
-    # Log History on Success
+    # 3. Log History on Success (Using REAL user_id instead of "test_user_123")
     await db["airtime_history"].insert_one({
-        "user_id": "test_user_123",
+        "user_id": user_id, # 🟢 FIXED: Now tied to the actual user
         "type": "Direct Withdraw",
         "amount": req.amount,
         "usd": -(req.amount / 130.5), 
         "network": provider,
         "country": "Kenya",
+        "status": "Completed", # 🟢 ADDED: So React knows it succeeded
         "timestamp": datetime.utcnow()
     })
     
