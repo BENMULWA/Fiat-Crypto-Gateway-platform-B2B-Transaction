@@ -4,6 +4,7 @@ import traceback
 from datetime import datetime
 import uuid
 import requests
+import os
 
 from database import get_db
 from Brain_Engine.corridor_1_airtime import AirtimeCeloCorridor

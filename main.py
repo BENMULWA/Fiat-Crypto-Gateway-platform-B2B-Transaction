@@ -17,7 +17,7 @@ except ImportError:
 from routes import (
     auth, dashboard, market_maker, trade, ramp, 
     airtime_ledger, general_ledger, rates, tokens, 
-    cardano, treasury, retail, otc_admin, swap_engine, valora
+    cardano, treasury, retail, otc_admin, swap_engine, valora, stellar
 )
 
 @asynccontextmanager
@@ -96,6 +96,7 @@ app.include_router(retail.router)
 app.include_router(otc_admin.router)
 app.include_router(swap_engine.router)
 app.include_router(valora.router)
+app.include_router(stellar.router)
 
 # Health Check Routes
 @app.get("/")
