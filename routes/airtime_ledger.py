@@ -3,7 +3,7 @@ from datetime import datetime
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from database import get_db
-# 🟢 ADDED: Import authentication to know WHO is making the request
+# ADDED: Import authentication to know WHO is making the request
 from routes.auth import get_current_user
 from services.safaricom_daraja import DarajaService
 
@@ -58,7 +58,7 @@ async def get_history(db=Depends(get_db), current_user=Depends(get_current_user)
             "usd": h.get("usd", 0.0),
             "network": h.get("network", "Unknown"),
             "country": h.get("country", "Kenya"),
-            # 🟢 ADDED: React UI needs this exact "status" key to show the green/red badges
+            # ADDED: React UI needs this exact "status" key to show the green/red badges
             "status": h.get("status", "Completed"), 
             "time": h.get("timestamp").strftime("%b %d, %H:%M") if h.get("timestamp") else "Just now"
         })
@@ -100,13 +100,13 @@ async def redeem_airtime(req: RedeemRequest, db=Depends(get_db), current_user=De
     
     # 3. Log History on Success (Using REAL user_id instead of "test_user_123")
     await db["airtime_history"].insert_one({
-        "user_id": user_id, # 🟢 FIXED: Now tied to the actual user
+        "user_id": user_id, # FIXED: Now tied to the actual user
         "type": "Direct Withdraw",
         "amount": req.amount,
         "usd": -(req.amount / 130.5), 
         "network": provider,
         "country": "Kenya",
-        "status": "Completed", # 🟢 ADDED: So React knows it succeeded
+        "status": "Completed", # ADDED: So React knows it succeeded
         "timestamp": datetime.utcnow()
     })
     

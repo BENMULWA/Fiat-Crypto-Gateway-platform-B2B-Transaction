@@ -89,7 +89,7 @@ async def initiate_deposit(req: InitiateDepositReq, db=Depends(get_db), current_
         raise HTTPException(status_code=400, detail="Unsupported Celo asset.")
         
     dep_id = f"DEP_{uuid.uuid4().hex[:8].upper()}"
-    user_id = safe_object_id(current_user.get("_id")) # 🟢 FIX
+    user_id = safe_object_id(current_user.get("_id")) 
     
     await db["pending_deposits"].insert_one({
         "_id": dep_id,
@@ -106,7 +106,7 @@ async def initiate_deposit(req: InitiateDepositReq, db=Depends(get_db), current_
 
 @router.get("/deposit/{dep_id}/status", response_model=DepositStatusRes)
 async def get_deposit_status(dep_id: str, db=Depends(get_db), current_user=Depends(get_current_user)):
-    user_id = safe_object_id(current_user.get("_id")) # 🟢 FIX
+    user_id = safe_object_id(current_user.get("_id")) # get current user id safely
     dep = await db["pending_deposits"].find_one({"_id": dep_id, "userId": user_id})
     
     if not dep: 
@@ -285,18 +285,23 @@ async def verify_valora_deposit(req: VerifyRequest, db=Depends(get_db), current_
     })
     
     return {"status": "success", "message": f"{req.amount} {req.asset} verified and credited!"}
-
 @router.post("/withdraw")
 async def withdraw_from_valora(req: WithdrawReq, db=Depends(get_db), current_user=Depends(get_current_user)):
-    user_id = current_user.get("_id")
+    import asyncio
+    # Safely convert user id to the same form used across other routes
+    user_id = safe_object_id(current_user.get("_id"))
 
     if req.asset not in ASSET_CONTRACTS:
         raise HTTPException(status_code=400, detail="Unsupported Celo asset.")
 
     user_wallet = await db["retail_wallets"].find_one({"userId": user_id})
-    current_bal = float(user_wallet.get(req.asset, 0.0)) if user_wallet else 0.0
-    
-    if current_bal < req.amount:
+    try:
+        current_bal = round(float(user_wallet.get(req.asset, 0.0)) if user_wallet else 0.0, 6)
+    except Exception:
+        current_bal = 0.0
+
+    if current_bal < round(req.amount, 6):
+        print(f"⚠️ Withdraw denied: user={user_id} asset={req.asset} balance={current_bal} requested={req.amount}")
         raise HTTPException(status_code=400, detail=f"Insufficient {req.asset} balance. You have {current_bal}.")
 
     # Deduct funds internally first (Rollback if blockchain fails)
@@ -305,12 +310,11 @@ async def withdraw_from_valora(req: WithdrawReq, db=Depends(get_db), current_use
         {"$inc": {req.asset: -req.amount}}
     )
 
-    target_address = req.identifier.strip()
-    if not w3.is_address(target_address):
+    try:
+        target_address = w3.to_checksum_address(req.identifier.strip())
+    except Exception:
         await db["retail_wallets"].update_one({"userId": user_id}, {"$inc": {req.asset: req.amount}})
-        raise HTTPException(status_code=400, detail="Invalid Celo destination address.")
-        
-    target_address = w3.to_checksum_address(target_address)
+        raise HTTPException(status_code=400, detail="Invalid destination address. Must be a valid 0x format.")
     
     try:
         private_key = os.getenv("CELO_TREASURY_PK")
@@ -326,7 +330,7 @@ async def withdraw_from_valora(req: WithdrawReq, db=Depends(get_db), current_use
         def execute_tx():
             nonce = w3.eth.get_transaction_count(account.address)
             tx = contract.functions.transfer(target_address, amount_base).build_transaction({
-                'chainId': CHAIN_ID,
+                'chainId': 42220, # Hardcoded chain ID from earlier to ensure safety
                 'gas': 150000,
                 'gasPrice': w3.eth.gas_price,
                 'nonce': nonce,
@@ -340,9 +344,11 @@ async def withdraw_from_valora(req: WithdrawReq, db=Depends(get_db), current_use
     except Exception as e:
         # Refund user if broadcast fails
         await db["retail_wallets"].update_one({"userId": user_id}, {"$inc": {req.asset: req.amount}})
+        print(f"⚠️ Celo Withdrawal Error: {e}")
         raise HTTPException(status_code=502, detail=f"Blockchain transfer failed: {str(e)}")
 
     now = datetime.utcnow()
+    import uuid
     await db["ramp_entries"].insert_one({
         "_id": f"TRADE_{uuid.uuid4().hex[:8].upper()}",
         "direction": "off", "channel": "Opera MiniPay", "fromAsset": req.asset, "toAsset": req.asset,
