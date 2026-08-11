@@ -1,10 +1,14 @@
 import os
 from typing import Optional
+from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from dotenv import load_dotenv
 
-# Force Python to find and load the .env file in the current folder
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
+ENV_PATH = BASE_DIR / ".env"
+
+# Always load backend/.env regardless of process working directory.
+load_dotenv(dotenv_path=ENV_PATH)
 
 class Settings(BaseSettings):
     # Base Configuration
@@ -16,6 +20,21 @@ class Settings(BaseSettings):
     
     # ── FIX: Added to prevent route module AttributeErrors ──────────────────
     secret_key: str = os.getenv("SECRET_KEY", "changeme-super-secret-jwt-key-32chars")
+
+    # Email OTP / SMTP
+    smtp_host: str = os.getenv("SMTP_HOST", "")
+    smtp_port: int = int(os.getenv("SMTP_PORT", "587"))
+    smtp_user: str = os.getenv("SMTP_USER", "")
+    smtp_password: str = os.getenv("SMTP_PASSWORD", "")
+    smtp_from_email: str = os.getenv("SMTP_FROM_EMAIL", "")
+    smtp_use_tls: bool = os.getenv("SMTP_USE_TLS", "true").lower() == "true"
+    admin_alert_emails: str = os.getenv("ADMIN_ALERT_EMAILS", "")
+
+    otp_expiry_minutes: int = int(os.getenv("OTP_EXPIRY_MINUTES", "10"))
+    otp_length: int = int(os.getenv("OTP_LENGTH", "6"))
+    otp_max_attempts: int = int(os.getenv("OTP_MAX_ATTEMPTS", "5"))
+    otp_resend_cooldown_seconds: int = int(os.getenv("OTP_RESEND_COOLDOWN_SECONDS", "30"))
+    otp_max_resends: int = int(os.getenv("OTP_MAX_RESENDS", "5"))
     
     # Crucial Fix: Read the list from .env, or use these live defaults
     cors_origins: list[str] = [
@@ -39,7 +58,7 @@ class Settings(BaseSettings):
 
     # Pydantic v2 Environment parsing rules
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(ENV_PATH),
         env_file_encoding="utf-8",
         extra="ignore"
     )

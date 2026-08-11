@@ -1,18 +1,186 @@
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 import uuid
 import requests
 import os
+from copy import deepcopy
+from typing import Optional
 
 from database import get_db
 from Brain_Engine.corridor_1_airtime import AirtimeCeloCorridor
 from services.safaricom_daraja import DarajaService
 from web3 import Web3
+from routes.auth import get_current_user, get_current_user_with_role, is_admin_role
 
 router = APIRouter(prefix="/api/treasury", tags=["Treasury"])
 daraja = DarajaService()
+
+RATE_BOOK_ID = "swap_rate_book"
+DEFAULT_USD_BASE_RATES = {
+    "USDA": 1.0, "USDC": 1.0, "USDT": 1.0, "USD": 1.0, "cUSD": 1.0, "IMP": 1.0,
+    "KES": 130.50, "UGX": 3750.00, "TZS": 2580.00, "RWF": 1320.00,
+    "BIF": 2850.00, "XAF": 605.00, "XOF": 605.00, "AIRT": 130.50,
+    "BTC": 1 / 64000, "ETH": 1 / 3500,
+}
+
+
+class TreasuryRateBookUpdate(BaseModel):
+    active: bool
+    reference_source: str
+    refresh_interval_hours: int
+    spread_bps: float
+    usd_base_rates: dict[str, float]
+    notes: Optional[str] = None
+
+
+def ensure_admin(current_user: dict):
+    if not is_admin_role(current_user.get("role")):
+        raise HTTPException(status_code=403, detail="Admin role required")
+
+
+def _default_rate_book() -> dict:
+    return {
+        "_id": RATE_BOOK_ID,
+        "active": True,
+        "reference_source": "CBK",
+        "refresh_interval_hours": 3,
+        "spread_bps": 50,
+        "usd_base_rates": deepcopy(DEFAULT_USD_BASE_RATES),
+        "notes": "Treasury-managed swap pricing.",
+        "updatedAt": datetime.utcnow(),
+        "updatedBy": None,
+    }
+
+
+def _serialize_rate_book(doc: dict) -> dict:
+    updated_at = doc.get("updatedAt")
+    refresh_hours = int(doc.get("refresh_interval_hours", 3) or 3)
+    next_refresh_at = None
+    if isinstance(updated_at, datetime):
+        next_refresh_at = updated_at.replace(microsecond=0)
+        next_refresh_at = next_refresh_at.isoformat() + "Z"
+        updated_at_value = updated_at.replace(microsecond=0).isoformat() + "Z"
+    else:
+        updated_at_value = str(updated_at) if updated_at else None
+    if isinstance(updated_at, datetime):
+        next_refresh_at = (updated_at + timedelta(hours=refresh_hours)).replace(microsecond=0).isoformat() + "Z"
+    return {
+        "active": bool(doc.get("active", True)),
+        "referenceSource": doc.get("reference_source", "CBK"),
+        "refreshIntervalHours": refresh_hours,
+        "spreadBps": float(doc.get("spread_bps", 50) or 0),
+        "usdBaseRates": doc.get("usd_base_rates", deepcopy(DEFAULT_USD_BASE_RATES)),
+        "notes": doc.get("notes", ""),
+        "updatedAt": updated_at_value,
+        "updatedBy": str(doc.get("updatedBy")) if doc.get("updatedBy") else None,
+        "nextRefreshAt": next_refresh_at,
+    }
+
+
+async def get_or_create_rate_book(db):
+    doc = await db["treasury_rate_book"].find_one({"_id": RATE_BOOK_ID})
+    if doc:
+        return doc
+    doc = _default_rate_book()
+    await db["treasury_rate_book"].update_one({"_id": RATE_BOOK_ID}, {"$setOnInsert": doc}, upsert=True)
+    return doc
+
+
+def compute_swap_quote_from_book(from_asset: str, to_asset: str, amount: float, rate_book: dict) -> dict:
+    rates = deepcopy(DEFAULT_USD_BASE_RATES)
+    rates.update(rate_book.get("usd_base_rates", {}))
+
+    if from_asset == to_asset:
+        return {
+            "market_rate": 1.0,
+            "execution_rate": 1.0,
+            "receive_amount": round(float(amount or 0), 4),
+            "market_receive_amount": round(float(amount or 0), 4),
+            "fee_amount": 0.0,
+            "spread_bps": float(rate_book.get("spread_bps", 0) or 0),
+        }
+
+    if from_asset not in rates or to_asset not in rates:
+        raise HTTPException(status_code=400, detail=f"Unsupported swap pair: {from_asset} -> {to_asset}")
+
+    amount_value = float(amount or 0)
+    market_rate = rates[to_asset] / rates[from_asset]
+    spread_bps = max(float(rate_book.get("spread_bps", 0) or 0), 0.0)
+    execution_rate = market_rate * (1 - (spread_bps / 10000))
+    market_receive_amount = amount_value * market_rate
+    receive_amount = amount_value * execution_rate
+    fee_amount = max(market_receive_amount - receive_amount, 0.0)
+
+    return {
+        "market_rate": market_rate,
+        "execution_rate": execution_rate,
+        "receive_amount": round(receive_amount, 4),
+        "market_receive_amount": round(market_receive_amount, 4),
+        "fee_amount": round(fee_amount, 4),
+        "spread_bps": spread_bps,
+    }
+
+
+@router.get("/rate-book")
+async def get_treasury_rate_book(db=Depends(get_db), current_user=Depends(get_current_user_with_role)):
+    ensure_admin(current_user)
+    doc = await get_or_create_rate_book(db)
+    return {"status": "success", "rateBook": _serialize_rate_book(doc)}
+
+
+@router.post("/rate-book")
+async def update_treasury_rate_book(payload: TreasuryRateBookUpdate, db=Depends(get_db), current_user=Depends(get_current_user_with_role)):
+    ensure_admin(current_user)
+
+    merged_rates = deepcopy(DEFAULT_USD_BASE_RATES)
+    for asset, value in payload.usd_base_rates.items():
+        try:
+            numeric_value = float(value)
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"Invalid numeric rate for {asset}")
+        if numeric_value <= 0:
+            raise HTTPException(status_code=400, detail=f"Rate for {asset} must be greater than zero")
+        merged_rates[asset] = numeric_value
+
+    doc = {
+        "_id": RATE_BOOK_ID,
+        "active": bool(payload.active),
+        "reference_source": (payload.reference_source or "CBK").strip() or "CBK",
+        "refresh_interval_hours": max(int(payload.refresh_interval_hours or 1), 1),
+        "spread_bps": max(float(payload.spread_bps or 0), 0.0),
+        "usd_base_rates": merged_rates,
+        "notes": (payload.notes or "").strip(),
+        "updatedAt": datetime.utcnow(),
+        "updatedBy": current_user.get("_id"),
+    }
+    await db["treasury_rate_book"].update_one({"_id": RATE_BOOK_ID}, {"$set": doc}, upsert=True)
+    return {"status": "success", "rateBook": _serialize_rate_book(doc)}
+
+
+@router.get("/swap-quote")
+async def get_swap_quote(from_asset: str, to_asset: str, amount: float = 1.0, db=Depends(get_db), current_user=Depends(get_current_user)):
+    if amount < 0:
+        raise HTTPException(status_code=400, detail="Amount must not be negative")
+    rate_book = await get_or_create_rate_book(db)
+    quote = compute_swap_quote_from_book(from_asset, to_asset, amount, rate_book)
+    return {
+        "status": "success",
+        "active": bool(rate_book.get("active", True)),
+        "fromAsset": from_asset,
+        "toAsset": to_asset,
+        "amount": amount,
+        "referenceSource": rate_book.get("reference_source", "CBK"),
+        "refreshIntervalHours": int(rate_book.get("refresh_interval_hours", 3) or 3),
+        "updatedAt": _serialize_rate_book(rate_book).get("updatedAt"),
+        "marketRate": quote["market_rate"],
+        "executionRate": quote["execution_rate"],
+        "receiveAmount": quote["receive_amount"],
+        "marketReceiveAmount": quote["market_receive_amount"],
+        "feeAmount": quote["fee_amount"],
+        "spreadBps": quote["spread_bps"],
+    }
 
 class CorridorRequest(BaseModel):
     amount_kes: float
