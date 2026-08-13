@@ -41,6 +41,8 @@ def decrypt_private_key(encrypted_key: str, salt_b64: str, master_password: str)
     
     return f.decrypt(encrypted_key.encode()).decode('utf-8')
 
+
+# Generating a master password and encrypting the private key is a one-time operation.
 if __name__ == "__main__":
     print("🔒 MAMLAKA SECURE WALLET ENCRYPTION 🔒")
     print("="*50)

@@ -4,6 +4,8 @@ from datetime import datetime
 from typing import Any
 import uuid
 import json
+import hashlib
+import hmac
 import requests
 import asyncio
 import os
@@ -152,8 +154,42 @@ async def _extract_callback_payload(request: Request) -> tuple[dict, str]:
     return payload, raw_text
 
 
+def _verify_airtel_callback_signature(request: Request, raw_text: str) -> dict[str, Any]:
+    """Verify an HMAC callback signature only when direct-callback verification is enabled."""
+    enabled = os.environ.get("AIRTEL_CALLBACK_AUTH_ENABLED", "false").strip().lower() == "true"
+    header_name = os.environ.get("AIRTEL_CALLBACK_SIGNATURE_HEADER", "X-Airtel-Signature").strip()
+    signature = request.headers.get(header_name, "").strip() if header_name else ""
+
+    auth = {
+        "enabled": enabled,
+        "header": header_name,
+        "signaturePresent": bool(signature),
+        "valid": None,
+    }
+    if not enabled:
+        return auth
+
+    secret = os.environ.get("AIRTEL_CALLBACK_HASH_KEY", "")
+    if not secret or not signature:
+        auth["valid"] = False
+        auth["reason"] = "missing shared key or signature header"
+        return auth
+
+    expected = hmac.new(
+        secret.encode("utf-8"),
+        raw_text.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    provided = signature.removeprefix("sha256=").strip().lower()
+    auth["valid"] = hmac.compare_digest(provided, expected)
+    if not auth["valid"]:
+        auth["reason"] = "signature mismatch"
+    return auth
+
+
 async def _handle_airtel_callback(request: Request, db, source: str):
     payload, raw_text = await _extract_callback_payload(request)
+    callback_auth = _verify_airtel_callback_signature(request, raw_text)
 
     event_id = f"CB_{uuid.uuid4().hex[:10].upper()}"
     headers = {
@@ -169,10 +205,18 @@ async def _handle_airtel_callback(request: Request, db, source: str):
         "headers": headers,
         "payload": payload,
         "rawBody": raw_text[:4000],
+        "authentication": callback_auth,
         "receivedAt": datetime.utcnow(),
         "processed": False,
     }
     await db["airtel_callback_events"].insert_one(callback_event)
+
+    if callback_auth["enabled"] and callback_auth["valid"] is not True:
+        await db["airtel_callback_events"].update_one(
+            {"_id": event_id},
+            {"$set": {"error": "Callback authentication failed", "processedAt": datetime.utcnow()}},
+        )
+        raise HTTPException(status_code=401, detail="Invalid Airtel callback signature")
 
     try:
         result = await _process_airtel_c2b_payload(payload, db)
@@ -1031,9 +1075,11 @@ async def reconcile_processing_deposits(
         if not _has_reconcile_evidence(body.provider_report):
             raise HTTPException(status_code=400, detail="Manual completion requires provider_report evidence.")
 
+    # Allow manual reconciliation for deposits that are still processing/pending
+    # as well as those marked failed (to support late provider callbacks).
     cursor = db["ramp_entries"].find({
         "direction": "on",
-        "status": {"$in": ["processing", "pending"]},
+        "status": {"$in": ["processing", "pending", "failed"]},
         "$or": [
             {"providerReference": {"$in": refs}},
             {"_id": {"$in": refs}},
@@ -1058,8 +1104,10 @@ async def reconcile_processing_deposits(
         entry_id = str(entry.get("_id"))
         ref = str(entry.get("providerReference") or entry_id)
 
+        # Claim the entry for reconciliation; include `failed` so admins can
+        # convert a provider-confirmed failed deposit into a completed one.
         claim = await db["ramp_entries"].update_one(
-            {"_id": entry.get("_id"), "status": {"$in": ["processing", "pending"]}},
+            {"_id": entry.get("_id"), "status": {"$in": ["processing", "pending", "failed"]}},
             {
                 "$set": {
                     "status": "crediting",
@@ -1390,19 +1438,37 @@ async def correct_completed_withdrawals(
     
 #===================    
 
-
 async def _process_airtel_c2b_payload(payload: dict, db):
+    # 1. Safely parse and normalize the nested transaction block
     tx = payload.get("transaction", {}) if isinstance(payload.get("transaction"), dict) else {}
 
-    # Gateway/provider payloads vary; accept multiple reference and status keys.
+    # Extract reference using your existing helper
     reference = _extract_reference_from_payload(payload, tx)
-    status, is_success, failure_reason = _extract_status_and_success(payload, tx)
-
+    
     if not reference:
         print(f"⚠️ Airtel webhook ignored (missing reference). Payload: {payload}")
         return {"message": "Ignored: missing reference"}
 
-    # First try provider reference (what we send to gateway), then fallback to internal trade id.
+    # 2. Native Airtel Carrier Status Parsing Layer
+    # Airtel Africa OpenAPI uses explicit status_code: "TS" (Success) and "TF" (Failed)
+    status_code = str(tx.get("status_code") or "").strip().upper()
+    message = tx.get("message") or payload.get("status", {}).get("message", "")
+    airtel_money_id = tx.get("airtel_money_id")
+
+    if status_code == "TS":
+        status = "SUCCESS"
+        is_success = True
+        failure_reason = None
+    elif status_code == "TF":
+        status = "FAILED"
+        is_success = False
+        failure_reason = message or "Transaction failed by carrier"
+    else:
+        # Fallback to secondary helper parsing if keys vary on alternate routes
+        status, is_success, failure_reason = _extract_status_and_success(payload, tx)
+
+    # 3. Database Lookup Array Verification
+    # Search by provider reference (sent to gateway) first, fallback to internal _id
     entry = await db["ramp_entries"].find_one({"providerReference": str(reference)})
     if not entry:
         entry = await db["ramp_entries"].find_one({"_id": str(reference)})
@@ -1411,14 +1477,18 @@ async def _process_airtel_c2b_payload(payload: dict, db):
         print(f"⚠️ Airtel webhook reference not found: {reference}")
         return {"message": "Ignored: transaction not found"}
 
-    if entry.get("status") not in ["processing", "pending"]:
+    # 4. Normalize Status Checking to avoid Upper/Lower Case Guard blocks
+    current_entry_status = str(entry.get("status") or "").lower()
+    if current_entry_status not in ["processing", "pending"]:
         return {"message": f"Ignored: already {entry.get('status')}"}
 
+    # Extract internal metadata dimensions
     user_id = entry.get("userId")
     amount = float(entry.get("toAmount") or entry.get("fromAmount") or 0)
     wallet_asset = entry.get("fromAsset") or "KES"
     direction = str(entry.get("direction") or "on").lower()
 
+    # 5. Core State Engine Actions
     if is_success:
         # Credit wallet only for deposit (on-ramp). Off-ramp funds were already deducted at request time.
         if direction == "on":
@@ -1428,6 +1498,7 @@ async def _process_airtel_c2b_payload(payload: dict, db):
                 upsert=True
             )
 
+        # Update ramp entries with active carrier values
         await db["ramp_entries"].update_one(
             {"_id": entry["_id"]},
             {
@@ -1435,6 +1506,7 @@ async def _process_airtel_c2b_payload(payload: dict, db):
                     "status": "completed",
                     "updatedAt": datetime.utcnow(),
                     "providerStatus": status,
+                    "airtel_money_id": airtel_money_id,  # Track receipt metadata row
                     "providerReport": payload,
                 }
             }
@@ -1467,7 +1539,7 @@ async def _process_airtel_c2b_payload(payload: dict, db):
         if direction == "off":
             print(f"❌ Airtel withdrawal failed {reference}. Refunded {amount} {wallet_asset} to {user_id}.")
         else:
-            print(f"❌ Airtel STK failed {reference}.")
+            print(f"❌ Airtel STK failed {reference}. Reason: {failure_reason}")
 
     return {"message": "C2B webhook processed"}
 
@@ -1475,51 +1547,6 @@ async def _process_airtel_c2b_payload(payload: dict, db):
 @router.post("/c2b/result")
 async def airtel_c2b_webhook(request: Request, db=Depends(get_db)):
     return await _handle_airtel_callback(request, db, "legacy_c2b")
-
-
-@callback_router.post("/collections")
-async def airtel_collections_callback(request: Request, db=Depends(get_db)):
-    return await _handle_airtel_callback(request, db, "collections")
-
-
-@callback_router.post("/collections/")
-async def airtel_collections_callback_slash(request: Request, db=Depends(get_db)):
-    return await _handle_airtel_callback(request, db, "collections_slash")
-
-
-@callback_router.post("/collection")
-async def airtel_collection_callback_alias(request: Request, db=Depends(get_db)):
-    return await _handle_airtel_callback(request, db, "collection_alias")
-
-
-@callback_router.post("/transaction")
-async def airtel_transaction_callback_alias(request: Request, db=Depends(get_db)):
-    return await _handle_airtel_callback(request, db, "transaction_alias")
-
-
-@callback_router.post("/collections/transaction")
-async def airtel_collections_transaction_alias(request: Request, db=Depends(get_db)):
-    return await _handle_airtel_callback(request, db, "collections_transaction_alias")
-
-
-@callback_router.post("/disbursements")
-async def airtel_disbursements_callback(request: Request, db=Depends(get_db)):
-    return await _handle_airtel_callback(request, db, "disbursements")
-
-
-@callback_router.post("/disbursements/")
-async def airtel_disbursements_callback_slash(request: Request, db=Depends(get_db)):
-    return await _handle_airtel_callback(request, db, "disbursements_slash")
-
-
-@callback_router.post("/disburse")
-async def airtel_disburse_callback(request: Request, db=Depends(get_db)):
-    return await _handle_airtel_callback(request, db, "disburse")
-
-
-@callback_router.post("/payouts")
-async def airtel_payouts_callback(request: Request, db=Depends(get_db)):
-    return await _handle_airtel_callback(request, db, "payouts")
 
 
 @callback_router.get("/health")

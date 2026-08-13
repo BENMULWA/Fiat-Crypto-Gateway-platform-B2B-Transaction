@@ -68,128 +68,21 @@ class FeeEstimateRequest(BaseModel):
 
 
 # ======================================================================
-# 🟢 NEW: SYNCHRONOUS AUTO-DETECTION ENDPOINTS
-# ======================================================================
-
-@router.post("/deposit/initiate")
-async def initiate_deposit(req: InitiateDepositReq, db=Depends(get_db), current_user=Depends(get_current_user)):
-    _cardano_guard()
-    master_address = os.getenv("MASTER_WALLET_ADDRESS")
-    if not master_address:
-        raise HTTPException(500, "MASTER_WALLET_ADDRESS not set in .env")
-
-    dep_id = f"DEP_{uuid.uuid4().hex[:8].upper()}"
-    
-    await db["pending_deposits"].insert_one({
-        "_id": dep_id,
-        "userId": current_user.get("_id"),
-        "asset": "USDA",
-        "network": "cardano",
-        "amount": req.amount,
-        "status": "listening",
-        "createdAt": datetime.utcnow()
-    })
-    
-    return {"deposit_id": dep_id, "address": master_address}
-
-
-@router.get("/deposit/{dep_id}/status", response_model=DepositStatusRes)
-async def get_deposit_status(dep_id: str, db=Depends(get_db), current_user=Depends(get_current_user)):
-    user_id = current_user.get("_id")
-    dep = await db["pending_deposits"].find_one({"_id": dep_id, "userId": user_id})
-    
-    if not dep: 
-        raise HTTPException(status_code=404, detail="Deposit session not found.")
-        
-    if dep["status"] == "credited":
-        return DepositStatusRes(status="credited", tx_hash=dep.get("tx_hash"), message="Funds credited!")
-
-    def scan_blockfrost():
-        master_address = os.getenv("MASTER_WALLET_ADDRESS")
-        expected_amount_lovelace = int(dep["amount"] * 1_000_000) # USDA uses 6 decimals
-        
-        # 1. Get last 10 transactions involving the master address
-        tx_url = f"{BLOCKFROST_URL}/addresses/{master_address}/transactions?order=desc&page=1&count=10"
-        res = requests.get(tx_url, headers=BLOCKFROST_HEADERS, timeout=5).json()
-        
-        for tx in res:
-            # Only look at transactions from the last 5 minutes to avoid double-crediting old deposits
-            block_time = tx.get("block_time", 0)
-            if time.time() - block_time > 300:
-                continue
-                
-            # 2. Get the UTXOs of this specific transaction to see exact assets sent
-            utxo_url = f"{BLOCKFROST_URL}/txs/{tx['hash']}/utxos"
-            utxo_res = requests.get(utxo_url, headers=BLOCKFROST_HEADERS, timeout=5).json()
-            
-            # Check outputs (funds coming IN to our wallet)
-            for output in utxo_res.get("outputs", []):
-                if output.get("address") == master_address:
-                    for asset in output.get("amount", []):
-                        unit = asset.get("unit", "")
-                        # USDA hex representation is 55534441. MinSwap policy is common.
-                        if "55534441" in unit or "USDA" in unit.upper():
-                            quantity = int(asset.get("quantity", 0))
-                            if quantity >= expected_amount_lovelace:
-                                return tx["hash"]
-        return None
-
-    try:
-        # Run synchronous requests in FastAPI's threadpool
-        found_hash = await asyncio.to_thread(scan_blockfrost)
-        
-        if found_hash:
-            await db["pending_deposits"].update_one(
-                {"_id": dep_id}, 
-                {"$set": {"status": "credited", "tx_hash": found_hash}}
-            )
-            await db["retail_wallets"].update_one(
-                {"userId": user_id}, 
-                {"$inc": {"USDA": dep["amount"]}}, 
-                upsert=True
-            )
-            
-            now = datetime.utcnow()
-            await db["ramp_entries"].insert_one({
-                "_id": f"TRADE_{uuid.uuid4().hex[:8].upper()}",
-                "direction": "on",
-                "channel": "Cardano Auto-Detect",
-                "fromAsset": "USDA",
-                "toAsset": "USDA",
-                "fromAmount": dep["amount"],
-                "toAmount": dep["amount"],
-                "status": "COMPLETED",
-                "userId": user_id,
-                "cardanoTxHash": found_hash,
-                "createdAt": now,
-                "date": now.strftime("%b %d, %Y"),
-                "timeAgo": "Just now"
-            })
-            
-            return DepositStatusRes(status="credited", tx_hash=found_hash, message="Funds credited!")
-            
-    except Exception as e:
-        print(f"⚠️ Cardano scan error: {e}")
-
-    return DepositStatusRes(status="listening", message="Scanning Blockfrost...")
-
-
-# ======================================================================
 # 🔵 INFRASTRUCTURE & BALANCE ENDPOINTS (REAL DATA)
 # ======================================================================
 
 @router.get("/wallet")
-async def get_deposit_wallet():
-    """Returns the real master vault address for deposits."""
-    master_address = os.getenv("MASTER_WALLET_ADDRESS")
-    if not master_address:
-        raise HTTPException(500, "MASTER_WALLET_ADDRESS not configured")
-    return {
-        "address": master_address,
-        "estimated_fee_ada": 0.17,
-        "estimated_fee_usd": 0.06,
-        "message": "Deposit to Master Vault"
-    }
+async def get_deposit_wallet(db=Depends(get_db), current_user=Depends(get_current_user)):
+    """Returns a unique, workspace-derived deposit address."""
+    _cardano_guard()
+    try:
+        wallet = await _wallet_for_user(db, current_user)
+        return {
+            "address": wallet.address_str,
+            "message": "Unique deposit address for workspace."
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/master-wallet/balance")
 async def get_master_wallet_balance():
