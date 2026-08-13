@@ -219,7 +219,11 @@ async def _handle_airtel_callback(request: Request, db, source: str):
         raise HTTPException(status_code=401, detail="Invalid Airtel callback signature")
 
     try:
+        # Compute a short payload reference for logging to avoid f-string brace issues
+        _ref = _extract_reference_from_payload(payload, payload.get('transaction') or {})
+        print(f"🔔 Incoming callback path={request.url.path} source={source} payload_ref={_ref}")
         result = await _process_airtel_c2b_payload(payload, db)
+        print(f"🔔 Callback processor result: {result}")
         await db["airtel_callback_events"].update_one(
             {"_id": event_id},
             {
@@ -1075,11 +1079,9 @@ async def reconcile_processing_deposits(
         if not _has_reconcile_evidence(body.provider_report):
             raise HTTPException(status_code=400, detail="Manual completion requires provider_report evidence.")
 
-    # Allow manual reconciliation for deposits that are still processing/pending
-    # as well as those marked failed (to support late provider callbacks).
     cursor = db["ramp_entries"].find({
         "direction": "on",
-        "status": {"$in": ["processing", "pending", "failed"]},
+        "status": {"$in": ["processing", "pending"]},
         "$or": [
             {"providerReference": {"$in": refs}},
             {"_id": {"$in": refs}},
@@ -1104,10 +1106,8 @@ async def reconcile_processing_deposits(
         entry_id = str(entry.get("_id"))
         ref = str(entry.get("providerReference") or entry_id)
 
-        # Claim the entry for reconciliation; include `failed` so admins can
-        # convert a provider-confirmed failed deposit into a completed one.
         claim = await db["ramp_entries"].update_one(
-            {"_id": entry.get("_id"), "status": {"$in": ["processing", "pending", "failed"]}},
+            {"_id": entry.get("_id"), "status": {"$in": ["processing", "pending"]}},
             {
                 "$set": {
                     "status": "crediting",
@@ -1477,10 +1477,33 @@ async def _process_airtel_c2b_payload(payload: dict, db):
         print(f"⚠️ Airtel webhook reference not found: {reference}")
         return {"message": "Ignored: transaction not found"}
 
+    # Diagnostic: log a concise summary of the DB entry we matched
+    try:
+        print("🔎 Matched ramp_entries:", {
+            "_id": str(entry.get("_id")),
+            "status": entry.get("status"),
+            "userId": str(entry.get("userId")),
+            "fromAsset": entry.get("fromAsset"),
+            "fromAmount": entry.get("fromAmount"),
+            "providerReference": entry.get("providerReference"),
+        })
+    except Exception:
+        print("🔎 Matched ramp_entries (failed to stringify)")
+
     # 4. Normalize Status Checking to avoid Upper/Lower Case Guard blocks
     current_entry_status = str(entry.get("status") or "").lower()
-    if current_entry_status not in ["processing", "pending"]:
+    # If already completed, ignore duplicate callbacks.
+    if current_entry_status == "completed":
         return {"message": f"Ignored: already {entry.get('status')}"}
+
+    # Allow processing for entries that are processing/pending or previously failed
+    # (supports late provider success callbacks). We'll enforce idempotency
+    # by checking existing providerReport airtel id vs incoming airtel id.
+    existing_report = entry.get("providerReport") if isinstance(entry.get("providerReport"), dict) else {}
+    existing_airtel_id = existing_report.get("airtel_money_id") or existing_report.get("provider_tx_id")
+    incoming_airtel_id = airtel_money_id
+    if existing_airtel_id and incoming_airtel_id and str(existing_airtel_id) == str(incoming_airtel_id):
+        return {"message": "Ignored: duplicate provider report"}
 
     # Extract internal metadata dimensions
     user_id = entry.get("userId")
@@ -1492,25 +1515,37 @@ async def _process_airtel_c2b_payload(payload: dict, db):
     if is_success:
         # Credit wallet only for deposit (on-ramp). Off-ramp funds were already deducted at request time.
         if direction == "on":
-            await db["retail_wallets"].update_one(
-                {"userId": user_id},
-                {"$inc": {wallet_asset: amount}},
-                upsert=True
-            )
+            try:
+                wallet_update = await db["retail_wallets"].update_one(
+                    {"userId": user_id},
+                    {"$inc": {wallet_asset: amount}},
+                    upsert=True,
+                )
+                print(f"➕ Wallet update result for user={user_id}: {getattr(wallet_update, 'raw_result', str(wallet_update))}")
+            except Exception as e:
+                print(f"❌ Error crediting wallet for user={user_id}: {e}")
+                raise
 
         # Update ramp entries with active carrier values
-        await db["ramp_entries"].update_one(
-            {"_id": entry["_id"]},
-            {
-                "$set": {
-                    "status": "completed",
-                    "updatedAt": datetime.utcnow(),
-                    "providerStatus": status,
-                    "airtel_money_id": airtel_money_id,  # Track receipt metadata row
-                    "providerReport": payload,
+        try:
+            entry_update = await db["ramp_entries"].update_one(
+                {"_id": entry["_id"]},
+                {
+                    "$set": {
+                        "status": "completed",
+                        "updatedAt": datetime.utcnow(),
+                        "providerStatus": status,
+                        "airtel_money_id": airtel_money_id,  # Track receipt metadata row
+                        "providerReport": payload,
+                        "processedByProvider": True,
+                    }
                 }
-            }
-        )
+            )
+            print(f"✔️ ramp_entries update result for _id={entry.get('_id')}: {getattr(entry_update, 'raw_result', str(entry_update))}")
+        except Exception as e:
+            print(f"❌ Error updating ramp_entries _id={entry.get('_id')}: {e}")
+            raise
+
         if direction == "on":
             print(f"✅ Airtel STK success {reference}. Credited {amount} {wallet_asset} to {user_id}.")
         else:
@@ -1557,3 +1592,16 @@ async def airtel_callback_health(request: Request):
         "path": str(request.url.path),
         "timestamp": datetime.utcnow().isoformat() + "Z",
     }
+
+
+# Compatibility endpoints expected by the Go gateway.
+# The gateway sends callbacks to /api/v1/callbacks/collections and
+# /api/v1/callbacks/disbursements — forward these to the common handler.
+@callback_router.post("/collections")
+async def callback_collections(request: Request, db=Depends(get_db)):
+    return await _handle_airtel_callback(request, db, "collections")
+
+
+@callback_router.post("/disbursements")
+async def callback_disbursements(request: Request, db=Depends(get_db)):
+    return await _handle_airtel_callback(request, db, "disbursements")
