@@ -16,6 +16,7 @@ from database import get_db
 from services.safaricom_daraja import DarajaService
 from routes.auth import get_current_user, get_current_user_with_role, is_admin_role
 from routes.treasury import get_or_create_rate_book, compute_swap_quote_from_book
+from broadcast import broadcast_manager
 
 router = APIRouter(prefix="/api/ramp", tags=["Ramp & Swaps"])
 callback_router = APIRouter(prefix="/api/v1/callbacks", tags=["Airtel Callbacks"])
@@ -1522,6 +1523,16 @@ async def _process_airtel_c2b_payload(payload: dict, db):
                     upsert=True,
                 )
                 print(f"➕ Wallet update result for user={user_id}: {getattr(wallet_update, 'raw_result', str(wallet_update))}")
+                try:
+                    await broadcast_manager.send_user(str(user_id), {
+                        "type": "wallet_update",
+                        "userId": str(user_id),
+                        "asset": wallet_asset,
+                        "amount": amount,
+                        "entryId": str(entry.get("_id")),
+                    })
+                except Exception:
+                    pass
             except Exception as e:
                 print(f"❌ Error crediting wallet for user={user_id}: {e}")
                 raise
@@ -1548,8 +1559,28 @@ async def _process_airtel_c2b_payload(payload: dict, db):
 
         if direction == "on":
             print(f"✅ Airtel STK success {reference}. Credited {amount} {wallet_asset} to {user_id}.")
+            try:
+                await broadcast_manager.send_user(str(user_id), {
+                    "type": "stk_success",
+                    "userId": str(user_id),
+                    "asset": wallet_asset,
+                    "amount": amount,
+                    "entryId": str(entry.get("_id")),
+                })
+            except Exception:
+                pass
         else:
             print(f"✅ Airtel withdrawal success {reference}. Marked completed for user {user_id}.")
+            try:
+                await broadcast_manager.send_user(str(user_id), {
+                    "type": "withdrawal_success",
+                    "userId": str(user_id),
+                    "asset": wallet_asset,
+                    "amount": amount,
+                    "entryId": str(entry.get("_id")),
+                })
+            except Exception:
+                pass
     else:
         # Refund failed off-ramp requests because funds were optimistically deducted.
         if direction == "off":
@@ -1558,6 +1589,17 @@ async def _process_airtel_c2b_payload(payload: dict, db):
                 {"$inc": {wallet_asset: amount}},
                 upsert=True
             )
+            try:
+                await broadcast_manager.send_user(str(user_id), {
+                    "type": "withdrawal_failed_refund",
+                    "userId": str(user_id),
+                    "asset": wallet_asset,
+                    "amount": amount,
+                    "entryId": str(entry.get("_id")),
+                    "reason": failure_reason,
+                })
+            except Exception:
+                pass
 
         await db["ramp_entries"].update_one(
             {"_id": entry["_id"]},

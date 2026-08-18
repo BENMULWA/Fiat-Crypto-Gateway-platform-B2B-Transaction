@@ -19,6 +19,7 @@ from routes import (
     airtime_ledger, general_ledger, rates, tokens, 
     cardano, treasury, retail, otc_admin, swap_engine, valora, stellar
 )
+from routes import realtime
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -87,6 +88,7 @@ app.include_router(market_maker.router)
 app.include_router(trade.router)
 app.include_router(ramp.router)
 app.include_router(ramp.callback_router)
+app.include_router(realtime.router)
 app.include_router(airtime_ledger.router)
 app.include_router(general_ledger.router)
 app.include_router(rates.router)

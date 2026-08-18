@@ -3,10 +3,16 @@ from email.message import EmailMessage
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from typing import Optional, Dict, Any
+import uuid
+import os
+import httpx
+from routes.ramp import _extract_status_and_success, _has_reconcile_evidence
+from broadcast import broadcast_manager
 from datetime import datetime, timedelta
 from collections import defaultdict
 from config import settings
-from database import get_db
+from database import get_db, get_client
 from routes.auth import get_current_user_with_role, is_admin_role
 
 try:
@@ -30,6 +36,7 @@ def ensure_admin(current_user: dict):
 # 🟢 FIX: Added Pydantic model to correctly catch the JSON body sent by React
 class TxStatusUpdate(BaseModel):
     status: str
+    provider_report: Optional[Dict[str, Any]] = None
 
 
 class RiskAlertStatusUpdate(BaseModel):
@@ -309,6 +316,257 @@ async def get_operations_overview(db=Depends(get_db)):
     # Placeholder for dashboard kpis
     return {"status": "success", "kpis": {}}
 
+
+@router.get("/company-revenue")
+async def get_company_revenue(db=Depends(get_db), current_user: dict = Depends(get_current_user_with_role)):
+    ensure_admin(current_user)
+    doc = await db["company_revenue"].find_one({"_id": "corporate_treasury"})
+    if not doc:
+        return {"status": "success", "revenue": {}}
+    # remove Mongo internal id for safety
+    doc.pop("_id", None)
+    return {"status": "success", "revenue": doc}
+
+
+class CompanyWithdrawRequest(BaseModel):
+    asset: str
+    amount: float
+    method: str  # 'airtel' or 'internal'
+    destination: Optional[Dict[str, Any]] = None
+
+
+@router.post("/company-withdraw")
+async def company_withdraw(body: CompanyWithdrawRequest, db=Depends(get_db), current_user: dict = Depends(get_current_user_with_role)):
+    ensure_admin(current_user)
+
+    asset = (body.asset or "").strip()
+    amount = float(body.amount or 0)
+    method = (body.method or "").strip().lower()
+
+    if not asset or amount <= 0:
+        raise HTTPException(status_code=400, detail="Invalid asset or amount")
+
+    # Use a MongoDB session/transaction to reserve funds and record the withdrawal atomically
+    withdraw_id = f"CW_{uuid.uuid4().hex[:8].upper()}"
+    now = datetime.utcnow()
+
+    record = {
+        "_id": withdraw_id,
+        "asset": asset,
+        "amount": amount,
+        "method": method,
+        "destination": body.destination or {},
+        "status": "processing",
+        "requestedBy": current_user.get("_id"),
+        "createdAt": now,
+    }
+
+    client = get_client()
+    try:
+        async with await client.start_session() as session:
+            async with session.start_transaction():
+                corp = await db["company_revenue"].find_one({"_id": "corporate_treasury"}, session=session)
+                current_bal = float(corp.get(asset, 0)) if corp else 0.0
+                if current_bal < amount:
+                    raise HTTPException(status_code=400, detail=f"Insufficient company balance for {asset}")
+
+                await db["company_revenue"].update_one({"_id": "corporate_treasury"}, {"$inc": {asset: -amount}}, upsert=True, session=session)
+                await db["company_withdrawals"].insert_one(record, session=session)
+
+                # handle internal transfers inside transaction
+                if method == "internal":
+                    user_id = (body.destination or {}).get("userId")
+                    if not user_id:
+                        raise HTTPException(status_code=400, detail="destination.userId is required for internal transfers")
+
+                    await db["retail_wallets"].update_one({"userId": safe_obj_id(user_id)}, {"$inc": {asset: amount}}, upsert=True, session=session)
+                    await db["company_withdrawals"].update_one({"_id": withdraw_id}, {"$set": {"status": "completed", "completedAt": datetime.utcnow(), "creditedTo": user_id}}, session=session)
+                    try:
+                        await broadcast_manager.send_user(str(user_id), {"type": "wallet_update", "asset": asset, "amount": amount, "source": "company_withdraw"})
+                    except Exception:
+                        pass
+                    return {"status": "success", "id": withdraw_id, "message": "Internal transfer completed"}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    # Airtel disburse: performed outside the DB transaction; on network failure we refund.
+    if method == "airtel":
+        phone = (body.destination or {}).get("phone")
+        if not phone:
+            # refund reserved funds
+            await db["company_revenue"].update_one({"_id": "corporate_treasury"}, {"$inc": {asset: amount}})
+            await db["company_withdrawals"].update_one({"_id": withdraw_id}, {"$set": {"status": "failed", "reason": "missing destination.phone"}})
+            raise HTTPException(status_code=400, detail="destination.phone is required for airtel disburse")
+
+        phone_s = str(phone).strip().replace(' ', '').replace('-', '')
+        if phone_s.startswith('+'):
+            phone_s = phone_s[1:]
+        if phone_s.startswith('254'):
+            phone_s = phone_s[3:]
+        if phone_s.startswith('0'):
+            phone_s = phone_s[1:]
+
+        gateway_url = os.environ.get("AIRTEL_GATEWAY_URL", "https://airtime.mamlakapsp.com")
+        api_key = os.environ.get("AIRTEL_GATEWAY_API_KEY", "")
+        disburse_url = f"{gateway_url}/api/v1/disburse"
+
+        payload = {"phone_number": phone_s, "amount": int(amount), "reference": withdraw_id}
+        payload["msisdn"] = f"254{phone_s}"
+        payload["phone"] = f"0{phone_s}"
+
+        headers = {"X-API-Key": api_key, "Content-Type": "application/json"}
+        try:
+            async with httpx.AsyncClient() as client_http:
+                resp = await client_http.post(disburse_url, json=payload, headers=headers, timeout=20.0)
+                if resp.is_error:
+                    raise Exception(f"Gateway HTTP {resp.status_code}: {resp.text}")
+                body_resp = resp.json() if resp.content else {}
+                success = body_resp.get("success") if isinstance(body_resp, dict) else None
+                if success is False:
+                    raise Exception(f"Gateway response indicated failure: {body_resp}")
+
+            await db["company_withdrawals"].update_one({"_id": withdraw_id}, {"$set": {"status": "completed", "completedAt": datetime.utcnow(), "gatewayResponse": body_resp}})
+            return {"status": "success", "id": withdraw_id, "message": "Airtel disburse initiated"}
+        except Exception as exc:
+            # refund reserved funds
+            await db["company_revenue"].update_one({"_id": "corporate_treasury"}, {"$inc": {asset: amount}})
+            await db["company_withdrawals"].update_one({"_id": withdraw_id}, {"$set": {"status": "failed", "reason": str(exc)}})
+            raise HTTPException(status_code=502, detail=f"Airtel disburse failed: {str(exc)}")
+
+    # unsupported method: refund
+    await db["company_revenue"].update_one({"_id": "corporate_treasury"}, {"$inc": {asset: amount}})
+    await db["company_withdrawals"].update_one({"_id": withdraw_id}, {"$set": {"status": "failed", "reason": "unsupported method"}})
+    raise HTTPException(status_code=400, detail="Unsupported withdrawal method")
+
+
+@router.get("/company-withdrawals")
+async def list_company_withdrawals(page: int = 1, limit: int = 50, status: str = None, db=Depends(get_db), current_user: dict = Depends(get_current_user_with_role)):
+    ensure_admin(current_user)
+    try:
+        page = max(int(page), 1)
+        limit = min(max(int(limit), 1), 200)
+    except Exception:
+        page = 1
+        limit = 50
+
+    query = {}
+    if status:
+        query["status"] = status
+
+    skip = (page - 1) * limit
+    cursor = db["company_withdrawals"].find(query).sort("createdAt", -1).skip(skip).limit(limit)
+    items = await cursor.to_list(length=limit)
+    total = await db["company_withdrawals"].count_documents(query)
+
+    formatted = []
+    for it in items:
+        created_at = it.get("createdAt")
+        formatted.append({
+            "id": str(it.get("_id")),
+            "asset": it.get("asset"),
+            "amount": it.get("amount"),
+            "method": it.get("method"),
+            "status": it.get("status"),
+            "destination": it.get("destination"),
+            "requestedBy": str(it.get("requestedBy")) if it.get("requestedBy") else None,
+            "createdAt": created_at.isoformat() + "Z" if isinstance(created_at, datetime) else created_at,
+            "completedAt": it.get("completedAt"),
+            "reason": it.get("reason"),
+        })
+
+    return {"status": "success", "page": page, "limit": limit, "total": total, "items": formatted}
+
+@router.get("/finance/payments")
+async def get_admin_finance_payments(db=Depends(get_db), current_user: dict = Depends(get_current_user_with_role)):
+    ensure_admin(current_user)
+
+    incoming_cursor = db["ramp_entries"].find({"direction": {"$in": ["on", "in", "incoming"]}}).sort("createdAt", -1).limit(20)
+    incoming = await incoming_cursor.to_list(length=20)
+
+    outgoing_cursor = db["ramp_entries"].find({"direction": {"$in": ["off", "out", "outgoing", "swap"]}}).sort("createdAt", -1).limit(20)
+    outgoing = await outgoing_cursor.to_list(length=20)
+
+    def fmt_row(entry, mode: str):
+        created = entry.get("createdAt") or datetime.utcnow()
+        if isinstance(created, str):
+            try:
+                created = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            except Exception:
+                created = datetime.utcnow()
+        status = str(entry.get("status") or "pending").lower()
+        if status in {"matched", "completed", "success", "successful"}:
+            status_label = "matched"
+        elif status in {"failed", "error", "rejected", "cancelled"}:
+            status_label = "failed"
+        else:
+            status_label = "unmatched" if mode == "incoming" else "pending"
+
+        ref = entry.get("reference") or entry.get("transactionRef") or entry.get("externalRef") or str(entry.get("_id"))
+        party = entry.get("customerName") or entry.get("userName") or "Unknown Customer"
+        amount = entry.get("fromAmount") or entry.get("amount") or 0
+
+        return {
+            "id": str(entry.get("_id")),
+            "time": created.strftime("%b %d, %Y %H:%M") if isinstance(created, datetime) else str(created),
+            "party": party,
+            "type": entry.get("channel") or ("on-ramp" if mode == "incoming" else "payout"),
+            "amount": f"{float(amount):,.2f}",
+            "reference": str(ref),
+            "status": status_label,
+        }
+
+    incoming_rows = [fmt_row(item, "incoming") for item in incoming]
+    outgoing_rows = [fmt_row(item, "outgoing") for item in outgoing]
+
+    unmatched_inbound = sum(1 for row in incoming_rows if row["status"] == "unmatched")
+    matched_today = sum(1 for row in incoming_rows if row["status"] == "matched")
+    outbound_sent = sum(1 for row in outgoing_rows if row["status"] in {"matched", "completed"})
+    outbound_pending = sum(1 for row in outgoing_rows if row["status"] not in {"matched", "completed", "failed"})
+
+    return {
+        "status": "success",
+        "kpis": {
+            "unmatched_inbound": unmatched_inbound,
+            "matched_today": matched_today,
+            "outbound_sent": outbound_sent,
+            "outbound_pending": outbound_pending,
+        },
+        "incoming": incoming_rows,
+        "outgoing": outgoing_rows,
+    }
+
+
+@router.post("/finance/payments/{payment_id}/match")
+async def match_admin_payment(payment_id: str, db=Depends(get_db), current_user: dict = Depends(get_current_user_with_role)):
+    ensure_admin(current_user)
+    entry = await db["ramp_entries"].find_one({"_id": payment_id})
+    if not entry:
+        try:
+            from bson import ObjectId
+            entry = await db["ramp_entries"].find_one({"_id": ObjectId(payment_id)})
+        except Exception:
+            entry = None
+
+    if not entry:
+        raise HTTPException(status_code=404, detail="Payment not found")
+
+    await db["ramp_entries"].update_one(
+        {"_id": entry.get("_id")},
+        {
+            "$set": {
+                "status": "matched",
+                "matchedBy": current_user.get("_id"),
+                "matchedAt": datetime.utcnow(),
+                "updatedAt": datetime.utcnow(),
+            }
+        },
+    )
+
+    return {"status": "success", "message": "Payment matched successfully"}
+
+
 @router.get("/dealer/rfqs")
 async def get_incoming_rfqs():
     import random
@@ -350,15 +608,33 @@ async def get_all_retail_transactions(userId: str = None, limit: int = 200, db=D
 
     cursor = db["ramp_entries"].find(query).sort("createdAt", -1).limit(limit)
     entries = await cursor.to_list(length=limit)
-    
+
+    # Batch user lookup to avoid N+1 queries which can be slow when returning many entries
+    user_ids = [e.get("userId") for e in entries if e.get("userId")]
+    unique_safe_ids = []
+    seen = set()
+    for uid in user_ids:
+        sid = safe_obj_id(uid)
+        key = str(sid)
+        if key not in seen:
+            seen.add(key)
+            unique_safe_ids.append(sid)
+
+    user_map = {}
+    if unique_safe_ids:
+        users = await db["users"].find({"_id": {"$in": unique_safe_ids}}).to_list(len(unique_safe_ids))
+        for u in users:
+            user_map[str(u.get("_id"))] = u
+
     formatted_entries = []
-    
     for e in entries:
         user_id = e.get("userId")
         customer_name = "Unknown User"
         if user_id:
-            user = await db["users"].find_one({"_id": safe_obj_id(user_id)})
-            if user: customer_name = user.get("displayName") or user.get("name") or user.get("email", "Unknown")
+            ukey = str(safe_obj_id(user_id))
+            user = user_map.get(ukey)
+            if user:
+                customer_name = user.get("displayName") or user.get("name") or user.get("email") or "Unknown User"
 
         formatted_entries.append({
             "id": str(e["_id"]),
@@ -369,6 +645,7 @@ async def get_all_retail_transactions(userId: str = None, limit: int = 200, db=D
             "toAmount": e.get("toAmount", 0), "toAsset": e.get("toAsset", ""),
             "status": e.get("status", "pending")
         })
+
     return {"status": "success", "entries": formatted_entries}
 
 # 🟢 FIX: Use the payload Pydantic model and handle tx_id formats safely
@@ -382,9 +659,69 @@ async def moderate_transaction(tx_id: str, payload: TxStatusUpdate, db=Depends(g
     except:
         pass
 
-    result = await db["ramp_entries"].update_one(query, {"$set": {"status": payload.status, "moderatedAt": datetime.utcnow()}})
-    if result.modified_count == 0: 
+    entry = await db["ramp_entries"].find_one(query)
+    if not entry:
         raise HTTPException(status_code=404, detail="Transaction not found")
+
+    new_status = (payload.status or "").strip().lower()
+
+    # If admin is attempting to mark as completed, ensure provider callback evidence indicates success
+    if new_status == "completed":
+        # Prefer stored providerReport, allow admin to supply one in the payload for manual reconciliation
+        provider_report = entry.get("providerReport") if isinstance(entry.get("providerReport"), dict) else None
+        if not provider_report and payload.provider_report:
+            provider_report = payload.provider_report
+
+        if not provider_report:
+            raise HTTPException(status_code=400, detail="Cannot mark completed: no provider callback/report found. Attach provider_report or wait for provider callback.")
+
+        # Determine provider-reported success/failure
+        status_text, success_flag, reason = _extract_status_and_success(provider_report, provider_report.get("transaction") if isinstance(provider_report.get("transaction"), dict) else {})
+
+        if not success_flag:
+            raise HTTPException(status_code=400, detail=f"Provider evidence indicates failure: {reason or status_text}")
+
+        # Provider indicates success -> apply wallet credit/refund logic consistent with webhook processing
+        try:
+            direction = str(entry.get("direction") or "on").lower()
+            wallet_asset = entry.get("fromAsset") or "KES"
+            amount = float(entry.get("toAmount") or entry.get("fromAmount") or 0)
+            user_id = entry.get("userId")
+
+            if direction == "on":
+                await db["retail_wallets"].update_one({"userId": user_id}, {"$inc": {wallet_asset: amount}}, upsert=True)
+
+            await db["ramp_entries"].update_one(
+                {"_id": entry.get("_id")},
+                {
+                    "$set": {
+                        "status": "completed",
+                        "moderatedAt": datetime.utcnow(),
+                        "updatedAt": datetime.utcnow(),
+                        "providerReport": provider_report,
+                        "processedByAdmin": True,
+                    }
+                }
+            )
+            try:
+                await broadcast_manager.send_user(str(user_id), {
+                    "type": "admin_reconciled",
+                    "userId": str(user_id),
+                    "asset": wallet_asset,
+                    "amount": amount,
+                    "entryId": str(entry.get("_id")),
+                })
+            except Exception:
+                pass
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to apply wallet update: {str(exc)}")
+
+        return {"status": "success", "message": "Transaction marked completed and wallet updated based on provider evidence."}
+
+    # Non-completion status updates still allowed (e.g., mark as failed)
+    result = await db["ramp_entries"].update_one(query, {"$set": {"status": payload.status, "moderatedAt": datetime.utcnow()}})
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="Transaction not found or no changes applied")
     return {"status": "success"}
 
 @router.get("/compliance/kyc")
