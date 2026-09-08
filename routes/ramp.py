@@ -503,14 +503,20 @@ async def _apply_wallet_delta_once(db, user_id, asset: str, amount: float, entry
 
     The marker and balance update share one MongoDB document update, so a
     duplicate provider callback cannot duplicate customer value.
+
+    userId is stored as a plain string on retail_wallets but can be an
+    ObjectId on ramp_entries (see safe_object_id) - match on every
+    string/ObjectId representation of the given id to avoid a false
+    "wallet missing" failure from a type mismatch alone.
     """
+    user_ids = build_user_id_candidates(user_id)
     result = await db["retail_wallets"].update_one(
-        {"userId": user_id, marker_field: {"$ne": entry_id}},
+        {"userId": {"$in": user_ids}, marker_field: {"$ne": entry_id}},
         {"$inc": {asset: amount}, "$addToSet": {marker_field: entry_id}},
     )
     if result.modified_count:
         return True
-    wallet = await db["retail_wallets"].find_one({"userId": user_id}, {marker_field: 1})
+    wallet = await db["retail_wallets"].find_one({"userId": {"$in": user_ids}}, {marker_field: 1})
     if not wallet:
         raise RuntimeError("Customer wallet is missing; settlement requires support reconciliation.")
     return False
@@ -1511,8 +1517,6 @@ async def reconcile_processing_deposits(
     if not is_admin_role(current_user.get("role")):
         raise HTTPException(status_code=403, detail="Admin role required for manual reconciliation.")
 
-    user_ids = build_user_id_candidates(current_user["_id"])
-
     refs = [str(r).strip() for r in body.references if str(r).strip()]
     refs = list(dict.fromkeys(refs))
     if not refs:
@@ -1530,7 +1534,7 @@ async def reconcile_processing_deposits(
 
     cursor = db["ramp_entries"].find({
         "direction": "on",
-        "status": {"$in": ["processing", "pending", "provider_confirmed"]},
+        "status": {"$in": ["processing", "pending", "provider_confirmed", "matched"]},
         "$or": [
             {"providerReference": {"$in": refs}},
             {"_id": {"$in": refs}},
@@ -1556,7 +1560,7 @@ async def reconcile_processing_deposits(
         ref = str(entry.get("providerReference") or entry_id)
 
         claim = await db["ramp_entries"].update_one(
-            {"_id": entry.get("_id"), "status": {"$in": ["processing", "pending", "provider_confirmed"]}},
+            {"_id": entry.get("_id"), "status": {"$in": ["processing", "pending", "provider_confirmed", "matched"]}},
             {
                 "$set": {
                     "status": "crediting",
@@ -1572,8 +1576,8 @@ async def reconcile_processing_deposits(
         amount = float(entry.get("toAmount") or entry.get("fromAmount") or 0)
         wallet_user_id = entry.get("userId")
 
-        # Guardrails: non-admin users are blocked above; also ensure we don't reconcile other users accidentally.
-        if not any(str(wallet_user_id) == str(uid) for uid in user_ids):
+        # Guardrail: an entry with no owner can't be credited to anyone.
+        if not wallet_user_id:
             await db["ramp_entries"].update_one(
                 {"_id": entry.get("_id")},
                 {"$set": {"status": "processing", "updatedAt": datetime.utcnow()}},
@@ -1657,8 +1661,6 @@ async def reconcile_processing_withdrawals(
     if not is_admin_role(current_user.get("role")):
         raise HTTPException(status_code=403, detail="Admin role required for manual reconciliation.")
 
-    user_ids = build_user_id_candidates(current_user["_id"])
-
     refs = [str(r).strip() for r in body.references if str(r).strip()]
     refs = list(dict.fromkeys(refs))
     if not refs:
@@ -1719,7 +1721,8 @@ async def reconcile_processing_withdrawals(
         amount = float(entry.get("fromAmount") or entry.get("toAmount") or 0)
         wallet_user_id = entry.get("userId")
 
-        if not any(str(wallet_user_id) == str(uid) for uid in user_ids):
+        # Guardrail: an entry with no owner can't be refunded to anyone.
+        if not wallet_user_id:
             await db["ramp_entries"].update_one(
                 {"_id": entry.get("_id")},
                 {"$set": {"status": "processing", "updatedAt": datetime.utcnow()}},

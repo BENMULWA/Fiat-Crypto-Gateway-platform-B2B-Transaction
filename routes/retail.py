@@ -76,6 +76,8 @@ def _send_admin_kyc_email(subject: str, body: str) -> None:
 # Import shared JWT config and auth helper
 from routes.auth import get_current_user
 from database import get_db
+from typing import Optional
+import uuid
 
 router = APIRouter(prefix="/api/retail", tags=["Retail User"])
 
@@ -425,3 +427,111 @@ async def get_kyc_status(db=Depends(get_db), current_user=Depends(get_current_us
         "kycReviewedAt": user.get("kycReviewedAt"),
         "kycReviewNotes": user.get("kycReviewNotes"),
     }
+
+
+class InternalTransferRequest(BaseModel):
+    recipient_email: str
+    asset: str
+    amount: float
+    otp_session_id: str
+    otp_code: str
+    totp_code: str
+    note: Optional[str] = None
+
+
+# Off-chain, instant, zero-fee balance transfer between two Jasiri accounts —
+# no blockchain transaction, just an internal ledger move. Gated behind the
+# same email-OTP + mandatory-TOTP check as a real withdrawal (see
+# two_factor.verify_withdrawal_2fa) because it moves funds out of an account
+# just as irreversibly from the sender's point of view, even though nothing
+# touches a chain.
+@router.post("/transfer")
+async def transfer_to_user(
+    payload: InternalTransferRequest,
+    db=Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    # Imported locally, not at module load: wallet_utils imports
+    # build_user_id_candidates from this module, so importing wallet_utils at
+    # the top of routes/retail.py would be a circular import.
+    from wallet_utils import debit_wallet, credit_wallet
+    from two_factor import verify_withdrawal_2fa
+
+    asset = payload.asset.strip().upper()
+    if asset not in SUPPORTED_ASSETS:
+        raise HTTPException(status_code=400, detail=f"Unsupported asset: {asset}")
+    if payload.amount <= 0:
+        raise HTTPException(status_code=400, detail="Transfer amount must be greater than zero.")
+
+    recipient_email = (payload.recipient_email or "").strip().lower()
+    if not recipient_email:
+        raise HTTPException(status_code=400, detail="Recipient email is required.")
+
+    sender_email = (current_user.get("email") or "").strip().lower()
+    if recipient_email == sender_email:
+        raise HTTPException(status_code=400, detail="You can't transfer to your own account.")
+
+    recipient_doc = await db["users"].find_one({"email": recipient_email})
+    if not recipient_doc:
+        raise HTTPException(status_code=404, detail="No Jasiri account found with that email.")
+
+    # Verifies email OTP + mandatory TOTP; raises before any balance moves.
+    await verify_withdrawal_2fa(db, current_user, payload.otp_session_id, payload.otp_code, payload.totp_code)
+
+    sender_id = current_user.get("_id")
+    recipient_id = recipient_doc["_id"]
+
+    await debit_wallet(db, sender_id, asset, payload.amount)
+    try:
+        await credit_wallet(db, recipient_id, asset, payload.amount)
+    except Exception as exc:
+        # Credit failed after the debit succeeded — reverse it immediately so
+        # the sender's funds aren't stranded in limbo.
+        await credit_wallet(db, sender_id, asset, payload.amount)
+        raise HTTPException(status_code=502, detail=f"Transfer failed and was reversed: {exc}")
+
+    now = datetime.utcnow()
+    transfer_id = str(uuid.uuid4())
+    await db["internal_transfers"].insert_one({
+        "_id": transfer_id,
+        "asset": asset,
+        "amount": payload.amount,
+        "senderId": sender_id,
+        "senderEmail": sender_email,
+        "recipientId": recipient_id,
+        "recipientEmail": recipient_email,
+        "note": (payload.note or "").strip()[:280],
+        "createdAt": now,
+    })
+
+    return {
+        "status": "success",
+        "id": transfer_id,
+        "asset": asset,
+        "amount": payload.amount,
+        "recipientEmail": recipient_email,
+        "message": f"Sent {payload.amount} {asset} to {recipient_email}.",
+    }
+
+
+@router.get("/transfers")
+async def get_transfer_history(db=Depends(get_db), current_user=Depends(get_current_user)):
+    """Sent and received internal transfers for the logged-in user, newest first."""
+    email = (current_user.get("email") or "").strip().lower()
+    records = await db["internal_transfers"].find(
+        {"$or": [{"senderEmail": email}, {"recipientEmail": email}]}
+    ).sort("createdAt", -1).limit(100).to_list(100)
+
+    transfers = []
+    for r in records:
+        transfers.append({
+            "id": r.get("_id"),
+            "asset": r.get("asset"),
+            "amount": r.get("amount"),
+            "direction": "sent" if r.get("senderEmail") == email else "received",
+            "counterparty": r.get("recipientEmail") if r.get("senderEmail") == email else r.get("senderEmail"),
+            "note": r.get("note", ""),
+            "createdAt": r.get("createdAt").isoformat() + "Z" if r.get("createdAt") else None,
+        })
+
+    return {"status": "success", "transfers": transfers}

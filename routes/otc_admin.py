@@ -7,7 +7,7 @@ from typing import Optional, Dict, Any
 import uuid
 import os
 import httpx
-from routes.ramp import _extract_status_and_success, _has_reconcile_evidence
+from routes.ramp import _extract_status_and_success, _has_reconcile_evidence, _apply_wallet_delta_once
 from broadcast import broadcast_manager
 from notifications import notify_user
 from datetime import datetime, timedelta
@@ -1055,7 +1055,9 @@ async def get_chart_analytics(days: int = 7, scope: str = "retail", db=Depends(g
     return {"status": "success", "chartData": [{**row, "volume": round(row["volume"], 2), "revenue": round(row["revenue"], 2)} for row in chart_by_date.values()]}
 
 @router.get("/retail-transactions")
-async def get_all_retail_transactions(userId: str = None, limit: int = 200, db=Depends(get_db)):
+async def get_all_retail_transactions(userId: str = None, limit: int = 200, db=Depends(get_db), current_user: dict = Depends(get_current_user_with_role)):
+    if not is_admin_role(current_user.get("role")):
+        raise HTTPException(status_code=403, detail="Admin role required.")
     """Fetches all retail transactions, smartly resolving ObjectIds vs Strings"""
     query = {}
     if userId:
@@ -1122,7 +1124,10 @@ async def get_all_retail_transactions(userId: str = None, limit: int = 200, db=D
 
 # 🟢 FIX: Use the payload Pydantic model and handle tx_id formats safely
 @router.patch("/retail-transactions/{tx_id}/status")
-async def moderate_transaction(tx_id: str, payload: TxStatusUpdate, db=Depends(get_db)):
+async def moderate_transaction(tx_id: str, payload: TxStatusUpdate, db=Depends(get_db), current_user: dict = Depends(get_current_user_with_role)):
+    if not is_admin_role(current_user.get("role")):
+        raise HTTPException(status_code=403, detail="Admin role required.")
+
     query = {"_id": tx_id}
     try:
         from bson import ObjectId
@@ -1136,6 +1141,9 @@ async def moderate_transaction(tx_id: str, payload: TxStatusUpdate, db=Depends(g
         raise HTTPException(status_code=404, detail="Transaction not found")
 
     new_status = (payload.status or "").strip().lower()
+
+    if entry.get("status") == "completed" and new_status == "completed":
+        return {"status": "success", "message": "Transaction already completed; wallet not credited again."}
 
     # If admin is attempting to mark as completed, ensure provider callback evidence indicates success
     if new_status == "completed":
@@ -1161,7 +1169,9 @@ async def moderate_transaction(tx_id: str, payload: TxStatusUpdate, db=Depends(g
             user_id = entry.get("userId")
 
             if direction == "on":
-                await db["retail_wallets"].update_one({"userId": user_id}, {"$inc": {wallet_asset: amount}}, upsert=True)
+                await _apply_wallet_delta_once(
+                    db, user_id, wallet_asset, amount, str(entry.get("_id")), "appliedRampCredits"
+                )
 
             await db["ramp_entries"].update_one(
                 {"_id": entry.get("_id")},
