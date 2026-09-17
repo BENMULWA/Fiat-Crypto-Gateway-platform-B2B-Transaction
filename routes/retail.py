@@ -164,26 +164,41 @@ async def _sync_retail_notifications(db, user_id, wallet):
     for alert in alerts:
         code = alert["code"]
         active_codes.append(code)
+
+        # Whether to force isRead back to False must NOT be unconditional --
+        # this resync runs on every GET /notifications call (every 30s poll,
+        # plus every time the bell dropdown reopens), and a threshold breach
+        # that's still active a poll later would otherwise get re-marked
+        # unread right after the user hits "Mark all as read", making that
+        # button look broken (it worked; the very next poll just undid it).
+        # Only reset to unread for a genuinely new alert (no existing doc)
+        # or a fresh re-trigger of one the user had already cleared
+        # (previously resolved=True) -- an alert that's been continuously
+        # active and already acknowledged stays read.
+        existing = await db["retail_notifications"].find_one(
+            {"userId": user_id, "code": code}, {"resolved": 1}
+        )
+        set_fields = {
+            "userId": user_id,
+            "code": code,
+            "category": alert["category"],
+            "severity": alert["severity"],
+            "title": alert["title"],
+            "message": alert["message"],
+            "asset": alert["asset"],
+            "balance": alert["balance"],
+            "threshold": alert["threshold"],
+            "resolved": False,
+            "updatedAt": now,
+        }
+        if not existing or existing.get("resolved"):
+            set_fields["isRead"] = False
+
         await db["retail_notifications"].update_one(
             {"userId": user_id, "code": code},
             {
-                "$set": {
-                    "userId": user_id,
-                    "code": code,
-                    "category": alert["category"],
-                    "severity": alert["severity"],
-                    "title": alert["title"],
-                    "message": alert["message"],
-                    "asset": alert["asset"],
-                    "balance": alert["balance"],
-                    "threshold": alert["threshold"],
-                    "isRead": False,
-                    "resolved": False,
-                    "updatedAt": now,
-                },
-                "$setOnInsert": {
-                    "createdAt": now,
-                },
+                "$set": set_fields,
+                "$setOnInsert": {"createdAt": now},
             },
             upsert=True,
         )
