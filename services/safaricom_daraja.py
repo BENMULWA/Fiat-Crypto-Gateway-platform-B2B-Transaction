@@ -11,8 +11,10 @@ load_dotenv()
 class DarajaService:
     def __init__(self):
         self.username = os.getenv("LIPAD_API_USERNAME", "meshex_sandbox")
-        self.password = os.getenv("LIPAD_API_PASSWORD", "mesh94DjsuSans8w203@2046ex")
-        
+        self.password = os.getenv("LIPAD_API_PASSWORD")
+        if not self.password:
+            raise RuntimeError("LIPAD_API_PASSWORD environment variable is not set")
+
         # 🟢 Clean trailing slashes to prevent 404 URL errors
         raw_url = os.getenv("LIPAD_BASE_URL", "https://payments.mam-laka.com")
         self.base_url = raw_url.rstrip('/')
@@ -82,28 +84,108 @@ class DarajaService:
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
-    def get_merchant_balance(self):
-        """Fetches the live Web2 balances from Mam-laka's core ledger."""
+    def collect_mobile_money(self, phone_number: str, amount: int, transaction_id: str, provider: str = None,
+                              callback_url: str = None):
+        """MOBILE MONEY COLLECTION (STK Push): pulls KES from a customer's
+        M-Pesa or Airtel Money wallet into the merchant account.
+
+        Same Mam-laka endpoint the retail (Jasiri) ramp flow uses for
+        on-ramp deposits, generalized to take `provider` explicitly instead
+        of hardcoding "M-Pesa" — that hardcoding is what silently routes
+        Airtel Money requests to M-Pesa in the retail app today. Always
+        pass provider explicitly for a liquidation node; only fall back to
+        phone-based detection when the caller doesn't know it up front."""
         token = self.get_access_token()
         if not token:
             return {"status": "error", "message": "Authentication failed"}
 
-        # 🟢 FIXED: Updated to match the Postman Guide endpoint
-        balance_url = f"{self.base_url}/api/v1/merchant/balance"
-        
+        actual_provider = provider if provider else self.get_provider_from_phone(phone_number)
+        initiate_url = f"{self.base_url}/api/v1/mobile/initiate"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        payload = {
+            "impalaMerchantId": self.username,
+            "displayName": "Mamlaka IMM Collection",
+            "currency": "KES",
+            "amount": int(amount),
+            "payerPhone": phone_number,
+            "mobileMoneySP": actual_provider.capitalize(),
+            "externalId": transaction_id,
+            **({"callbackUrl": callback_url} if callback_url else {}),
+        }
+
+        try:
+            response = requests.post(initiate_url, json=payload, headers=headers, timeout=15)
+            if response.status_code in [200, 201]:
+                data = response.json()
+                return {"status": "success", "provider_id": data.get("transactionId", transaction_id)}
+            return {"status": "error", "message": f"API Rejected: {response.text}"}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    def payout_mobile_money(self, phone_number: str, amount: int, transaction_id: str, provider: str = None,
+                             callback_url: str = None):
+        """MOBILE MONEY PAYOUT (B2C): pushes KES from the merchant account
+        out to an M-Pesa or Airtel Money wallet — this is the real,
+        external settlement a LIQUIDATE leg needs to make its recognized
+        float actually exist outside the ledger. Same generalization
+        rationale as collect_mobile_money() above: provider is explicit,
+        never assumed from the phone number for a known liquidation node."""
+        token = self.get_access_token()
+        if not token:
+            return {"status": "error", "message": "Authentication failed"}
+
+        actual_provider = provider if provider else self.get_provider_from_phone(phone_number)
+        payout_url = f"{self.base_url}/api/v1/mobile/transfer"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        payload = {
+            "impalaMerchantId": self.username,
+            "currency": "KES",
+            "amount": int(amount),
+            "recipientPhone": phone_number,
+            "mobileMoneySP": actual_provider.capitalize(),
+            "externalId": transaction_id,
+            **({"callbackUrl": callback_url} if callback_url else {}),
+        }
+
+        try:
+            response = requests.post(payout_url, json=payload, headers=headers, timeout=15)
+            if response.status_code in [200, 201]:
+                data = response.json()
+                return {"status": "success", "provider_id": data.get("transactionId", transaction_id)}
+            return {"status": "error", "message": f"API Rejected: {response.text}"}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    def get_merchant_balance(self):
+        """Fetches the live Web2 balances from Mam-laka's core ledger.
+
+        The endpoint this used to call (/api/v1/merchant/balance) 404s
+        against the real sandbox — confirmed live against
+        sandbox.payments.mamlakapsp.com. The working one is
+        /api/v1/wallet/balances, and the response key is lowercase
+        "balances" (not "Balances"), containing kesBalance, artmBalance,
+        airtelBalance, etc."""
+        token = self.get_access_token()
+        if not token:
+            return {"status": "error", "message": "Authentication failed"}
+
+        balance_url = f"{self.base_url}/api/v1/wallet/balances"
+
         headers = {
-            "Authorization": f"Bearer {token}", 
+            "Authorization": f"Bearer {token}",
             "Content-Type": "application/json"
         }
 
         try:
             response = requests.get(balance_url, headers=headers, timeout=15)
+            if response.status_code not in (200, 201):
+                return {"status": "error", "message": f"API Rejected: {response.text}"}
+
             data = response.json()
-            
-            if "Balances" in data:
-                return {"status": "success", "data": data["Balances"]}
+            if "balances" in data:
+                return {"status": "success", "data": data["balances"]}
             return {"status": "success", "data": data}
-            
+
         except Exception as e:
             return {"status": "error", "message": str(e)}
         

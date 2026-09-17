@@ -35,8 +35,19 @@ def normalize_email(value: str) -> str:
 
 
 def is_admin_role(role: Optional[str]) -> bool:
-    """Treat platform roles other than end-user roles as admin-capable."""
-    return (role or "").lower() not in {"", "retail", "trader", "user"}
+    """
+    Treat platform roles other than end-user roles as admin-capable.
+
+    This is a denylist, not an allowlist -- every new end-user-facing role
+    must be added here explicitly or it silently gets treated as
+    admin-capable. "institutional" was added here for that exact reason: an
+    institutional/merchant signup must never get admin dashboard access.
+    Consider switching this to an explicit allowlist of real admin roles
+    ("admin", "super_admin", ...) instead, which would make this whole class
+    of bug impossible going forward -- deferred here since a full audit of
+    every admin-capable role value in use wasn't done as part of this change.
+    """
+    return (role or "").lower() not in {"", "retail", "trader", "user", "institutional", "merchant"}
 
 
 def hash_password(password: str) -> str:
@@ -545,15 +556,30 @@ async def signup(data: dict, request: Request, db=Depends(get_db)):
 
 @router.post("/signup/request-otp")
 async def signup_request_otp(data: dict, db=Depends(get_db)):
-    """Start signup OTP challenge by validating input and emailing code."""
+    """
+    Start signup OTP challenge by validating input and emailing code.
+
+    account_type distinguishes retail vs institutional signup within this
+    one OTP pipeline (reused rather than duplicated into parallel
+    /otc/signup endpoints) -- see signup_verify_otp for the branch on it.
+    "institutional" additionally requires business_name and sets role to
+    "institutional" (never "admin"/"retail"/etc -- see is_admin_role's
+    docstring for why that distinction matters).
+    """
     email = normalize_email(data.get("email") or "")
     password = data.get("password") or ""
     display = data.get("displayName") or data.get("display") or email
+    account_type = str(data.get("account_type") or "retail").strip().lower()
+    business_name = (data.get("business_name") or "").strip()
 
     if not email or not password:
         raise HTTPException(status_code=400, detail="email and password required")
     if len(password) < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    if account_type not in {"retail", "institutional"}:
+        raise HTTPException(status_code=400, detail="account_type must be 'retail' or 'institutional'")
+    if account_type == "institutional" and not business_name:
+        raise HTTPException(status_code=400, detail="business_name is required for institutional signup")
 
     existing = await db.users.find_one({"email": email})
     if existing:
@@ -568,6 +594,8 @@ async def signup_request_otp(data: dict, db=Depends(get_db)):
         payload={
             "displayName": display,
             "passwordHash": hash_password(password),
+            "accountType": account_type,
+            "businessName": business_name or None,
         },
     )
 
@@ -594,30 +622,52 @@ async def signup_verify_otp(data: dict, request: Request, db=Depends(get_db)):
     if existing:
         raise HTTPException(status_code=409, detail="User already exists")
 
+    account_type = payload.get("accountType") or "retail"
     workspace_id_str = str(ObjectId())
     user_doc = {
         "email": email,
         "password": payload.get("passwordHash"),
         "displayName": payload.get("displayName") or email,
-        "role": "retail",
+        # "institutional" here, never "admin"/"retail"/etc for an OTC
+        # merchant -- see is_admin_role's docstring for why this distinction
+        # is a real access-control boundary, not just a label.
+        "role": account_type,
         "workspaceId": workspace_id_str,
         "kycStatus": "unverified",
         "emailVerified": True,
         "createdAt": datetime.utcnow(),
     }
+    if account_type == "institutional":
+        user_doc["businessName"] = payload.get("businessName")
     res = await db.users.insert_one(user_doc)
     user_doc["_id"] = res.inserted_id
 
-    try:
-        await db["retail_wallets"].insert_one({
-            "userId": str(res.inserted_id),
-            "KES": 0.0,
-            "USDA": 0.0,
-            "IMP": 0.0,
-            "createdAt": datetime.utcnow()
-        })
-    except Exception:
-        pass
+    if account_type == "institutional":
+        try:
+            await db["institutional_profiles"].insert_one({
+                "userId": str(res.inserted_id),
+                "businessName": payload.get("businessName"),
+                "onboardingStatus": "not_started",
+                "directors": [],
+                "shareholders": [],
+                "peps": [],
+                "documents": [],
+                "createdAt": datetime.utcnow(),
+                "updatedAt": datetime.utcnow(),
+            })
+        except Exception:
+            pass
+    else:
+        try:
+            await db["retail_wallets"].insert_one({
+                "userId": str(res.inserted_id),
+                "KES": 0.0,
+                "USDA": 0.0,
+                "IMP": 0.0,
+                "createdAt": datetime.utcnow()
+            })
+        except Exception:
+            pass
 
     await db.auth_otps.update_one({"_id": session["_id"]}, {"$set": {"consumed": True, "consumedAt": datetime.utcnow()}})
 

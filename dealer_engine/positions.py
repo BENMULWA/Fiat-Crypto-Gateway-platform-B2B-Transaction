@@ -77,3 +77,57 @@ class TreasuryPositionEngine:
                 return False
             reserved.append((asset, amount))
         return True
+
+    async def release_route(self, reference: str) -> None:
+        """
+        Undoes reserve_route for a settlement that was cancelled/failed before
+        the reserved inventory was actually spent -- decrements `reserved` on
+        every position holding a reservation for this reference and removes
+        those reservation entries. Safe to call even if nothing was reserved
+        under this reference (no-op).
+        """
+        positions = await self.db["treasury_positions"].find(
+            {"reservations.reference": reference}
+        ).to_list(length=None)
+        for position in positions:
+            amount = sum(
+                float(r.get("amount", 0) or 0)
+                for r in position.get("reservations", [])
+                if r.get("reference") == reference
+            )
+            if amount <= 0:
+                continue
+            await self.db["treasury_positions"].update_one(
+                {"asset": position["asset"]},
+                {
+                    "$inc": {"reserved": -amount},
+                    "$pull": {"reservations": {"reference": reference}},
+                },
+            )
+
+    async def spend_route(self, reference: str) -> None:
+        """
+        Finalizes a settlement that actually completed -- the reserved
+        inventory left the treasury for real, so it comes off both `total`
+        and `reserved` (not just `reserved`, which release_route does for a
+        cancelled/failed settlement). Call this on reconciliation, not on
+        release/failure.
+        """
+        positions = await self.db["treasury_positions"].find(
+            {"reservations.reference": reference}
+        ).to_list(length=None)
+        for position in positions:
+            amount = sum(
+                float(r.get("amount", 0) or 0)
+                for r in position.get("reservations", [])
+                if r.get("reference") == reference
+            )
+            if amount <= 0:
+                continue
+            await self.db["treasury_positions"].update_one(
+                {"asset": position["asset"]},
+                {
+                    "$inc": {"total": -amount, "reserved": -amount},
+                    "$pull": {"reservations": {"reference": reference}},
+                },
+            )

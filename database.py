@@ -41,3 +41,7 @@ def get_user_wallets_col():
 
 def get_settlement_logs_col():
     return get_db()["settlement_logs"]
+
+
+def get_imm_switches_col():
+    return get_db()["imm_switches"]

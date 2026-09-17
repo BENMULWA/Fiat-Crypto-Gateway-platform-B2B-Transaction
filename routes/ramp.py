@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 import uuid
 import json
@@ -17,6 +17,7 @@ from pymongo import ReturnDocument
 
 from database import get_db
 from services.safaricom_daraja import DarajaService
+from services.zigram_client import ZigramClient, ZigramError, is_clear_status, is_zigram_configured, resolve_screening_leg
 from routes.auth import get_current_user, get_current_user_with_role, get_verified_current_user, is_admin_role
 from routes.treasury import get_or_create_rate_book, compute_swap_quote_from_book, DEFAULT_USD_BASE_RATES
 from routes.swap_engine import settle_crypto_on_celo
@@ -33,6 +34,197 @@ from services.impala_airtime import impala_airtime
 router = APIRouter(prefix="/api/ramp", tags=["Ramp & Swaps"])
 callback_router = APIRouter(prefix="/api/v1/callbacks", tags=["Airtel Callbacks"])
 mam_laka = DarajaService()
+zigram = ZigramClient()
+
+
+async def _consume_compliance_override(db, user_id, *, trade_id: str, kind: str) -> bool:
+    """
+    Checks for and consumes a one-time compliance override for this user,
+    created by POST /api/ramp/admin/release/{trade_id}. Ramp/swap execution
+    (Airtel gateway calls, Celo settlement, Cardano AIRT mint/burn) is too
+    large and varied to safely re-invoke directly from an admin action, so
+    releasing a hold doesn't re-execute the original transaction -- it lets
+    the customer's *next* attempt skip screening once instead. See
+    release_held_transaction below.
+    """
+    now = datetime.utcnow()
+    override = await db["compliance_overrides"].find_one_and_update(
+        {"user_id": user_id, "consumed": False, "expires_at": {"$gt": now}},
+        {"$set": {"consumed": True, "consumed_at": now, "consumed_trade_id": trade_id}},
+    )
+    if not override:
+        return False
+    await db["compliance_checks"].insert_one({
+        "trade_id": trade_id,
+        "user_id": user_id,
+        "direction": kind,
+        "outcome": "manual_override_consumed",
+        "override_id": override.get("_id"),
+        "created_at": now,
+    })
+    return True
+
+
+async def _screen_ramp_transaction(db, *, current_user, trade_id: str, body: "RampExecute") -> bool:
+    """
+    Screens a real-money (Mobile Money on/off-ramp) transaction with ZIGRAM
+    before any wallet debit or provider call happens. Always logs the
+    attempt/result to `compliance_checks` for audit, regardless of outcome.
+
+    Scope: only direction in {"on", "off"} with channel == "Mobile Money" is
+    screened here -- those are the actual fiat cash-in/cash-out legs. Internal
+    "swap" transactions are screened separately by _screen_swap_transaction
+    below, via resolve_screening_leg (ZIGRAM's Transaction_Currency field is a
+    3-char ISO code and doesn't fit asset tickers like AIRT/USDA directly).
+
+    Returns True if the transaction may proceed, False if it must be held for
+    manual compliance review.
+    """
+    if await _consume_compliance_override(db, current_user["_id"], trade_id=trade_id, kind=body.direction):
+        return True
+
+    if not is_zigram_configured():
+        # ZIGRAM_USERNAME/ZIGRAM_USER_SECRET/ZIGRAM_PROJECT_ID aren't set yet
+        # (e.g. local/QA testing before the vendor account is provisioned).
+        # Without this check, every ramp transaction would fail-closed into
+        # pending_compliance_review via ZigramError, since there's nothing to
+        # call. Bypass is logged to compliance_checks so it's auditable, and
+        # this self-corrects the moment real credentials are set in the
+        # environment -- no code change needed to re-enable screening.
+        print(f"⚠️ [Compliance] ZIGRAM not configured -- skipping screening for {trade_id} (test/dev bypass)")
+        await db["compliance_checks"].insert_one({
+            "trade_id": trade_id,
+            "user_id": current_user["_id"],
+            "direction": body.direction,
+            "channel": body.channel,
+            "amount": body.amount,
+            "outcome": "skipped_not_configured",
+            "created_at": datetime.utcnow(),
+        })
+        return True
+
+    fiat_asset = body.from_asset if body.direction == "on" else body.to_asset
+
+    check_doc = {
+        "trade_id": trade_id,
+        "user_id": current_user["_id"],
+        "direction": body.direction,
+        "channel": body.channel,
+        "amount": body.amount,
+        "currency": fiat_asset,
+        "created_at": datetime.utcnow(),
+    }
+
+    try:
+        result = zigram.submit_transaction(
+            customer_id=str(current_user["_id"]),
+            transaction_id=trade_id,
+            amount=body.amount,
+            currency=fiat_asset,
+            mode=body.channel,
+            transaction_type="Deposit" if body.direction == "on" else "Withdrawal",
+            transaction_status="Pending",
+            channel=body.channel,
+        )
+    except ZigramError as e:
+        check_doc.update({"outcome": "error", "error": str(e)})
+        await db["compliance_checks"].insert_one(check_doc)
+        # fail-closed: if we can't screen it, we don't move money
+        return False
+
+    check_doc.update({
+        "outcome": "screened",
+        "is_success": result["is_success"],
+        "monitoring_status": result["monitoring_status"],
+        "case_display_id": result["case_display_id"],
+        "master_case_display_id": result["master_case_display_id"],
+        "raw_response": result["raw"],
+    })
+    await db["compliance_checks"].insert_one(check_doc)
+
+    if not result["is_success"]:
+        return False
+
+    return is_clear_status(result["monitoring_status"])
+
+
+async def _screen_swap_transaction(db, *, current_user, trade_id: str, body: "RampExecute", receive_amount: float, rate_book: dict) -> bool:
+    """
+    Screens an internal swap (crypto<->crypto, AIRT mint/burn, KES<->USDA,
+    etc.) with ZIGRAM before any wallet debit, mint/burn, or on-chain
+    settlement happens. Same fail-closed contract as _screen_ramp_transaction.
+
+    Uses resolve_screening_leg to pick a real ISO currency + amount to send
+    ZIGRAM, since most swap legs are crypto tickers ZIGRAM's 3-char currency
+    field can't hold.
+    """
+    if await _consume_compliance_override(db, current_user["_id"], trade_id=trade_id, kind="swap"):
+        return True
+
+    if not is_zigram_configured():
+        # See the matching check in _screen_ramp_transaction above -- same
+        # reasoning: without real ZIGRAM credentials, every swap would
+        # fail-closed into pending_compliance_review with nothing to call.
+        print(f"⚠️ [Compliance] ZIGRAM not configured -- skipping screening for {trade_id} (test/dev bypass)")
+        await db["compliance_checks"].insert_one({
+            "trade_id": trade_id,
+            "user_id": current_user["_id"],
+            "direction": "swap",
+            "from_asset": body.from_asset,
+            "to_asset": body.to_asset,
+            "amount": body.amount,
+            "outcome": "skipped_not_configured",
+            "created_at": datetime.utcnow(),
+        })
+        return True
+
+    from routes.treasury import DEFAULT_USD_BASE_RATES
+    rates = dict(DEFAULT_USD_BASE_RATES)
+    rates.update(rate_book.get("usd_base_rates", {}))
+    currency, amount = resolve_screening_leg(body.from_asset, body.to_asset, body.amount, receive_amount, usd_base_rates=rates)
+
+    check_doc = {
+        "trade_id": trade_id,
+        "user_id": current_user["_id"],
+        "direction": "swap",
+        "from_asset": body.from_asset,
+        "to_asset": body.to_asset,
+        "amount": amount,
+        "currency": currency,
+        "created_at": datetime.utcnow(),
+    }
+
+    try:
+        result = zigram.submit_transaction(
+            customer_id=str(current_user["_id"]),
+            transaction_id=trade_id,
+            amount=amount,
+            currency=currency,
+            mode=body.channel or "Internal Ledger",
+            transaction_type="Swap",
+            transaction_status="Pending",
+            channel=body.channel or "Internal Ledger",
+        )
+    except ZigramError as e:
+        check_doc.update({"outcome": "error", "error": str(e)})
+        await db["compliance_checks"].insert_one(check_doc)
+        return False
+
+    check_doc.update({
+        "outcome": "screened",
+        "is_success": result["is_success"],
+        "monitoring_status": result["monitoring_status"],
+        "case_display_id": result["case_display_id"],
+        "master_case_display_id": result["master_case_display_id"],
+        "raw_response": result["raw"],
+    })
+    await db["compliance_checks"].insert_one(check_doc)
+
+    if not result["is_success"]:
+        return False
+
+    return is_clear_status(result["monitoring_status"])
+
 
 # Safe MongoDB ObjectId converter
 try:
@@ -548,6 +740,24 @@ async def execute_ramp(body: RampExecute, db=Depends(get_db), current_user=Depen
     trade_id = f"TRADE_{uuid.uuid4().hex[:8].upper()}"
     provider_reference = f"LIVE-{uuid.uuid4().hex[:8].upper()}"
 
+    if body.direction in ("on", "off") and body.channel == "Mobile Money":
+        cleared = await _screen_ramp_transaction(db, current_user=current_user, trade_id=trade_id, body=body)
+        if not cleared:
+            await db["ramp_entries"].insert_one({
+                "_id": trade_id, "direction": body.direction, "channel": body.channel,
+                "fromAsset": body.from_asset, "toAsset": body.to_asset,
+                "fromAmount": body.amount, "toAmount": 0.0,
+                "status": "pending_compliance_review", "userId": user_id,
+                "date": datetime.utcnow().strftime("%b %d, %Y"),
+                "timeAgo": datetime.utcnow().strftime("%H:%M:%S"),
+                "createdAt": datetime.utcnow(),
+            })
+            return {
+                "id": trade_id,
+                "status": "pending_compliance_review",
+                "message": "Your transaction is held for compliance review. No funds have moved.",
+            }
+
     receive = body.amount
     live_swap_quote = None
 
@@ -564,6 +774,26 @@ async def execute_ramp(body: RampExecute, db=Depends(get_db), current_user=Depen
         receive = live_swap_quote["receive_amount"]
         profit_amount = live_swap_quote["fee_amount"]
         profit_currency = live_swap_quote.get("fee_currency", body.to_asset)
+
+        cleared = await _screen_swap_transaction(
+            db, current_user=current_user, trade_id=trade_id, body=body,
+            receive_amount=receive, rate_book=rate_book,
+        )
+        if not cleared:
+            await db["ramp_entries"].insert_one({
+                "_id": trade_id, "direction": "swap", "channel": body.channel or "Internal Ledger",
+                "fromAsset": body.from_asset, "toAsset": body.to_asset,
+                "fromAmount": body.amount, "toAmount": 0.0,
+                "status": "pending_compliance_review", "userId": user_id,
+                "date": datetime.utcnow().strftime("%b %d, %Y"),
+                "timeAgo": datetime.utcnow().strftime("%H:%M:%S"),
+                "createdAt": datetime.utcnow(),
+            })
+            return {
+                "id": trade_id,
+                "status": "pending_compliance_review",
+                "message": "Your swap is held for compliance review. No funds have moved.",
+            }
 
     # ========================================================
     # INTERNAL SWAP EXECUTION (User Ledger Transfer)
@@ -1400,6 +1630,49 @@ async def get_ramp_history(db=Depends(get_db), current_user=Depends(get_current_
             ,"explorerUrl": f"https://cardanoscan.io/transaction/{e['cardanoTxHash']}" if e.get("cardanoTxHash") else None
         })
     return {"status": "success", "entries": formatted_entries}
+
+
+@router.post("/admin/release/{trade_id}")
+async def release_held_transaction(trade_id: str, db=Depends(get_db), current_user=Depends(get_current_user_with_role)):
+    """
+    Manually clears a ZIGRAM compliance hold on a specific ramp/swap entry.
+
+    This does NOT re-execute the original transaction -- the on/off-ramp and
+    swap code paths involve live Airtel gateway calls, Celo settlement, and
+    Cardano AIRT mint/burn, which is too much varied side-effecting logic to
+    safely re-trigger from an admin action without dedicated review. Instead,
+    this grants the affected user a one-time compliance override (see
+    _consume_compliance_override) that their *next* ramp/swap attempt from the
+    app will consume automatically, skipping ZIGRAM screening for that one
+    retry only. The customer needs to be told to retry from the app.
+    """
+    if not is_admin_role(current_user.get("role")):
+        raise HTTPException(status_code=403, detail="Admin role required")
+
+    entry = await db["ramp_entries"].find_one({"_id": trade_id})
+    if not entry:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    if entry.get("status") != "pending_compliance_review":
+        raise HTTPException(status_code=400, detail=f"Transaction is not pending review (status: {entry.get('status')})")
+
+    now = datetime.utcnow()
+    await db["compliance_checks"].insert_one({
+        "trade_id": trade_id,
+        "outcome": "manually_released",
+        "released_by": current_user.get("_id"),
+        "released_at": now,
+    })
+    await db["compliance_overrides"].insert_one({
+        "user_id": entry.get("userId"),
+        "trade_id": trade_id,
+        "consumed": False,
+        "created_at": now,
+        "expires_at": now + timedelta(hours=24),
+    })
+    return {
+        "status": "success",
+        "message": "Compliance hold released. Ask the customer to retry the same transaction from the app -- their next attempt will skip screening once.",
+    }
 
 
 @router.get("/stk/latest")

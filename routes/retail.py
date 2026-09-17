@@ -439,6 +439,51 @@ class InternalTransferRequest(BaseModel):
     note: Optional[str] = None
 
 
+def _mask_display_name(name: str) -> str:
+    """'John Kariuki' -> 'John K.' — same partial-name confirmation banks
+    show before you commit to an internal transfer (e.g. KCB/M-Pesa's
+    "confirm recipient" step), without exposing the full name to a sender
+    who only knows the recipient's email."""
+    parts = [p for p in (name or "").strip().split(" ") if p]
+    if not parts:
+        return "Jasiri User"
+    if len(parts) == 1:
+        return parts[0]
+    return f"{parts[0]} {parts[1][0]}."
+
+
+# Recipient verification step before a transfer is confirmed — mirrors the
+# "confirm recipient name" screen on a bank's own-bank transfer flow. Returns
+# only a masked display name, never the full name/phone, so a sender can't
+# use this to enumerate account holder details from a bare email guess.
+@router.get("/transfer/lookup")
+async def lookup_transfer_recipient(
+    email: str,
+    db=Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    recipient_email = (email or "").strip().lower()
+    if not recipient_email:
+        raise HTTPException(status_code=400, detail="Email is required.")
+
+    sender_email = (current_user.get("email") or "").strip().lower()
+    if recipient_email == sender_email:
+        return {"status": "success", "found": False, "isSelf": True}
+
+    recipient_doc = await db["users"].find_one({"email": recipient_email})
+    if not recipient_doc:
+        return {"status": "success", "found": False, "isSelf": False}
+
+    display_name = recipient_doc.get("displayName") or recipient_doc.get("name") or ""
+    return {
+        "status": "success",
+        "found": True,
+        "isSelf": False,
+        "displayName": _mask_display_name(display_name),
+        "kycVerified": recipient_doc.get("kycStatus") == "verified",
+    }
+
+
 # Off-chain, instant, zero-fee balance transfer between two Jasiri accounts —
 # no blockchain transaction, just an internal ledger move. Gated behind the
 # same email-OTP + mandatory-TOTP check as a real withdrawal (see

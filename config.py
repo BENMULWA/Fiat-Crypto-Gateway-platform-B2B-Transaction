@@ -78,6 +78,34 @@ class Settings(BaseSettings):
     # Optional ADA->USD conversion rate for UI display (set in .env for approximate USD values)
     cardano_ada_usd_rate: Optional[float] = None if os.getenv("CARDANO_ADA_USD_RATE") is None else float(os.getenv("CARDANO_ADA_USD_RATE"))
 
+    # ZIGRAM / Transact Comply transaction monitoring
+    zigram_base_url: str = os.getenv("ZIGRAM_BASE_URL", "https://qa.transactcomply.com/tmprocessor/tp/")
+    zigram_username: Optional[str] = os.getenv("ZIGRAM_USERNAME", None)
+    zigram_user_secret: Optional[str] = os.getenv("ZIGRAM_USER_SECRET", None)
+    # Kept as a plain str field + property, not Optional[int] -- pydantic-settings
+    # ignores this class's own Python-side default and tries to coerce whatever
+    # raw string is in the environment (including "") into the annotated type
+    # the moment the env var exists at all, which crashes app startup on an
+    # empty ZIGRAM_PROJECT_ID= line. Same failure mode as cors_origins_raw above.
+    zigram_project_id_raw: str = os.getenv("ZIGRAM_PROJECT_ID", "")
+
+    @property
+    def zigram_project_id(self) -> Optional[int]:
+        return int(self.zigram_project_id_raw) if self.zigram_project_id_raw.strip() else None
+
+    # Comma-separated Monitoring_Status values ZIGRAM has confirmed mean "clear
+    # to proceed". Their docs only ever show "Flag" as an example and never
+    # publish the full enum, so this stays empty on purpose: nothing
+    # auto-clears until you get the real value(s) from ZIGRAM support and set
+    # this env var. Kept as a plain str field + property, not list[str] --
+    # see the cors_origins_raw comment above for why a list-typed field here
+    # would crash at startup the moment this var is actually set.
+    zigram_clear_statuses_raw: str = os.getenv("ZIGRAM_CLEAR_STATUSES", "")
+
+    @property
+    def zigram_clear_statuses(self) -> list[str]:
+        return [s.strip() for s in self.zigram_clear_statuses_raw.split(",") if s.strip()]
+
     # Pydantic v2 Environment parsing rules
     model_config = SettingsConfigDict(
         env_file=str(ENV_PATH),

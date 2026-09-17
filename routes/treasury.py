@@ -19,11 +19,13 @@ from routes.swap_engine import settle_crypto_on_celo
 from routes.auth import get_current_user, get_current_user_with_role, get_verified_current_user, is_admin_role
 from celo_wallet import derive_celo_account, get_or_create_celo_wallet_index
 from cardano_child_wallet import derive_cardano_child_account, get_or_create_cardano_wallet_index
-from stellar_child_wallet import get_or_create_stellar_wallet_index, derive_stellar_child_account
+from stellar_child_wallet import get_or_create_stellar_wallet_index, derive_stellar_child_account, get_stellar_treasury_keypair
 from workers.stellar_deposit_watcher import (
     provision_stellar_account_sync,
     is_stellar_account_provisioned_sync,
     send_stellar_withdrawal_sync,
+    _get_server as get_stellar_server,
+    USDC_ISSUER as STELLAR_USDC_ISSUER,
 )
 from stellar_audit import log_stellar_audit_event
 from notifications import notify_user
@@ -34,12 +36,47 @@ from decimal import Decimal
 router = APIRouter(prefix="/api/treasury", tags=["Treasury"])
 daraja = DarajaService()
 
+
+def _read_celo_usdc_balance_sync() -> float:
+    """Real, live USDC balance of this backend's Celo treasury — same
+    address and contract call /positions already uses via
+    read_celo_balances(), pulled out here so /dashboard can show the same
+    real number for the Celo node without duplicating the ABI/call."""
+    treasury_address = get_treasury_address()
+    balance_abi = [{
+        "constant": True,
+        "inputs": [{"name": "account", "type": "address"}],
+        "name": "balanceOf",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "type": "function",
+    }]
+    contract = w3.eth.contract(address=ASSET_CONTRACTS["USDC"], abi=balance_abi)
+    return float(contract.functions.balanceOf(treasury_address).call()) / (10 ** 6)
+
+
+def _read_stellar_treasury_balance_sync() -> dict:
+    """Real, live balance of the Stellar treasury account — shared by
+    /positions and /dashboard so both surfaces read the exact same call
+    instead of two copies drifting apart."""
+    server = get_stellar_server()
+    treasury = get_stellar_treasury_keypair()
+    account = server.accounts().account_id(treasury.public_key).call()
+    xlm = 0.0
+    usdc = 0.0
+    for b in account.get("balances", []):
+        if b.get("asset_type") == "native":
+            xlm = float(b.get("balance", 0) or 0)
+        elif b.get("asset_code") == "USDC" and b.get("asset_issuer") == STELLAR_USDC_ISSUER:
+            usdc = float(b.get("balance", 0) or 0)
+    return {"status": "success", "xlm": xlm, "usdc": usdc}
+
 RATE_BOOK_ID = "swap_rate_book"
 DEFAULT_USD_BASE_RATES = {
     "USDA": 1.0, "USDC": 1.0, "USDT": 1.0, "USD": 1.0, "cUSD": 1.0, "IMP": 1.0,
     "KES": 130.50, "UGX": 3750.00, "TZS": 2580.00, "RWF": 1320.00,
     "BIF": 2850.00, "XAF": 605.00, "XOF": 605.00,
     "BTC": 1 / 64000, "ETH": 1 / 3500,
+    "USDC_STELLAR": 1.0, "XLM": 1 / 0.12,
 }
 
 
@@ -336,7 +373,12 @@ class CorridorRequest(BaseModel):
     amount_kes: float
 
 @router.post("/corridor/airtime-celo")
-async def trigger_airtime_celo_corridor(req: CorridorRequest, db=Depends(get_db)):
+async def trigger_airtime_celo_corridor(
+    req: CorridorRequest,
+    db=Depends(get_db),
+    current_user=Depends(get_current_user_with_role),
+):
+    ensure_admin(current_user)
     if req.amount_kes <= 0:
         raise HTTPException(status_code=400, detail="Amount must be greater than zero.")
 
@@ -360,22 +402,38 @@ class HFTExecuteRequest(BaseModel):
     corridor_id: str
 
 @router.post("/corridor/execute-hft")
-async def execute_dynamic_hft_corridor(req: HFTExecuteRequest, db=Depends(get_db)):
+async def execute_dynamic_hft_corridor(
+    req: HFTExecuteRequest,
+    db=Depends(get_db),
+    current_user=Depends(get_current_user_with_role),
+):
+    ensure_admin(current_user)
     if req.amount <= 0:
         raise HTTPException(status_code=400, detail="Amount must be greater than zero.")
 
     try:
         from Brain_Engine.state_engine import ImmutableLedger, HFTCorridorFSM, FSMState
+        from Brain_Engine.node_registry import CORRIDORS, corridor_eligible
         ledger = ImmutableLedger(db_collection=db["transactions"])
-        
-        config = {}
-        if req.corridor_id == "telkom_5x":
-            config = {"cycles": 5, "discount": 0.10, "fx_edge": 0.05, "node_procure": "N1", "node_liquidate": "N4"}
-        elif req.corridor_id == "airtel_5x":
-            config = {"cycles": 5, "discount": 0.06, "fx_edge": 0.00, "node_procure": "N2", "node_liquidate": "N5"}
-        else:
+
+        if req.corridor_id not in CORRIDORS:
             raise HTTPException(status_code=400, detail="Unknown corridor ID")
-            
+        if not corridor_eligible(req.corridor_id):
+            raise HTTPException(
+                status_code=403,
+                detail=f"Corridor {req.corridor_id!r} is disabled or one of its nodes is switched off — "
+                       "re-enable it via /api/imm before deploying.",
+            )
+
+        corridor = CORRIDORS[req.corridor_id]
+        config = {
+            "cycles": 5,
+            "discount": corridor["discount"],
+            "fx_edge": corridor["fx_edge"],
+            "node_procure": corridor["node_procure"],
+            "node_liquidate": corridor["node_liquidate"],
+        }
+
         bot = HFTCorridorFSM(ledger=ledger, starting_capital_usd=req.amount, config=config)
         await bot.boot_system()
         
@@ -397,6 +455,112 @@ async def execute_dynamic_hft_corridor(req: HFTExecuteRequest, db=Depends(get_db
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class SimulateCorridorRequest(BaseModel):
+    amount: float
+    currency: str = "KES"  # "KES" or "USD" — matches the opportunity's own currency field on the frontend
+    mocked_node_ids: Optional[list[str]] = None  # e.g. ["N1","N2","N4","N5"] to light up an otherwise-offline corridor for the demo
+    hold_cycles: Optional[list[int]] = None  # which cycle(s) should visibly hold in AWAITING_OPPORTUNITY; defaults to [2]
+
+
+@router.post("/corridor/simulate-5x")
+async def simulate_dynamic_hft_corridor(
+    req: SimulateCorridorRequest,
+    current_user=Depends(get_current_user_with_role),
+):
+    """Runs the real HFTCorridorFSM (Brain_Engine/state_engine.py) through
+    a full 5x rollover with every external call swapped for a
+    deterministic fake — see Brain_Engine/simulate.py's module docstring.
+    No real airtime, paybill balance, Cardano vault, or Celo broadcast is
+    touched; nothing here writes to the real ledger (in-memory only).
+    Safe to run at will to demo the corridor shape on the dashboard."""
+    ensure_admin(current_user)
+    if req.amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be greater than zero.")
+
+    from Brain_Engine.simulate import run_simulated_5x_cycle
+
+    baseline_rate = 129.50
+    principal_usd = req.amount / baseline_rate if req.currency.upper() == "KES" else req.amount
+
+    try:
+        result = await run_simulated_5x_cycle(
+            principal_usd=principal_usd,
+            mocked_node_ids=req.mocked_node_ids,
+            hold_cycles=req.hold_cycles,
+        )
+        return result
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class StartCorridorRequest(BaseModel):
+    amount: float
+    corridor_id: str
+    currency: str = "USD"  # "KES" or "USD" — same convention as SimulateCorridorRequest
+
+
+@router.post("/corridor/start")
+async def start_hft_corridor(
+    req: StartCorridorRequest,
+    db=Depends(get_db),
+    current_user=Depends(get_current_user_with_role),
+):
+    """Starts a REAL corridor run as a background task and returns
+    immediately with its run_id — replaces the old /corridor/execute-hft's
+    blocking behavior (that endpoint awaited the FSM synchronously inside
+    one HTTP request, which cannot work now that ROLLOVER can legitimately
+    hold in AWAITING_OPPORTUNITY for minutes to a day). Poll
+    GET /corridor/{run_id}/status for progress; the run also survives a
+    server restart (see workers/corridor_worker.py's resume sweep)."""
+    ensure_admin(current_user)
+
+    from workers.corridor_worker import start_corridor_run
+
+    baseline_rate = 129.50
+    principal_usd = req.amount / baseline_rate if req.currency.upper() == "KES" else req.amount
+
+    try:
+        run_doc = await start_corridor_run(
+            db, corridor_id=req.corridor_id, amount_usd=principal_usd,
+            started_by=str(current_user.get("_id")),
+        )
+        return {"status": "started", "run": run_doc}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/corridor/{run_id}/status")
+async def get_hft_corridor_status(
+    run_id: str,
+    db=Depends(get_db),
+    current_user=Depends(get_current_user_with_role),
+):
+    ensure_admin(current_user)
+    from workers.corridor_worker import get_run_status
+
+    run_doc = await get_run_status(db, run_id)
+    if not run_doc:
+        raise HTTPException(status_code=404, detail="Unknown corridor run ID")
+    return run_doc
+
+
+@router.get("/corridor/runs")
+async def list_hft_corridor_runs(
+    limit: int = 25,
+    db=Depends(get_db),
+    current_user=Depends(get_current_user_with_role),
+):
+    ensure_admin(current_user)
+    from workers.corridor_worker import list_runs
+
+    return {"runs": await list_runs(db, limit=min(limit, 100))}
+
 
 @router.get("/dashboard")
 async def get_treasury_dashboard(db=Depends(get_db)):
@@ -421,7 +585,12 @@ async def get_treasury_dashboard(db=Depends(get_db)):
 
         vaults = {
             "N7_USDA": 0.0, "N4_MPESA": 0.0, "N1_TELKOM": 0.0, "N2_AIRTEL": 0.0,
-            "N3_SAFARICOM": 0.0, "N8_IMP": 0.0, "N9_XLM": 0.0, "N10_USD": 0.0, "N11_GOLD": 0.0
+            "N3_SAFARICOM": 0.0, "N8_IMP": 0.0, "N9_XLM": 0.0, "N10_USD": 0.0, "N11_GOLD": 0.0,
+            # Not one of the ten canonical whitepaper nodes — Celo is the
+            # settlement chain the corridor FSM's default exit already
+            # uses (Brain_Engine/state_engine.py's EXIT_CHAIN="celo"), so
+            # it gets a real balance here even without its own N-number.
+            "CELO_USDC": 0.0,
         }
         
         all_txns_cursor = db["transactions"].find()
@@ -439,10 +608,35 @@ async def get_treasury_dashboard(db=Depends(get_db)):
         mam_laka_total = 0.0
 
         if fiat_balances:
-            vaults["N2_AIRTEL"] = fiat_balances.get("artmBalance", 0.0) 
-            vaults["N4_MPESA"] = fiat_balances.get("kesBalance", 0.0)   
-            vaults["N8_IMP"] = fiat_balances.get("impaBalance", 0.0)    
+            vaults["N2_AIRTEL"] = fiat_balances.get("artmBalance", 0.0)
+            vaults["N4_MPESA"] = fiat_balances.get("kesBalance", 0.0)
+            vaults["N8_IMP"] = fiat_balances.get("impaBalance", 0.0)
             mam_laka_total = fiat_balances.get("totalBalance", 0.0)
+
+        # Same real-wallet-overwrite pattern as the Mam-laka block above,
+        # for the two nodes that previously only ever showed a ledger-only
+        # sum with nothing real behind it: N7 (USDA) from the real Cardano
+        # custodial vault, N9 (multi-chain router) from the real Stellar
+        # treasury. Both fail soft — a real fetch error leaves the
+        # ledger-derived value in place rather than zeroing it out.
+        try:
+            cardano_balance = await get_master_wallet_balance()
+            if isinstance(cardano_balance, dict) and cardano_balance.get("status") == "success":
+                vaults["N7_USDA"] = float(cardano_balance.get("usda", 0.0) or 0.0)
+        except Exception:
+            traceback.print_exc()
+
+        try:
+            stellar_balance = await asyncio.to_thread(_read_stellar_treasury_balance_sync)
+            if stellar_balance.get("status") == "success":
+                vaults["N9_XLM"] = float(stellar_balance.get("xlm", 0.0) or 0.0)
+        except Exception:
+            traceback.print_exc()
+
+        try:
+            vaults["CELO_USDC"] = await asyncio.wait_for(asyncio.to_thread(_read_celo_usdc_balance_sync), timeout=20)
+        except Exception:
+            traceback.print_exc()
 
         return {
             "status": "success",
@@ -508,6 +702,12 @@ async def get_treasury_positions(db=Depends(get_db)):
         async def read_cardano_balance():
             return await asyncio.to_thread(lambda: asyncio.run(get_master_wallet_balance()))
 
+        async def read_stellar_balance():
+            try:
+                return await asyncio.to_thread(_read_stellar_treasury_balance_sync)
+            except Exception as e:
+                return {"status": "error", "message": str(e)}
+
         def read_celo_balances():
             treasury_address = get_treasury_address()
             balance_abi = [{
@@ -528,10 +728,11 @@ async def get_treasury_positions(db=Depends(get_db)):
             read_daraja_balance(),
             read_cardano_balance(),
             asyncio.wait_for(asyncio.to_thread(read_celo_balances), timeout=20),
+            read_stellar_balance(),
             return_exceptions=True,
         )
 
-        merchant_result, cardano_balance, celo_balances = master_results
+        merchant_result, cardano_balance, celo_balances, stellar_balance = master_results
         if isinstance(merchant_result, dict) and merchant_result.get("status") == "success":
             merchant_data = merchant_result.get("data", {})
             master_balances.update({
@@ -546,13 +747,24 @@ async def get_treasury_positions(db=Depends(get_db)):
                 "USDA": float(cardano_balance.get("usda", 0) or 0),
             })
             master_assets.update({"ADA", "USDA"})
+        if isinstance(stellar_balance, dict) and stellar_balance.get("status") == "success":
+            # Kept as distinct symbols from Celo's own "USDC" rather than
+            # merged into it — these are two different chains' holdings of
+            # a same-named asset, and silently summing them would hide
+            # which chain actually has how much.
+            master_balances.update({
+                "XLM": float(stellar_balance.get("xlm", 0) or 0),
+                "USDC_STELLAR": float(stellar_balance.get("usdc", 0) or 0),
+            })
+            master_assets.update({"XLM", "USDC_STELLAR"})
         if isinstance(celo_balances, dict):
             master_balances.update(celo_balances)
             master_assets.update(celo_balances)
 
         assets = [*SUPPORTED_ASSETS]
-        if "ADA" not in assets:
-            assets.append("ADA")
+        for extra_asset in ("ADA", "XLM", "USDC_STELLAR"):
+            if extra_asset not in assets:
+                assets.append(extra_asset)
         balances = {
             asset: master_balances[asset] if asset in master_assets else retail_balances.get(asset, 0.0)
             for asset in assets

@@ -33,11 +33,21 @@ try:
 except ImportError:
     stellar_deposit_watcher_loop = None
 
+# Keeps Comet Engine's KES/IMC IMM rate fresh — Comet refuses any quote
+# older than 60 minutes (see services/comet_client.py), so without this,
+# /api/market-maker/spread/comet silently starts 502ing an hour after
+# whoever last ran POST /admin/imm/rates by hand.
+try:
+    from services.comet_client import CometClient
+except ImportError:
+    CometClient = None
+
 # Routers (The Web Traffic)
 from routes import (
-    auth, dashboard, market_maker, trade, ramp, 
-    airtime_ledger, general_ledger, rates, tokens, 
-    cardano, treasury, retail, otc_admin, swap_engine, valora, stellar
+    auth, dashboard, market_maker, trade, ramp,
+    airtime_ledger, general_ledger, rates, tokens,
+    cardano, treasury, retail, otc_admin, otc_merchant, swap_engine, valora, stellar,
+    imm_control
 )
 from routes import realtime
 
@@ -57,12 +67,45 @@ async def lifespan(app: FastAPI):
     cardano_watcher_stop = None
     stellar_watcher_task = None
     stellar_watcher_stop = None
+    comet_rate_task = None
 
     try:
         # Verify Database Connection
         await client.admin.command("ping")
         print("✓ Connected to MongoDB")
         db = get_db()
+
+        # Rehydrate per-node/per-corridor IMM switches from Mongo into
+        # memory_cache — those switches are read from the hot in-memory
+        # cache on every DecisionEngine tick, but must survive a restart.
+        from Brain_Engine.cache import memory_cache
+        async for switch_doc in db["imm_switches"].find({}):
+            kind_and_id = switch_doc["_id"].split(":", 1)
+            if len(kind_and_id) == 2:
+                kind, entity_id = kind_and_id
+                memory_cache.set(f"imm:{kind}:{entity_id}:enabled", bool(switch_doc.get("enabled", True)))
+        print("✓ IMM node/corridor switches rehydrated from MongoDB")
+
+        # The autonomous DecisionEngine's kill switch lives only in
+        # memory_cache — it does NOT persist across restarts. Without this,
+        # every restart (deploy, crash, routine reload) silently re-arms
+        # live autonomous trading with no warning, and the engine can
+        # attempt a real corridor execution within seconds of boot (this
+        # actually happened twice during dev testing on 2026-09-12, hitting
+        # ImpalaPay's real airtime API — rejected with 402, no funds moved,
+        # but the request was real). Always boot halted; an admin must
+        # explicitly re-arm via POST /api/treasury/kill-switch.
+        memory_cache.set("system:kill_switch", True)
+        print("🛑 Autonomous engine boots HALTED by default — admin must explicitly re-arm.")
+
+        # Resume any corridor run a previous process left mid-flight
+        # (crash, deploy, restart) — see workers/corridor_worker.py.
+        # Each resumed run picks its own background task back up from
+        # exactly the cycle/principal/FSMState it last persisted.
+        from workers.corridor_worker import resume_pending_corridor_runs
+        resumed_count = await resume_pending_corridor_runs(db)
+        if resumed_count:
+            print(f"✓ Resumed {resumed_count} corridor run(s) from a prior process")
 
         # Start the HFT Bot in the background
         if hft_bot:
@@ -117,7 +160,29 @@ async def lifespan(app: FastAPI):
                 await asyncio.sleep(60)
 
         airtel_timeout_task = asyncio.create_task(expire_silent_airtel_entries())
-            
+
+        # Comet's KES/IMC IMM rate — fixed 1:1 peg, matching Comet's own
+        # worked example (docs.mamlakapsp.com/examples/imm-market-maker.html).
+        # Refreshed well under Comet's 60-min staleness window so a normal
+        # gap between cycles never causes a false 502 on /spread/comet.
+        async def refresh_comet_kes_imc_rate():
+            if not CometClient:
+                return
+            comet = CometClient()
+            interval_seconds = max(300, int(os.getenv("COMET_RATE_REFRESH_SECONDS", "1800")))
+            while True:
+                try:
+                    result = comet.set_imm_rate("KES", "IMC", 1.0)
+                    if result["status"] == "success":
+                        print("✓ Comet KES/IMC rate refreshed (1:1 peg)")
+                    else:
+                        print(f"✗ Comet rate refresh rejected: {result['message']}")
+                except Exception as e:
+                    print(f"✗ Comet rate refresh failed: {e}")
+                await asyncio.sleep(interval_seconds)
+
+        comet_rate_task = asyncio.create_task(refresh_comet_kes_imc_rate())
+
     except Exception as e:
         print(f"✗ Startup Error: {e}")
         
@@ -157,7 +222,14 @@ async def lifespan(app: FastAPI):
             await airtel_timeout_task
         except asyncio.CancelledError:
             pass
-        
+
+    if comet_rate_task:
+        comet_rate_task.cancel()
+        try:
+            await comet_rate_task
+        except asyncio.CancelledError:
+            pass
+
     client.close()
     print("✓ MongoDB connection closed.")
 
@@ -184,6 +256,7 @@ app.add_middleware(
 app.include_router(auth.router)
 app.include_router(dashboard.router)
 app.include_router(market_maker.router)
+app.include_router(imm_control.router)
 app.include_router(trade.router)
 app.include_router(ramp.router)
 app.include_router(ramp.callback_router)
@@ -196,6 +269,7 @@ app.include_router(cardano.router)
 app.include_router(treasury.router)
 app.include_router(retail.router)
 app.include_router(otc_admin.router)
+app.include_router(otc_merchant.router)
 app.include_router(swap_engine.router)
 app.include_router(valora.router)
 app.include_router(stellar.router)

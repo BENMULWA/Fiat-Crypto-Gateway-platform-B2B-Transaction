@@ -58,7 +58,8 @@ async def get_live_ledger_feed(limit: int = 50, search: str = None, db = Depends
             "amount": f"{amount_val:,.2f} {asset_str}",
             "intValue": f"${int_val:,.2f}",
             "type": txn_type,
-            "typeColor": type_color
+            "typeColor": type_color,
+            "externalRef": r.get("external_ref"),
         })
         
     return {"status": "success", "feed": formatted_feed}
