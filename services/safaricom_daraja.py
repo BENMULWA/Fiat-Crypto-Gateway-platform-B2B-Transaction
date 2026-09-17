@@ -10,24 +10,46 @@ load_dotenv()
 
 class DarajaService:
     def __init__(self):
-        self.username = os.getenv("LIPAD_API_USERNAME", "meshex_sandbox")
-        self.password = os.getenv("LIPAD_API_PASSWORD")
-        if not self.password:
-            raise RuntimeError("LIPAD_API_PASSWORD environment variable is not set")
+        # Reads the SAME credentials as the live retail Mobile Money STK
+        # flow (routes/ramp.py's on-ramp/off-ramp handlers) --
+        # AIRTEL_API_USERNAME/AIRTEL_API_PASSWORD/AIRTEL_API_BASE_URL --
+        # not the separate LIPAD_* vars this used to read. LIPAD/Daraja
+        # credentials were never actually provisioned; the real Mam-laka
+        # gateway account in production is configured under the AIRTEL_*
+        # names, so this class silently could never succeed before, and
+        # the corridor engine's merchant-balance check (the one caller of
+        # this class, see Brain_Engine/state_engine.py) always got nothing.
+        #
+        # Also deliberately does NOT raise when a credential is missing.
+        # This class is instantiated as a module-level singleton at import
+        # time (Brain_Engine/state_engine.py's `daraja_service = DarajaService()`),
+        # so raising here used to crash the entire backend at startup --
+        # every unrelated route (retail wallets, KYC, admin dashboards) --
+        # over one missing Mobile Money credential. Instead, a missing
+        # credential is caught in get_access_token() below, at the point an
+        # actual Mam-laka call is attempted, the same way every other
+        # failure in this class already surfaces (a clean {"status": "error"}
+        # instead of a crash).
+        self.username = os.getenv("AIRTEL_API_USERNAME", "")
+        self.password = os.getenv("AIRTEL_API_PASSWORD", "")
 
         # 🟢 Clean trailing slashes to prevent 404 URL errors
-        raw_url = os.getenv("LIPAD_BASE_URL", "https://payments.mam-laka.com")
+        raw_url = os.getenv("AIRTEL_API_BASE_URL", "https://sandbox.payments.mamlakapsp.com/api/v1")
         self.base_url = raw_url.rstrip('/')
-        
-        self.airtel_wallet = "073174090"  
-        
+
+        self.airtel_wallet = "073174090"
+
     def get_access_token(self):
         """
-        🟢 FIXED: Authenticates using the correct GET /api/v1 endpoint with Basic Auth 
+        🟢 FIXED: Authenticates using the correct GET /api/v1 endpoint with Basic Auth
         as outlined in your Postman Testing Guide!
         """
+        if not self.username or not self.password:
+            print("❌ Mam-laka Auth Error: AIRTEL_API_USERNAME / AIRTEL_API_PASSWORD is not configured")
+            return None
+
         auth_url = f"{self.base_url}/api/v1"
-        
+
         try:
             # Basic Auth is passed natively in the requests library
             response = requests.get(auth_url, auth=(self.username, self.password), timeout=15)
