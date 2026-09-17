@@ -41,14 +41,18 @@ class DarajaService:
 
     def get_access_token(self):
         """
-        🟢 FIXED: Authenticates using the correct GET /api/v1 endpoint with Basic Auth
-        as outlined in your Postman Testing Guide!
+        Authenticates against the gateway root — same call the proven-working
+        retail STK flow makes (routes/ramp.py: `client.get(f"{gateway_url}/", ...)`).
+        AIRTEL_API_BASE_URL already includes the /api/v1 prefix (see __init__),
+        so every path built in this class appends only its sub-path from here
+        (e.g. "/mobile/initiate"), matching ramp.py's convention exactly
+        instead of doubling up a second "/api/v1".
         """
         if not self.username or not self.password:
             print("❌ Mam-laka Auth Error: AIRTEL_API_USERNAME / AIRTEL_API_PASSWORD is not configured")
             return None
 
-        auth_url = f"{self.base_url}/api/v1"
+        auth_url = f"{self.base_url}/"
 
         try:
             # Basic Auth is passed natively in the requests library
@@ -81,7 +85,7 @@ class DarajaService:
 
         actual_provider = provider if provider else self.get_provider_from_phone(phone_number)
 
-        airtime_url = f"{self.base_url}/api/v1/mobile/airtime"
+        airtime_url = f"{self.base_url}/mobile/airtime"
         headers = {
             "Authorization": f"Bearer {token}", 
             "Content-Type": "application/json"
@@ -122,7 +126,7 @@ class DarajaService:
             return {"status": "error", "message": "Authentication failed"}
 
         actual_provider = provider if provider else self.get_provider_from_phone(phone_number)
-        initiate_url = f"{self.base_url}/api/v1/mobile/initiate"
+        initiate_url = f"{self.base_url}/mobile/initiate"
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         payload = {
             "impalaMerchantId": self.username,
@@ -157,7 +161,7 @@ class DarajaService:
             return {"status": "error", "message": "Authentication failed"}
 
         actual_provider = provider if provider else self.get_provider_from_phone(phone_number)
-        payout_url = f"{self.base_url}/api/v1/mobile/transfer"
+        payout_url = f"{self.base_url}/mobile/transfer"
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         payload = {
             "impalaMerchantId": self.username,
@@ -191,7 +195,7 @@ class DarajaService:
         if not token:
             return {"status": "error", "message": "Authentication failed"}
 
-        balance_url = f"{self.base_url}/api/v1/wallet/balances"
+        balance_url = f"{self.base_url}/wallet/balances"
 
         headers = {
             "Authorization": f"Bearer {token}",
@@ -218,7 +222,7 @@ class DarajaService:
         if not token:
             return {"status": "error", "message": "Authentication failed"}
 
-        sweep_url = f"{self.base_url}/api/v1/merchant/wallet-transfer"
+        sweep_url = f"{self.base_url}/merchant/wallet-transfer"
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
         payload = {
