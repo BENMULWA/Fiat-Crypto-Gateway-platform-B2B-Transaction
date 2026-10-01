@@ -160,6 +160,8 @@ async def submit_onboarding(db=Depends(get_db), current_user: dict = Depends(get
     missing = [f for f in ("directors", "shareholders", "documents") if not profile.get(f)]
     if not profile.get("legalName") and not profile.get("businessName"):
         missing.append("legalName")
+    if profile.get("documents") and not any(isinstance(d, dict) and d.get("file") and d.get("name") for d in profile["documents"]):
+        missing.append("documents (each needs a name and an uploaded file)")
     if missing:
         raise HTTPException(status_code=400, detail=f"Cannot submit onboarding -- missing: {', '.join(missing)}")
 

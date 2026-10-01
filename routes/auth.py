@@ -581,6 +581,27 @@ async def signup_request_otp(data: dict, db=Depends(get_db)):
     if account_type == "institutional" and not business_name:
         raise HTTPException(status_code=400, detail="business_name is required for institutional signup")
 
+    # Institutional business details collected at signup (stored on the profile at verify
+    # time, so the later KYB form starts pre-filled instead of asking again).
+    business_profile = None
+    if account_type == "institutional":
+        raw = data.get("profile") or {}
+        business_profile = {
+            "countryOfIncorporation": str(raw.get("country") or "").strip(),
+            "contactPhone": str(raw.get("phone") or "").strip(),
+            "companyType": str(raw.get("businessType") or "").strip(),
+            "incorporationNumber": str(raw.get("incorporationNumber") or "").strip(),
+            "expectedMonthlyVolume": str(raw.get("monthlyVolume") or "").strip(),
+            "heardAbout": [str(x).strip() for x in (raw.get("heardAbout") or []) if str(x).strip()][:6],
+            "referralCode": str(raw.get("referralCode") or "").strip() or None,
+        }
+        missing = [k for k in ("countryOfIncorporation", "contactPhone", "companyType", "incorporationNumber", "expectedMonthlyVolume")
+                   if not business_profile[k]]
+        if missing:
+            raise HTTPException(status_code=400, detail=f"Missing business details: {', '.join(missing)}")
+        if not raw.get("consent"):
+            raise HTTPException(status_code=400, detail="You must accept the Terms of Use and Privacy Policy to continue")
+
     existing = await db.users.find_one({"email": email})
     if existing:
         raise HTTPException(status_code=409, detail="User already exists")
@@ -596,6 +617,7 @@ async def signup_request_otp(data: dict, db=Depends(get_db)):
             "passwordHash": hash_password(password),
             "accountType": account_type,
             "businessName": business_name or None,
+            "businessProfile": business_profile,
         },
     )
 
@@ -647,6 +669,10 @@ async def signup_verify_otp(data: dict, request: Request, db=Depends(get_db)):
             await db["institutional_profiles"].insert_one({
                 "userId": str(res.inserted_id),
                 "businessName": payload.get("businessName"),
+                "legalName": payload.get("businessName"),
+                "contactName": payload.get("displayName"),
+                **{k: v for k, v in (payload.get("businessProfile") or {}).items() if v not in (None, "", [])},
+                "consentAcceptedAt": datetime.utcnow(),
                 "onboardingStatus": "not_started",
                 "directors": [],
                 "shareholders": [],
