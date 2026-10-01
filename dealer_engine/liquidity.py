@@ -73,7 +73,9 @@ class SmartRouter:
             "required": required,
             "allocations": allocations,
             "totalAllocated": round(total, 8),
-            "sufficient": total >= required,
-            "shortfall": round(max(required - total, 0), 8),
+            # Tolerance: allocations are rounded to 8dp but `required` is not, so an
+            # exact fill (e.g. 10 x 129.71 = 1297.1000000000001) must not read as short.
+            "sufficient": total + 1e-6 >= required,
+            "shortfall": round(max(required - total, 0), 8) if total + 1e-6 < required else 0.0,
             "blendedRate": round(sum(item["amount"] * item["rate"] for item in allocations) / total, 8) if total else 0,
         }

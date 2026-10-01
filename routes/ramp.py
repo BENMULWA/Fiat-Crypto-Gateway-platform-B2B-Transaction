@@ -1587,6 +1587,39 @@ async def mamlaka_stk_callback(payload: dict, db=Depends(get_db)):
     return {"status": "acknowledged"}
 
     """   
+def _resolve_tx_explorer(e: dict) -> tuple[str | None, str | None, str | None]:
+    """Return (tx_hash, network, explorer_url) for a ramp_entries doc.
+
+    Field naming here is inconsistent across the codebase — "cardanoTxHash"
+    has been used both for genuine Cardano hashes (routes/cardano.py) and,
+    by mistake, for Celo hashes (routes/valora.py's withdraw endpoint). Newer
+    writers set an explicit "network"; for older docs without one, we infer
+    from whichever hash field is populated and the channel, which is the
+    best signal available for entries written before this field existed.
+    """
+    tx_hash = e.get("txHash") or e.get("celoTxHash") or e.get("cardanoTxHash")
+    if not tx_hash:
+        return None, None, None
+
+    network = e.get("network")
+    if not network:
+        channel = str(e.get("channel") or "").lower()
+        if e.get("celoTxHash") or "minipay" in channel:
+            network = "celo"
+        elif "stellar" in channel:
+            network = "stellar"
+        elif e.get("cardanoTxHash"):
+            network = "cardano"
+
+    explorer_url = {
+        "celo": f"https://celoscan.io/tx/{tx_hash}",
+        "cardano": f"https://cardanoscan.io/transaction/{tx_hash}",
+        "stellar": f"https://stellar.expert/explorer/public/tx/{tx_hash}",
+    }.get(network)
+
+    return tx_hash, network, explorer_url
+
+
 @router.get("/history")
 async def get_ramp_history(db=Depends(get_db), current_user=Depends(get_current_user)):
     user_ids = build_user_id_candidates(current_user["_id"])
@@ -1627,8 +1660,8 @@ async def get_ramp_history(db=Depends(get_db), current_user=Depends(get_current_
             ,"cardanoPolicyId": e.get("cardanoPolicyId")
             ,"cardanoAssetName": e.get("cardanoAssetName")
             ,"receiptHash": e.get("receiptHash")
-            ,"explorerUrl": f"https://cardanoscan.io/transaction/{e['cardanoTxHash']}" if e.get("cardanoTxHash") else None
         })
+        formatted_entries[-1]["txHash"], formatted_entries[-1]["network"], formatted_entries[-1]["explorerUrl"] = _resolve_tx_explorer(e)
     return {"status": "success", "entries": formatted_entries}
 
 
@@ -2076,7 +2109,7 @@ async def correct_completed_withdrawals(
 
     cursor = db["ramp_entries"].find({
         "direction": "off",
-        "status": {"$in": ["completed", "credited"]},
+        "$expr": {"$in": [{"$toLower": "$status"}, ["completed", "credited"]]},
         "$or": [
             {"providerReference": {"$in": refs}},
             {"_id": {"$in": refs}},

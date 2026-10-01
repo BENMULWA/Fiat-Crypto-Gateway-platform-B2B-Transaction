@@ -86,11 +86,17 @@ def test_awaiting_opportunity_advances_to_next_cycle_when_one_opens(monkeypatch)
 
 
 def test_find_best_open_opportunity_picks_the_only_live_corridor_today():
-    """Only airtel_5x is actually eligible right now — telkom_5x's nodes
-    (N1 Telkom, N4 T-Kash) are both live=False in node_registry.py, so
-    corridor_eligible("telkom_5x") is False regardless of its better
-    on-paper yield. This pins that real-world state rather than assuming
-    both corridors compete."""
+    """airtel_5x is the only corridor actually eligible right now — its
+    N2/N5 nodes are live. telkom_5x's nodes (N1 Telkom, N4 T-Kash) are both
+    live=False in node_registry.py, so corridor_eligible("telkom_5x") is
+    False regardless of its better on-paper yield. This pins that
+    real-world state rather than assuming both corridors compete.
+
+    2026-09-29: airtel_comet was merged into airtel_5x (both had identical
+    economics, differing only in mint_provider/exit_provider — now
+    airtel_5x itself mints via Comet/IMC, not the Cardano USDA vault) — see
+    node_registry.CORRIDORS's comment. There's only one real Airtel
+    corridor now, not two competing on an artificial tie."""
     assert set(CORRIDORS) == {"airtel_5x", "telkom_5x"}  # pin the assumption this test relies on
 
     winner = state_engine_module.find_best_open_opportunity()

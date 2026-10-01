@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from Brain_Engine.cache import memory_cache
 
 from Brain_Engine.Discovery_Engine import IMMDiscoveryEngine
-from Brain_Engine.node_registry import corridor_eligible
+from Brain_Engine.node_registry import corridor_eligible, CORRIDORS
 from Brain_Engine.risk_engine import is_rate_stale, rate_age_seconds, RATE_STALE_AFTER_SECONDS
 from services.comet_client import CometClient
 from routes.auth import get_current_user_with_role, is_admin_role
@@ -178,11 +178,24 @@ async def get_dynamic_opportunities():
     engine = IMMDiscoveryEngine()
     baseline = engine.baseline_rate_kes_usd
     
-    # 1. Calculate Live Yield Projections
+    # 1. Calculate Live Yield Projections — discount/fx_edge read from
+    # node_registry.CORRIDORS (the single source of truth the real FSM
+    # itself uses), not a second hardcoded copy that can drift from it —
+    # exactly what happened here once already (this used to say 0.06;
+    # the real reseller rate, confirmed 2026-09-25 against
+    # reseller.impalapay.com, is 0.05).
     telkom_math = engine.project_corridor_yield(discount_rate=0.10, fx_edge_pct=0.05, cycles=5)
-    airtel_math = engine.project_corridor_yield(discount_rate=0.06, fx_edge_pct=0.00, cycles=5)
-    
-    # 2. Build the exact Schema the React UI expects
+    airtel_math = engine.project_corridor_yield(
+        discount_rate=CORRIDORS["airtel_5x"]["discount"], fx_edge_pct=CORRIDORS["airtel_5x"]["fx_edge"], cycles=5
+    )
+
+    # 2. Build the exact Schema the React UI expects.
+    # mintAsset / exitLabel: what MarketMakerPage.tsx's corridor header shows
+    # instead of a hardcoded "USDA"/"CELO" string — every entry sets both.
+    # mintProvider / exitProvider (present only on non-default corridors):
+    # forwarded by the frontend to POST /api/treasury/corridor/start, which
+    # node_registry.CORRIDORS then uses as the real FSM's mint_provider/
+    # exit_provider — the frontend passes these along, it doesn't invent them.
     opportunities = {
         "telkom_5x": {
             "id": "telkom_5x",
@@ -199,6 +212,8 @@ async def get_dynamic_opportunities():
             "engineTopRight": f"{baseline * 0.95:.2f}",
             "baseline": f"{baseline:.2f}",
             "currency": "USD",
+            "mintAsset": "USDA",
+            "exitLabel": "CELO",
             "nodes": [
                 { "id": "N1", "name": "Telkom 10% disc.", "tag": "PROCURE", "color": "blue", "type": "procure" },
                 { "id": "N4", "name": "T-Kash Super-Agent", "tag": "LIQUIDATE", "color": "orange", "type": "liquidate" },
@@ -209,11 +224,11 @@ async def get_dynamic_opportunities():
         },
         "airtel_5x": {
             "id": "airtel_5x",
-            "title": "Airtel → USDA → ×5 Rollover → Celo Exit",
-            "pathDesc": "PATH: N2-N7-N9 \u00A0\u00A0RSK 2% \u00A0\u00A0LIQ 98",
+            "title": "Airtel → IMC (Comet) → ×5 Rollover → Comet Exit",
+            "pathDesc": "PATH: N2-IMC-COMET   RSK 2%   LIQ 98   VAULT: comet",
             "profitPct": f"+{airtel_math['projected_profit_pct']}%",
-            "discount": "6%",
-            "discountNum": 0.06,
+            "discount": f"{CORRIDORS['airtel_5x']['discount']*100:.0f}%",
+            "discountNum": CORRIDORS["airtel_5x"]["discount"],
             "fxEdge": "0%",
             "pip": "+$0.00",
             "rolloverRate": f"{baseline:.2f}",
@@ -222,18 +237,23 @@ async def get_dynamic_opportunities():
             "engineTopRight": f"{baseline:.2f}",
             "baseline": f"{baseline:.2f}",
             "currency": "KES",
+            "mintAsset": "IMC",
+            "exitLabel": "COMET",
+            "mintProvider": "comet",
+            "exitProvider": "comet",
             "nodes": [
-                { "id": "N2", "name": "Airtel 6% disc.", "tag": "PROCURE", "color": "red", "type": "procure" },
-                { "id": "N7", "name": "Internal Realization", "tag": "MINT USDA", "color": "blue", "type": "mint" },
+                { "id": "N2", "name": "Airtel 5% disc.", "tag": "PROCURE", "color": "red", "type": "procure" },
+                { "id": "IMC", "name": "Comet IMM Swap", "tag": "MINT IMC", "color": "emerald", "type": "mint" },
                 { "id": "↻", "name": "Cycle 4/5 internal", "tag": "ROLLOVER", "color": "purple", "type": "rollover" },
-                { "id": "N9", "name": "Cycle 5 only", "tag": "CELO EXIT", "color": "slate", "type": "exit" }
+                { "id": "COMET", "name": "Cycle 5 only", "tag": "COMET AMM EXIT", "color": "slate", "type": "exit" }
             ]
         }
     }
-    
+
     # Hide corridors the admin has switched off (per-corridor or via one of
     # its nodes) so the dealer's "Deploy" dropdown can't offer them at all —
-    # the hard enforcement lives in treasury.py's /corridor/execute-hft.
+    # the hard enforcement lives in POST /api/treasury/corridor/start
+    # (workers/corridor_worker.start_corridor_run's own corridor_eligible check).
     opportunities = {k: v for k, v in opportunities.items() if corridor_eligible(k)}
 
     return {"status": "success", "opportunities": opportunities}

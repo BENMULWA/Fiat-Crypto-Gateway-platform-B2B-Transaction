@@ -16,7 +16,14 @@ exactly, just per-merchant instead of platform-wide:
   lock_funds        -- RFQ accepted, funds committed but not yet spent
   release_locked    -- settlement failed/cancelled, funds freed back up
   spend_locked      -- settlement reconciled, funds actually gone
+
+`credit_available`/`spend_locked` also append to `institutional_ledger_entries`
+-- the one shared ledger backing the portal's Collections ("in"), Payouts
+("out"), and Transactions History (both) pages, instead of three divergent
+backend concepts. `lock_funds`/`release_locked` don't write an entry: neither
+actually moves money in/out, only reserves/unreserves it.
 """
+import uuid
 from datetime import datetime
 
 from fastapi import HTTPException
@@ -24,6 +31,24 @@ from fastapi import HTTPException
 
 def _asset_key(asset: str) -> str:
     return str(asset or "").upper()
+
+
+async def _write_ledger_entry(
+    db, user_id: str, *, direction: str, asset: str, amount: float,
+    source: str, related_rfq_id: str | None = None, related_settlement_id: str | None = None,
+) -> None:
+    await db["institutional_ledger_entries"].insert_one({
+        "id": f"LEDGER-{uuid.uuid4().hex[:10].upper()}",
+        "merchantId": str(user_id),
+        "direction": direction,
+        "asset": _asset_key(asset),
+        "amount": float(amount),
+        "source": source,
+        "relatedRfqId": related_rfq_id,
+        "relatedSettlementId": related_settlement_id,
+        "status": "completed",
+        "createdAt": datetime.utcnow(),
+    })
 
 
 async def get_institutional_wallet(db, user_id: str) -> dict:
@@ -41,7 +66,10 @@ async def get_balance(db, user_id: str, asset: str) -> dict:
     }
 
 
-async def credit_available(db, user_id: str, asset: str, amount: float) -> None:
+async def credit_available(
+    db, user_id: str, asset: str, amount: float,
+    *, source: str = "credit", related_rfq_id: str | None = None, related_settlement_id: str | None = None,
+) -> None:
     """
     Credits a confirmed deposit onto `available`. v1 deposit confirmation is
     manual (treasury confirms an incoming bank/crypto transfer the same way
@@ -51,15 +79,19 @@ async def credit_available(db, user_id: str, asset: str, amount: float) -> None:
     amount = float(amount or 0)
     if amount <= 0:
         raise HTTPException(status_code=400, detail="Credit amount must be positive")
-    asset = _asset_key(asset)
+    asset_key = _asset_key(asset)
     await db["institutional_wallets"].update_one(
         {"_id": user_id},
         {
-            "$inc": {f"{asset}.available": amount},
+            "$inc": {f"{asset_key}.available": amount},
             "$set": {"updatedAt": datetime.utcnow()},
             "$setOnInsert": {"_id": user_id},
         },
         upsert=True,
+    )
+    await _write_ledger_entry(
+        db, user_id, direction="in", asset=asset_key, amount=amount,
+        source=source, related_rfq_id=related_rfq_id, related_settlement_id=related_settlement_id,
     )
 
 
@@ -93,13 +125,40 @@ async def release_locked(db, user_id: str, asset: str, amount: float) -> None:
     )
 
 
-async def spend_locked(db, user_id: str, asset: str, amount: float) -> None:
+async def log_settlement_ledger_entry(
+    db, user_id: str, *, direction: str, asset: str, amount: float,
+    source: str, related_rfq_id: str | None = None, related_settlement_id: str | None = None,
+) -> None:
+    """
+    Records a ledger entry for a per-trade, quote-then-fund settlement leg
+    WITHOUT touching institutional_wallets.available/locked -- unlike
+    credit_available/spend_locked, this money was never held as a standing
+    balance (it was sent to fund one specific accepted quote and used
+    immediately), so there is no available/locked figure to move. Used by
+    the settlement action state machine's confirm_customer_funds (direction
+    "in") and reconciled (direction "out") transitions for merchant
+    self-service RFQs -- see routes/otc_admin.py::act_on_dealer_settlement.
+    """
+    await _write_ledger_entry(
+        db, user_id, direction=direction, asset=asset, amount=amount,
+        source=source, related_rfq_id=related_rfq_id, related_settlement_id=related_settlement_id,
+    )
+
+
+async def spend_locked(
+    db, user_id: str, asset: str, amount: float,
+    *, related_rfq_id: str | None = None, related_settlement_id: str | None = None,
+) -> None:
     """Settlement reconciled -- locked funds are actually gone, for real."""
     amount = float(amount or 0)
     if amount <= 0:
         return
-    asset = _asset_key(asset)
+    asset_key = _asset_key(asset)
     await db["institutional_wallets"].update_one(
         {"_id": user_id},
-        {"$inc": {f"{asset}.locked": -amount}, "$set": {"updatedAt": datetime.utcnow()}},
+        {"$inc": {f"{asset_key}.locked": -amount}, "$set": {"updatedAt": datetime.utcnow()}},
+    )
+    await _write_ledger_entry(
+        db, user_id, direction="out", asset=asset_key, amount=amount,
+        source="settlement_spend", related_rfq_id=related_rfq_id, related_settlement_id=related_settlement_id,
     )

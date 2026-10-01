@@ -64,6 +64,12 @@ async def start_corridor_run(db, corridor_id: str, amount_usd: float, started_by
             "fx_edge": corridor["fx_edge"],
             "node_procure": corridor["node_procure"],
             "node_liquidate": corridor["node_liquidate"],
+            # Corridor-defined provider variant (node_registry.CORRIDORS) —
+            # a corridor with neither key omits them entirely, so
+            # HFTCorridorFSM's own "cardano"/"native" defaults apply,
+            # exactly as every pre-existing corridor already behaves.
+            **({"mint_provider": corridor["mint_provider"]} if "mint_provider" in corridor else {}),
+            **({"exit_provider": corridor["exit_provider"]} if "exit_provider" in corridor else {}),
         },
         "status": FSMState.IDLE.value,
         "currentCycle": 1,
@@ -73,6 +79,9 @@ async def start_corridor_run(db, corridor_id: str, amount_usd: float, started_by
         "finalUsd": None,
         "profit": None,
         "haltReason": None,
+        "exitPathChosen": None,
+        "cyclePnl": 0.0,
+        "cumulativePnl": 0.0,
         "startedBy": started_by,
         "createdAt": now,
         "updatedAt": now,
@@ -115,13 +124,33 @@ async def resume_pending_corridor_runs(db) -> int:
     return resumed
 
 
-def _build_fsm(ledger: ImmutableLedger, run_doc: dict[str, Any]) -> HFTCorridorFSM:
+def _build_fsm(db, ledger: ImmutableLedger, run_doc: dict[str, Any]) -> HFTCorridorFSM:
     config = dict(run_doc["config"])
     config["run_id"] = run_doc["_id"]
+    # Real Motor database handle — mint_provider="comet" needs it to price
+    # the IMC->USDT leg off the same treasury rate book retail swaps use
+    # (routes.swap_engine.calculate_backend_rate), instead of Comet's IMM
+    # (whose custodial wallet turned out not to recognize a plain on-chain
+    # deposit — see state_engine._execute_mint_comet's docstring).
+    config["db"] = db
     config["resume_cycle"] = run_doc["currentCycle"]
     config["resume_principal_usd"] = run_doc["currentUsdPrincipal"]
     config["resume_kes_float"] = run_doc.get("currentKesFloat", 0.0)
     config["resume_state"] = run_doc["status"]
+    config["resume_cumulative_pnl_usd"] = run_doc.get("cumulativePnl", 0.0)
+    config["resume_exit_path_chosen"] = run_doc.get("exitPathChosen")
+    # AWAITING_MANUAL_MINT state (see state_engine._execute_mint_comet):
+    # restores what a real on-chain balance poll is waiting to observe, so
+    # a restart mid-wait resumes watching for the same mint rather than
+    # losing track of it.
+    config["resume_pending_mint_expected_imc"] = run_doc.get("pendingMintExpectedImc")
+    config["resume_pending_mint_external_id"] = run_doc.get("pendingMintExternalId")
+    config["resume_pending_mint_treasury_imc_before"] = run_doc.get("pendingMintTreasuryImcBefore")
+    # AWAITING_MANUAL_TOPUP state (see state_engine._execute_procure) — same
+    # resume-on-restart treatment as the manual-mint fields above.
+    config["resume_pending_topup_expected_kes"] = run_doc.get("pendingTopupExpectedKes")
+    config["resume_pending_topup_txn_id"] = run_doc.get("pendingTopupTxnId")
+    config["resume_pending_topup_payout_balance_before"] = run_doc.get("pendingTopupPayoutBalanceBefore")
     return HFTCorridorFSM(ledger, starting_capital_usd=run_doc["startingUsd"], config=config)
 
 
@@ -131,6 +160,15 @@ async def _persist_tick(db, run_id: str, bot: HFTCorridorFSM) -> None:
         "currentCycle": bot.current_cycle,
         "currentUsdPrincipal": bot.current_usd_principal,
         "currentKesFloat": bot.current_kes_float,
+        "exitPathChosen": bot.exit_path_chosen,
+        "cyclePnl": bot.last_cycle_pnl_usd,
+        "cumulativePnl": bot.cumulative_pnl_usd,
+        "pendingMintExpectedImc": bot.pending_mint_expected_imc,
+        "pendingMintExternalId": bot.pending_mint_external_id,
+        "pendingMintTreasuryImcBefore": bot.pending_mint_treasury_imc_before,
+        "pendingTopupExpectedKes": bot.pending_topup_expected_kes,
+        "pendingTopupTxnId": bot.pending_topup_txn_id,
+        "pendingTopupPayoutBalanceBefore": bot.pending_topup_payout_balance_before,
         "updatedAt": datetime.utcnow(),
     }
     if bot.state == FSMState.HALTED and bot.halt_reason:
@@ -160,7 +198,7 @@ async def _drive_run(db, run_id: str) -> None:
     ledger = ImmutableLedger(db_collection=db["transactions"])
 
     try:
-        bot = _build_fsm(ledger, run_doc)
+        bot = _build_fsm(db, ledger, run_doc)
     except Exception as e:
         logger.error("Corridor run %s failed to reconstruct: %s", run_id, e)
         await db[RUNS_COLLECTION].update_one(

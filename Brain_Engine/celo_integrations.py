@@ -66,32 +66,21 @@ class CorridorIntegrations:
         # The official Native USDC Smart Contract Address on Celo Mainnet
         self.usdc_address = "0xcebA9300f2b948710d2653dD7B07f33A8B32118C"
 
-    async def buy_telkom_airtime(self, usd_principal: float, discount_rate: float) -> float:
-        """STATE 1: Procure wholesale airtime (Simulated for Celo testing)"""
-        base_rate = 129.50
-        kes_value = (usd_principal * base_rate) / (1 - discount_rate)
-        
-        if not self.live_mode:
-            await asyncio.sleep(0.5)
-            return kes_value
-            
-        return kes_value
-
-    async def liquidate_to_fiat(self, airtime_kes_value: float) -> float:
-        """STATE 2: Liquidate airtime to float (Simulated for Celo testing)"""
-        if not self.live_mode:
-            await asyncio.sleep(0.5)
-            return airtime_kes_value
-        return airtime_kes_value
-
-    def _sync_celo_transfer(self, amount_usd: float) -> str:
+    def _sync_celo_transfer(self, amount_usd: float, token_address: str | None = None,
+                             to_address: str | None = None, decimals: int = 6) -> str:
         """
         Synchronous function that builds, signs, and sends the raw Ethereum/Celo transaction.
+        Generalized beyond USDC-only: token_address/to_address/decimals let
+        transfer_erc20() below reuse this exact signing/gas/broadcast logic
+        for any real ERC-20 (e.g. depositing minted IMC into a Comet-
+        managed wallet before a swap) instead of duplicating it.
         """
-        print(f"\n🌐 WEB3 ENGINE: Initiating on-chain settlement of {amount_usd} USDC...")
-        
-        if not self.treasury_private_key or not self.exit_address:
-            raise ValueError("Missing CELO_MNEMONIC or CELO_EXIT_ADDRESS in .env file.")
+        token_address = token_address or self.usdc_address
+        to_address = to_address or self.exit_address
+        print(f"\n🌐 WEB3 ENGINE: Initiating on-chain settlement of {amount_usd} tokens...")
+
+        if not self.treasury_private_key or not to_address:
+            raise ValueError("Missing CELO_MNEMONIC or a destination address.")
 
         if not self.w3.is_connected():
             raise ConnectionError("Failed to connect to the Celo Blockchain RPC.")
@@ -99,25 +88,27 @@ class CorridorIntegrations:
         # 1. Load the Hot Wallet Account
         account = self.w3.eth.account.from_key(self.treasury_private_key)
         print(f"   ↳ Treasury Wallet Loaded: {account.address}")
-        print(f"   ↳ Target Exit Vault: {self.exit_address}")
+        print(f"   ↳ Target: {to_address}")
 
-        # 2. Instantiate the USDC Smart Contract
-        usdc_contract = self.w3.eth.contract(
-            address=self.w3.to_checksum_address(self.usdc_address), 
+        # 2. Instantiate the ERC-20 contract
+        token_contract = self.w3.eth.contract(
+            address=self.w3.to_checksum_address(token_address),
             abi=ERC20_ABI
         )
 
-        # 3. Format the amount (USDC has 6 decimal places, not 18!)
-        amount_base_units = int(amount_usd * 1_000_000)
+        # 3. Format the amount at the token's real decimals (USDC/USDT/IMC
+        # are 6; caller passes a different `decimals` for an 18-decimal
+        # token like cUSD).
+        amount_base_units = int(amount_usd * (10 ** decimals))
 
         # 4. Get the latest Nonce (Transaction count) to prevent replay attacks
         nonce = self.w3.eth.get_transaction_count(account.address)
 
         print(f"   ↳ Building Smart Contract Payload...")
-        
+
         # 5. Estimate the contract gas instead of reserving an unnecessarily large fixed limit.
-        transfer_call = usdc_contract.functions.transfer(
-            self.w3.to_checksum_address(self.exit_address),
+        transfer_call = token_contract.functions.transfer(
+            self.w3.to_checksum_address(to_address),
             amount_base_units
         )
         transaction_base = {
@@ -161,6 +152,25 @@ class CorridorIntegrations:
         print(f"   ↳ ✅ ON-CHAIN SUCCESS! TxHash: {hex_hash}\n")
         
         return hex_hash
+
+    async def transfer_erc20(self, token_address: str, to_address: str, amount: float, decimals: int = 6) -> str:
+        """Real signed ERC-20 transfer from the treasury's self-custodied
+        wallet to any address, on any token. Added so _execute_mint_comet
+        can deposit freshly-minted IMC into the Comet-managed wallet
+        (from comet_client.get_or_create_wallet) before calling
+        execute_imm_swap — Comet's tokenize_airtime mints into the caller's
+        own treasury wallet, not into Comet's custodial wallet, so the
+        corridor must move the funds itself first. This is a real broadcast
+        transaction; callers must have real CELO for gas and treat failures
+        (e.g. insufficient gas) as a hard stop, not a retry-forever loop."""
+        try:
+            return await asyncio.to_thread(
+                self._sync_celo_transfer, amount, token_address, to_address, decimals
+            )
+        except Exception as e:
+            error_msg = str(e)
+            print(f"\n   ↳ ❌ CELO BLOCKCHAIN REJECTED TRANSACTION: {error_msg}\n")
+            raise Exception(f"Web3 Error: {error_msg}")
 
     async def execute_celo_dex_swap(self, usda_amount: float) -> str:
         """

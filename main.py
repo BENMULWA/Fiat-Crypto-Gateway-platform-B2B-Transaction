@@ -47,7 +47,7 @@ from routes import (
     auth, dashboard, market_maker, trade, ramp,
     airtime_ledger, general_ledger, rates, tokens,
     cardano, treasury, retail, otc_admin, otc_merchant, swap_engine, valora, stellar,
-    imm_control
+    imm_control, base_rate
 )
 from routes import realtime
 
@@ -85,6 +85,18 @@ async def lifespan(app: FastAPI):
                 kind, entity_id = kind_and_id
                 memory_cache.set(f"imm:{kind}:{entity_id}:enabled", bool(switch_doc.get("enabled", True)))
         print("✓ IMM node/corridor switches rehydrated from MongoDB")
+
+        # Rehydrate the last fixed KES/USD base rate (services/rate_feed.py)
+        # so a restart doesn't silently drop back to the cache's 129.80
+        # placeholder and start treating it as fresh — is_rate_stale() only
+        # protects against that if updated_at actually survives a restart.
+        from services import rate_feed
+        await rate_feed.rehydrate_from_db(db)
+        rate_status = rate_feed.get_rate_status()
+        if rate_status["updatedAt"]:
+            print(f"✓ Base rate rehydrated: {rate_status['rate']} KES/USD (fixed {rate_status['ageSeconds']:.0f}s ago)")
+        else:
+            print("⚠ No base rate has ever been fixed in this environment — POST /api/base-rate/fix before relying on it")
 
         # The autonomous DecisionEngine's kill switch lives only in
         # memory_cache — it does NOT persist across restarts. Without this,
@@ -161,10 +173,19 @@ async def lifespan(app: FastAPI):
 
         airtel_timeout_task = asyncio.create_task(expire_silent_airtel_entries())
 
-        # Comet's KES/IMC IMM rate — fixed 1:1 peg, matching Comet's own
-        # worked example (docs.mamlakapsp.com/examples/imm-market-maker.html).
-        # Refreshed well under Comet's 60-min staleness window so a normal
-        # gap between cycles never causes a false 502 on /spread/comet.
+        # Comet's KES/IMC IMM rate. IMC is pegged 1 IMC = 1 USD, NOT 1:1 to
+        # KES — this used to call set_imm_rate("KES", "IMC", 1.0), a literal
+        # 1:1 KES:IMC peg copied from Comet's own demo example and never
+        # corrected for IMC's real peg. That means every KES/IMC quote and
+        # swap Comet executed was priced ~129x wrong versus the intended
+        # USD peg. Now sources the rate from services/rate_feed.py (an
+        # admin explicitly fixes it — see routes/base_rate.py) instead of a
+        # hardcoded literal; skips the refresh entirely if nobody has fixed
+        # a fresh rate yet, rather than pushing a wrong one to Comet.
+        #
+        # Confirm Comet's base/quote division direction against a real
+        # get_imm_quote() call before trusting this in production — this
+        # assumes quote_per_base (1 KES = 1/rate USD-denominated IMC).
         async def refresh_comet_kes_imc_rate():
             if not CometClient:
                 return
@@ -172,9 +193,17 @@ async def lifespan(app: FastAPI):
             interval_seconds = max(300, int(os.getenv("COMET_RATE_REFRESH_SECONDS", "1800")))
             while True:
                 try:
-                    result = comet.set_imm_rate("KES", "IMC", 1.0)
+                    from services import rate_feed
+                    try:
+                        base_rate = rate_feed.get_base_rate()
+                    except rate_feed.BaseRateUnavailable as e:
+                        print(f"✗ Comet rate refresh skipped: {e}")
+                        await asyncio.sleep(interval_seconds)
+                        continue
+
+                    result = comet.set_imm_rate("KES", "IMC", 1.0 / base_rate)
                     if result["status"] == "success":
-                        print("✓ Comet KES/IMC rate refreshed (1:1 peg)")
+                        print(f"✓ Comet KES/IMC rate refreshed ({base_rate:.4f} KES/USD peg)")
                     else:
                         print(f"✗ Comet rate refresh rejected: {result['message']}")
                 except Exception as e:
@@ -257,6 +286,7 @@ app.include_router(auth.router)
 app.include_router(dashboard.router)
 app.include_router(market_maker.router)
 app.include_router(imm_control.router)
+app.include_router(base_rate.router)
 app.include_router(trade.router)
 app.include_router(ramp.router)
 app.include_router(ramp.callback_router)

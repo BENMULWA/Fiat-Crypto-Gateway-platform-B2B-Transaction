@@ -10,7 +10,6 @@ from copy import deepcopy
 from typing import Optional
 
 from database import get_db
-from Brain_Engine.corridor_1_airtime import AirtimeCeloCorridor
 from services.safaricom_daraja import DarajaService
 from routes.retail import SUPPORTED_ASSETS, safe_object_id
 from routes.cardano import get_master_wallet_balance
@@ -54,6 +53,23 @@ def _read_celo_usdc_balance_sync() -> float:
     return float(contract.functions.balanceOf(treasury_address).call()) / (10 ** 6)
 
 
+def _read_celo_imc_balance_sync() -> float:
+    """Real, live IMC balance of this backend's Celo treasury — same
+    pattern as _read_celo_usdc_balance_sync above. 6 decimals, confirmed
+    live against the real contract (see ASSET_CONTRACTS['IMC'] in
+    routes/valora.py)."""
+    treasury_address = get_treasury_address()
+    balance_abi = [{
+        "constant": True,
+        "inputs": [{"name": "account", "type": "address"}],
+        "name": "balanceOf",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "type": "function",
+    }]
+    contract = w3.eth.contract(address=ASSET_CONTRACTS["IMC"], abi=balance_abi)
+    return float(contract.functions.balanceOf(treasury_address).call()) / (10 ** 6)
+
+
 def _read_stellar_treasury_balance_sync() -> dict:
     """Real, live balance of the Stellar treasury account — shared by
     /positions and /dashboard so both surfaces read the exact same call
@@ -72,7 +88,7 @@ def _read_stellar_treasury_balance_sync() -> dict:
 
 RATE_BOOK_ID = "swap_rate_book"
 DEFAULT_USD_BASE_RATES = {
-    "USDA": 1.0, "USDC": 1.0, "USDT": 1.0, "USD": 1.0, "cUSD": 1.0, "IMP": 1.0,
+    "USDA": 1.0, "USDC": 1.0, "USDT": 1.0, "USD": 1.0, "cUSD": 1.0, "IMP": 1.0, "IMC": 1.0,
     "KES": 130.50, "UGX": 3750.00, "TZS": 2580.00, "RWF": 1320.00,
     "BIF": 2850.00, "XAF": 605.00, "XOF": 605.00,
     "BTC": 1 / 64000, "ETH": 1 / 3500,
@@ -112,7 +128,7 @@ async def withdraw_from_celo_master_wallet(
     ensure_admin(current_user)
 
     asset = payload.asset.strip()
-    if asset not in {"USDT", "USDC", "cUSD"}:
+    if asset not in {"USDT", "USDC", "cUSD","IMC"}:
         raise HTTPException(status_code=400, detail="Supported Celo assets are USDT, USDC, and cUSD.")
     if payload.amount <= 0:
         raise HTTPException(status_code=400, detail="Withdrawal amount must be greater than zero.")
@@ -369,92 +385,20 @@ async def get_treasury_rate_book_history(db=Depends(get_db), current_user=Depend
         item.pop("_id", None)
     return {"status": "success", "history": history}
 
-class CorridorRequest(BaseModel):
-    amount_kes: float
-
-@router.post("/corridor/airtime-celo")
-async def trigger_airtime_celo_corridor(
-    req: CorridorRequest,
-    db=Depends(get_db),
-    current_user=Depends(get_current_user_with_role),
-):
-    ensure_admin(current_user)
-    if req.amount_kes <= 0:
-        raise HTTPException(status_code=400, detail="Amount must be greater than zero.")
-
-    try:
-        corridor = AirtimeCeloCorridor(db_collection=db["transactions"])
-        result = await corridor.execute_from_kes(deployed_kes=req.amount_kes)
-        
-        return {
-            "status": "success",
-            "message": f"Airtel -> Celo Corridor executed. Yielded {result['yield_percent']}%",
-            "data": result
-        }
-        
-    except Exception as e:
-        traceback.print_exc() 
-        print(f"Corridor Execution Error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-class HFTExecuteRequest(BaseModel):
-    amount: float
-    corridor_id: str
-
-@router.post("/corridor/execute-hft")
-async def execute_dynamic_hft_corridor(
-    req: HFTExecuteRequest,
-    db=Depends(get_db),
-    current_user=Depends(get_current_user_with_role),
-):
-    ensure_admin(current_user)
-    if req.amount <= 0:
-        raise HTTPException(status_code=400, detail="Amount must be greater than zero.")
-
-    try:
-        from Brain_Engine.state_engine import ImmutableLedger, HFTCorridorFSM, FSMState
-        from Brain_Engine.node_registry import CORRIDORS, corridor_eligible
-        ledger = ImmutableLedger(db_collection=db["transactions"])
-
-        if req.corridor_id not in CORRIDORS:
-            raise HTTPException(status_code=400, detail="Unknown corridor ID")
-        if not corridor_eligible(req.corridor_id):
-            raise HTTPException(
-                status_code=403,
-                detail=f"Corridor {req.corridor_id!r} is disabled or one of its nodes is switched off — "
-                       "re-enable it via /api/imm before deploying.",
-            )
-
-        corridor = CORRIDORS[req.corridor_id]
-        config = {
-            "cycles": 5,
-            "discount": corridor["discount"],
-            "fx_edge": corridor["fx_edge"],
-            "node_procure": corridor["node_procure"],
-            "node_liquidate": corridor["node_liquidate"],
-        }
-
-        bot = HFTCorridorFSM(ledger=ledger, starting_capital_usd=req.amount, config=config)
-        await bot.boot_system()
-        
-        while bot.state != FSMState.COMPLETED and bot.state != FSMState.HALTED:
-            await bot.tick()
-            
-        if bot.state == FSMState.HALTED:
-            raise Exception("Corridor halted due to internal error or low liquidity.")
-            
-        return {
-            "status": "success",
-            "message": f"{config['cycles']}x Rollover Complete via {config['node_procure']}! Exited to Celo.",
-            "data": {
-                "starting_usd": req.amount,
-                "final_usd": bot.current_usd_principal,
-                "profit": bot.current_usd_principal - req.amount
-            }
-        }
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+# NOTE: two endpoints used to live here —
+#   POST /corridor/airtime-celo  (Brain_Engine.corridor_1_airtime.AirtimeCeloCorridor)
+#   POST /corridor/execute-hft   (blocking HFTCorridorFSM runner)
+# Both are removed. /corridor/airtime-celo executed real airtime procurement
+# and a real Celo settlement with none of HFTCorridorFSM's risk checks
+# (no daily-limit check, no vault-backed mint capacity check, no min-balance
+# floor check, no corridor_eligible()/node-liveness check, and a fresh
+# random uuid per call instead of a deterministic idempotent txn id) — a
+# second, unguarded path to the same real-money actions the FSM guards
+# carefully. /corridor/execute-hft was the original synchronous runner for
+# HFTCorridorFSM; POST /corridor/start (workers/corridor_worker.py) replaced
+# it precisely because ROLLOVER can now hold in AWAITING_OPPORTUNITY for
+# minutes to a day, which the old endpoint would have blocked an HTTP
+# request open for the whole time. Use POST /corridor/start instead.
 
 
 class SimulateCorridorRequest(BaseModel):
@@ -462,6 +406,7 @@ class SimulateCorridorRequest(BaseModel):
     currency: str = "KES"  # "KES" or "USD" — matches the opportunity's own currency field on the frontend
     mocked_node_ids: Optional[list[str]] = None  # e.g. ["N1","N2","N4","N5"] to light up an otherwise-offline corridor for the demo
     hold_cycles: Optional[list[int]] = None  # which cycle(s) should visibly hold in AWAITING_OPPORTUNITY; defaults to [2]
+    corridor_id: Optional[str] = None  # which node_registry.CORRIDORS entry to simulate (picks its mint/exit provider); None = today's airtel_5x-shaped default
 
 
 @router.post("/corridor/simulate-5x")
@@ -489,6 +434,7 @@ async def simulate_dynamic_hft_corridor(
             principal_usd=principal_usd,
             mocked_node_ids=req.mocked_node_ids,
             hold_cycles=req.hold_cycles,
+            corridor_id=req.corridor_id,
         )
         return result
     except Exception as e:
@@ -638,6 +584,11 @@ async def get_treasury_dashboard(db=Depends(get_db)):
         except Exception:
             traceback.print_exc()
 
+        try:
+            vaults["CELO_IMC"] = await asyncio.wait_for(asyncio.to_thread(_read_celo_imc_balance_sync), timeout=20)
+        except Exception:
+            traceback.print_exc()
+
         return {
             "status": "success",
             "vaults": vaults,
@@ -663,15 +614,18 @@ async def get_celo_master_wallet_balance(current_user=Depends(get_current_user_w
             "type": "function",
         }]
         balances = {}
+     
         for asset, contract_address in ASSET_CONTRACTS.items():
             contract = w3.eth.contract(address=contract_address, abi=balance_abi)
-            decimals = 6 if asset in {"USDC", "USDT"} else 18
+            decimals = 18 if asset == "cUSD" else 6
             balances[asset] = round(
                 contract.functions.balanceOf(treasury_address).call() / (10 ** decimals),
                 decimals,
             )
 
         celo_wei = w3.eth.get_balance(treasury_address)
+        
+        # the respoonse for the balance upon sucessfull fetch from the chain
         return {
             "status": "success",
             "network": "celo",

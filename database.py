@@ -45,3 +45,7 @@ def get_settlement_logs_col():
 
 def get_imm_switches_col():
     return get_db()["imm_switches"]
+
+
+def get_base_rates_col():
+    return get_db()["base_rates"]

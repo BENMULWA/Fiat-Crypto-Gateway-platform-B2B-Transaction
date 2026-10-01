@@ -1,6 +1,8 @@
 import os
 import uuid
 import asyncio
+import smtplib
+from email.message import EmailMessage
 from datetime import datetime, timedelta
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Depends
@@ -16,6 +18,7 @@ from fiat_payout_audit import log_fiat_payout_audit_event
 from notifications import notify_user
 from two_factor import verify_withdrawal_2fa
 from wallet_utils import debit_wallet, credit_wallet
+from config import settings
 from dotenv import load_dotenv
 
 # 🟢 NEW: Safely convert String IDs to MongoDB ObjectIds
@@ -65,7 +68,15 @@ w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
 ASSET_CONTRACTS = {
     "cUSD": w3.to_checksum_address("0x765DE816845861e75A25fCA122bb6898B8B1282a"),
     "USDC": w3.to_checksum_address("0xcebA9300f2b948710d2653dD7B07f33A8B32118C"),
-    "USDT": w3.to_checksum_address("0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e")
+    "USDT": w3.to_checksum_address("0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e"),
+    # Impala Coin (IMC) — real, deployed Celo mainnet contract. Confirmed
+    # 2026-09-25 via a live balanceOf/symbol/decimals read: name "Impala
+    # Coin", symbol "IMC", 6 decimals (matches Comet's tokenize_airtime
+    # amountBase convention exactly). totalSupply was 0 at confirmation
+    # time — nothing has been minted on this contract yet, so a balance
+    # read against it will legitimately return 0 until the first real
+    # tokenize_airtime call succeeds.
+    "IMC": w3.to_checksum_address("0x766AA4F469A295330b10D150f842d71977D56dD6"),
 }
 
 # "USD" isn't its own on-chain token — there's no US banking rail behind this
@@ -87,6 +98,38 @@ MAX_WITHDRAWAL_PER_TX = float(os.getenv("CELO_MAX_WITHDRAWAL_PER_TX", "500"))
 MAX_WITHDRAWAL_PER_DAY = float(os.getenv("CELO_MAX_WITHDRAWAL_PER_DAY", "2000"))
 
 # --- 2. HELPER FUNCTIONS ---
+def _send_admin_treasury_alert(subject: str, body: str) -> None:
+    if not getattr(settings, "smtp_host", ""):
+        return
+
+    recipients_raw = getattr(settings, "admin_alert_emails", "") or ""
+    recipients = [email.strip().lower() for email in recipients_raw.split(",") if email.strip()]
+    if not recipients:
+        return
+
+    sender = getattr(settings, "smtp_from_email", "") or getattr(settings, "smtp_user", "")
+    if not sender:
+        return
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = sender
+    msg["To"] = ", ".join(recipients)
+    msg.set_content(body)
+
+    try:
+        server = smtplib.SMTP(getattr(settings, "smtp_host", ""), int(getattr(settings, "smtp_port", 587) or 587), timeout=20)
+        if bool(getattr(settings, "smtp_use_tls", True)):
+            server.starttls()
+        smtp_user = getattr(settings, "smtp_user", "")
+        if smtp_user:
+            server.login(smtp_user, getattr(settings, "smtp_password", ""))
+        server.send_message(msg)
+        server.quit()
+    except Exception as e:
+        print(f"⚠️ Failed to send treasury alert email: {e}")
+
+
 def get_treasury_address():
     pk = os.getenv("CELO_TREASURY_PK")
     if pk:
@@ -338,7 +381,24 @@ async def withdraw_from_valora(req: WithdrawReq, db=Depends(get_db), current_use
                 return True  # Continue anyway if we can't check
         
         await asyncio.to_thread(check_gas_balance)
-        
+
+        # 🟢 CHECK TREASURY TOKEN BALANCE BEFORE ATTEMPTING TRANSFER — the gas
+        # check above only guards CELO for fees; it says nothing about whether
+        # the treasury actually holds enough of the asset being withdrawn.
+        # Without this, a withdrawal request the treasury can't cover still
+        # got broadcast, reverted on-chain, and used to be recorded as a
+        # completed withdrawal anyway (see the receipt-wait fix below).
+        def check_token_balance():
+            treasury_balance_base = contract.functions.balanceOf(account.address).call()
+            have = treasury_balance_base / (10 ** decimals)
+            print(f"💰 Treasury {onchain_asset} balance: {have:.6f} (need {req.amount:.6f})")
+            if treasury_balance_base < amount_base:
+                raise ValueError(
+                    f"Treasury insufficient {onchain_asset} balance. Have: {have:.6f} {onchain_asset}, Need: {req.amount:.6f} {onchain_asset}"
+                )
+
+        await asyncio.to_thread(check_token_balance)
+
         def execute_tx():
             nonce = w3.eth.get_transaction_count(account.address)
             tx = contract.functions.transfer(target_address, amount_base).build_transaction({
@@ -349,7 +409,18 @@ async def withdraw_from_valora(req: WithdrawReq, db=Depends(get_db), current_use
             })
             signed_tx = w3.eth.account.sign_transaction(tx, account.key)
             raw_tx = getattr(signed_tx, 'raw_transaction', getattr(signed_tx, 'rawTransaction', None))
-            return w3.to_hex(w3.eth.send_raw_transaction(raw_tx))
+            sent_hash = w3.to_hex(w3.eth.send_raw_transaction(raw_tx))
+            # A successful broadcast only means the network accepted the tx
+            # into the mempool — it says nothing about whether it actually
+            # executed. Wait for the receipt and check status before telling
+            # anyone this withdrawal completed; otherwise a revert (e.g. the
+            # balance-exceeded case this endpoint hit in production) still
+            # gets recorded as status: COMPLETED with a real tx hash attached,
+            # even though zero tokens moved.
+            receipt = w3.eth.wait_for_transaction_receipt(sent_hash, timeout=60)
+            if receipt.get("status") != 1:
+                raise RuntimeError(f"Transaction reverted on-chain: {sent_hash}")
+            return sent_hash
 
         tx_hex = await asyncio.to_thread(execute_tx)
 
@@ -363,16 +434,37 @@ async def withdraw_from_valora(req: WithdrawReq, db=Depends(get_db), current_use
             error=str(e),
         )
 
+        # Customer-facing copy must never include the raw exception text —
+        # it leaks internal treasury/liquidity details ("Treasury insufficient
+        # USDT balance. Have: 2.68...") to the user. The full detail still
+        # goes to celo_audit_log above and the admin alert emails below;
+        # this is deliberately generic regardless of the underlying cause.
         await notify_user(
             db, user_id, "withdrawal", "error",
             "Withdrawal failed",
-            f"Your withdrawal of {req.amount:g} {req.asset} failed and was refunded. {e}",
+            f"Your withdrawal of {req.amount:g} {req.asset} failed and was refunded. Please try again shortly, or contact support if this continues.",
             extra={"asset": req.asset, "amount": req.amount},
         )
 
         # Provide more helpful error messages
         error_str = str(e)
-        if "insufficient" in error_str.lower() and "celo" in error_str.lower():
+        if "Treasury insufficient" in error_str and "balance" in error_str:
+            _send_admin_treasury_alert(
+                f"[URGENT] Treasury balance too low to process a withdrawal",
+                f"User {user_id} tried to withdraw {req.amount} {req.asset} to {req.identifier}.\n\n"
+                f"{error_str}\n\n"
+                f"The withdrawal was blocked and the user's balance was refunded automatically. "
+                f"Please top up the treasury wallet ({get_treasury_address()}) so future withdrawals go through.",
+            )
+            raise HTTPException(status_code=503, detail="System is temporarily unable to process withdrawals: treasury balance is low. Support has been notified — please try again shortly.")
+        elif "reverted on-chain" in error_str:
+            _send_admin_treasury_alert(
+                f"[URGENT] Withdrawal reverted on-chain after broadcast",
+                f"User {user_id}'s withdrawal of {req.amount} {req.asset} to {req.identifier} was broadcast but "
+                f"reverted on-chain.\n\n{error_str}\n\nThe user's balance was refunded automatically. Please investigate the treasury wallet.",
+            )
+            raise HTTPException(status_code=502, detail="Withdrawal failed to confirm on-chain and was refunded. Please try again or contact support.")
+        elif "insufficient" in error_str.lower() and "celo" in error_str.lower():
             raise HTTPException(status_code=503, detail="System is temporarily unable to process withdrawals. Treasury CELO balance is low. Please try again later.")
         elif "insufficient funds for gas" in error_str:
             raise HTTPException(status_code=503, detail="System is temporarily unable to process withdrawals. Insufficient transaction fees. Please try again later.")
@@ -385,8 +477,12 @@ async def withdraw_from_valora(req: WithdrawReq, db=Depends(get_db), current_use
         "_id": f"TRADE_{uuid.uuid4().hex[:8].upper()}",
         "direction": "off", "channel": "Opera MiniPay", "fromAsset": req.asset, "toAsset": req.asset,
         "fromAmount": req.amount, "toAmount": req.amount, "rate": 1.0, "fee": 0.0,
-        "counterparty": req.identifier, "status": "COMPLETED", 
+        "counterparty": req.identifier, "status": "COMPLETED",
         "cardanoTxHash": tx_hex, "cardanoAddress": target_address,
+        # Canonical fields for the tx-hash/explorer-link UI — "cardanoTxHash"
+        # above is a legacy misnomer (this is always a Celo tx) kept only so
+        # older readers of this collection don't break.
+        "txHash": tx_hex, "network": "celo",
         "userId": user_id, "createdAt": now, "date": now.strftime("%b %d, %Y"), "timeAgo": "Just now"
     })
 

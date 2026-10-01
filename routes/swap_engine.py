@@ -26,7 +26,7 @@ router = APIRouter(prefix="/api/swap", tags=["Real-Time Swap Engine"])
 # 1. ASSET CONFIGURATION (Matches Frontend)
 # ==========================================
 ASSET_CONFIG = {
-    "USDA": {"type": "crypto"}, "USDC": {"type": "crypto"}, "USDT": {"type": "crypto"}, "cUSD": {"type": "crypto"}, "USD": {"type": "fiat"},
+    "USDA": {"type": "crypto"}, "USDC": {"type": "crypto"}, "USDT": {"type": "crypto"}, "cUSD": {"type": "crypto"}, "IMC": {"type": "crypto"}, "USD": {"type": "fiat"},
     "KES": {"type": "fiat"}, "UGX": {"type": "fiat"}, "TZS": {"type": "fiat"}, "RWF": {"type": "fiat"}, "BIF": {"type": "fiat"},
     "XAF": {"type": "fiat"}, "XOF": {"type": "fiat"},
     "AIRT": {"type": "telco"}, "IMP": {"type": "internal"}
@@ -45,9 +45,15 @@ w3_celo = Web3(Web3.HTTPProvider(CELO_RPC, request_kwargs={'timeout': 15}))
 w3_celo.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
 
 CELO_ASSET_CONTRACTS = {
-    "cUSD": w3_celo.to_checksum_address("0x765DE816845861e75A25fCA122bb6898B8B1282a"), 
-    "USDC": w3_celo.to_checksum_address("0xcebA9300f2b948710d2653dD7B07f33A8B32118C"), 
-    "USDT": w3_celo.to_checksum_address("0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e")  
+    "cUSD": w3_celo.to_checksum_address("0x765DE816845861e75A25fCA122bb6898B8B1282a"),
+    "USDC": w3_celo.to_checksum_address("0xcebA9300f2b948710d2653dD7B07f33A8B32118C"),
+    "USDT": w3_celo.to_checksum_address("0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e"),
+    # Same real Impala Coin contract as routes/valora.py's ASSET_CONTRACTS —
+    # duplicated here rather than imported to avoid a cross-module import
+    # this late; keep both in sync if this address ever changes. 6
+    # decimals (confirmed live), which settle_crypto_on_celo's existing
+    # "18 if cUSD else 6" already handles correctly with no further change.
+    "IMC": w3_celo.to_checksum_address("0x766AA4F469A295330b10D150f842d71977D56dD6"),
 }
 
 CELO_ERC20_ABI = [

@@ -93,6 +93,20 @@ class Settings(BaseSettings):
     def zigram_project_id(self) -> Optional[int]:
         return int(self.zigram_project_id_raw) if self.zigram_project_id_raw.strip() else None
 
+    # DEMO ONLY: skips ZIGRAM on the OTC/RFQ flow (see OTC_DEMO_SKIP_ZIGRAM in .env).
+    otc_demo_skip_zigram_raw: str = os.getenv("OTC_DEMO_SKIP_ZIGRAM", "")
+
+    @property
+    def otc_demo_skip_zigram(self) -> bool:
+        return self.otc_demo_skip_zigram_raw.strip().lower() in {"1", "true", "yes", "on"}
+
+    # DEMO ONLY: lets one admin both approve and submit a settlement (OTC_DEMO_ALLOW_SELF_SUBMIT in .env).
+    otc_demo_allow_self_submit_raw: str = os.getenv("OTC_DEMO_ALLOW_SELF_SUBMIT", "")
+
+    @property
+    def otc_demo_allow_self_submit(self) -> bool:
+        return self.otc_demo_allow_self_submit_raw.strip().lower() in {"1", "true", "yes", "on"}
+
     # Comma-separated Monitoring_Status values ZIGRAM has confirmed mean "clear
     # to proceed". Their docs only ever show "Flag" as an example and never
     # publish the full enum, so this stays empty on purpose: nothing

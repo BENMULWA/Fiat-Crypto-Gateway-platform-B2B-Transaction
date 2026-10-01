@@ -29,21 +29,35 @@ class FakeResponse:
         return self._payload
 
 
+_IMPALA_STATE = {"balance": 1000.0}
+
+
 def _fake_impala_send_ok(monkeypatch):
     """Fakes PROCURE's ImpalaPay call so _execute_liquidate is reachable
-    without depending on the real sandbox's airtime float."""
-    monkeypatch.setenv("AIRTIME_API_KEY", "test-key")
-    monkeypatch.setenv("AIRTIME_API_SECRET", "test-secret")
+    without depending on the real sandbox's airtime float. Real ImpalaPay
+    Reseller API (airtime-api.impalapay.com): PROCURE now tops up via a
+    real STK push (topup_via_stk) and polls the real payout balance
+    (get_payout_balance) for the confirmed delta — both only need a
+    cached session token, not a full login() round trip."""
+    _IMPALA_STATE["balance"] = 1000.0
     from services.impala_airtime import ImpalaAirtimeClient
-    monkeypatch.setattr(state_engine_module, "impala_airtime", ImpalaAirtimeClient())
+    client = ImpalaAirtimeClient()
+    client._session_token = "test-session-token"
+    monkeypatch.setattr(state_engine_module, "impala_airtime", client)
     monkeypatch.setitem(state_engine_module.PROCUREMENT_WALLETS, "N2", "0733253036")
 
 
-def _impala_response(url):
-    if url.endswith("/api/auth/token"):
-        return FakeResponse(200, {"success": True, "data": {"access_token": "token-123"}})
-    if url.endswith("/send"):
-        return FakeResponse(200, {"success": True, "data": {"status": "success", "requestRef": "REQ-1"}})
+def _impala_post_response(url, payload):
+    if url.endswith("/api/app/topup"):
+        amount = payload.get("amount", 0) if payload else 0
+        _IMPALA_STATE["balance"] += amount * 1.06  # matches this file's 6% test fixture discount
+        return FakeResponse(200, {"status": "success"})
+    return None
+
+
+def _impala_get_response(url):
+    if url.endswith("/api/app/details"):
+        return FakeResponse(200, {"accountBalance": _IMPALA_STATE["balance"]})
     return None
 
 
@@ -52,18 +66,24 @@ def _build_fsm():
     return ledger, HFTCorridorFSM(
         ledger,
         starting_capital_usd=100 / 129.50,
-        config={"node_procure": "N2", "node_liquidate": "N5", "discount": 0.06, "baseline_rate": 129.50, "run_id": "LIQ-TEST"},
+        config={
+            "node_procure": "N2", "node_liquidate": "N5", "discount": 0.06, "baseline_rate": 129.50, "run_id": "LIQ-TEST",
+            "stk_poll_interval_seconds": 0.01, "stk_poll_attempts": 3,
+        },
     )
 
 
 def _fake_daraja_auth_and_balance(monkeypatch, kes_balance):
     def fake_post(url, **kwargs):
-        impala_resp = _impala_response(url)
+        impala_resp = _impala_post_response(url, kwargs.get("json"))
         if impala_resp is not None:
             return impala_resp
         raise AssertionError(f"LIQUIDATE should never POST anything (no STK push): {url}")
 
     def fake_get(url, **kwargs):
+        impala_resp = _impala_get_response(url)
+        if impala_resp is not None:
+            return impala_resp
         if url.endswith("/api/v1"):
             return FakeResponse(200, {"token": "jwt-123"})
         if url.endswith("/api/v1/wallet/balances"):

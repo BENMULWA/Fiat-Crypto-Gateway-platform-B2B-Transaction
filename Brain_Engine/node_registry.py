@@ -110,9 +110,20 @@ LIQUIDATION_PROVIDERS = {
 # autonomous DecisionEngine (Brain_Engine/bot.py) and the dealer's manual
 # "Deploy" button read from, so a switch flipped here actually gates both.
 CORRIDORS = {
+    # Mints via Comet (IMC), not the Cardano USDA vault — changed
+    # 2026-09-29 at the operator's request ("we are minting IMC, not
+    # USDA"). This used to be two separate corridors (airtel_5x on
+    # Cardano/native-Celo, airtel_comet on Comet/IMC) with identical
+    # economics; they're merged here into the one real corridor actually
+    # in use, rather than keeping a redundant duplicate around. Real 5%
+    # reseller discount confirmed 2026-09-25 against the Impala/Jasiri
+    # reseller dashboard (reseller.impalapay.com) — verify there again
+    # before changing this, it's the source of truth, not a number to
+    # guess or round from a whitepaper.
     "airtel_5x": {
-        "name": "AIRTEL LIVE", "node_procure": "N2", "node_liquidate": "N5",
-        "discount": 0.06, "fx_edge": 0.0,
+        "name": "AIRTEL -> COMET/IMC", "node_procure": "N2", "node_liquidate": "N5",
+        "discount": 0.05, "fx_edge": 0.0,
+        "mint_provider": "comet", "exit_provider": "comet",
     },
     "telkom_5x": {
         "name": "TELKOM", "node_procure": "N1", "node_liquidate": "N4",

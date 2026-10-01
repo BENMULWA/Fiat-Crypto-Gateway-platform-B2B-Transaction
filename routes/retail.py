@@ -77,14 +77,15 @@ def _send_admin_kyc_email(subject: str, body: str) -> None:
 from routes.auth import get_current_user
 from database import get_db
 from typing import Optional
+from celo_wallet import get_onchain_celo_snapshot
 import uuid
 
 router = APIRouter(prefix="/api/retail", tags=["Retail User"])
 
 # ALL SUPPORTED ASSETS IN THE PLATFORM
 SUPPORTED_ASSETS = [
-    "KES", "USDA", "USDT", "USDC", "cUSD", "USD", 
-    "UGX", "TZS", "RWF", "BIF", "XAF", "XOF", 
+    "KES", "USDA", "USDT", "USDC", "cUSD", "IMC", "USD",
+    "UGX", "TZS", "RWF", "BIF", "XAF", "XOF",
     "AIRT", "IMP", "BTC", "ETH"
 ]
 
@@ -236,7 +237,19 @@ async def get_retail_wallet_balances(db=Depends(get_db), current_user=Depends(ge
                 continue
         balances[asset] = total
 
-    return {"status": "success", "balances": balances}
+    # Live on-chain snapshot at this user's own derived Celo address, shown
+    # alongside the internal ledger for comparison — the ledger balance isn't
+    # backed by an on-chain event per se, so this is what actually proves a
+    # given amount is real. Best-effort: an RPC hiccup here must never break
+    # the whole wallet page, so a failure just omits "onchain" from the
+    # response rather than raising.
+    onchain = None
+    try:
+        onchain = await get_onchain_celo_snapshot(db, current_user.get("_id"))
+    except Exception as e:
+        print(f"⚠️ Could not load on-chain snapshot for wallet page: {e}")
+
+    return {"status": "success", "balances": balances, "onchain": onchain}
 
 
 @router.get("/notifications")

@@ -24,7 +24,7 @@ async def build_quote(rate_book: dict, amount: float, from_asset: str, to_asset:
 
 # basis points = 1/ 100th of 1% = 0.001. For example, 100 basis points = 1% and 50 basis points = 0.5%. The spread in basis points is used to adjust the execution rate for the trade, either increasing it for BUY trades or decreasing it for SELL trades. This allows for a more accurate representation of the cost of executing the trade based on market conditions and the specified spread.
     direction = 1 + spread / 10000 if side == "BUY" else 1 - spread / 10000
-    execution_rate = base["market_rate"] * direction
+    execution_rate = round(base["market_rate"] * direction, 8)  # avoids float noise like 128.93174000000002
     receive_amount = round(amount * execution_rate, 4)
     return {
         "market_rate": base["market_rate"],

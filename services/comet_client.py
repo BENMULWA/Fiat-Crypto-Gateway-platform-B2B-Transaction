@@ -113,8 +113,111 @@ class CometClient:
     def get_amm_quote(self, from_symbol: str, to_symbol: str, amount_in: str) -> dict:
         return self._get("/api/v1/swap/quote", {"from": from_symbol, "to": to_symbol, "amountIn": amount_in})
 
+    def execute_amm_swap(self, external_user_id: str, from_symbol: str, to_symbol: str, amount_in: str,
+                          tenant_slug: str | None = None) -> dict:
+        """POST /api/v1/swap/tokens — the real Celo AMM execute endpoint
+        (docs.mamlakapsp.com/api/amm.html), NOT /api/v1/imm/swap. Used for
+        the corridor's IMC/USDT/USDC legs: Comet lists USDT/USDC, USDT/IMC,
+        USDC/IMC as real supported pools. amount_in is a base-unit string
+        (see tokenize_airtime's docstring on units) — the caller converts.
+
+        externalUserId, NOT the numeric userId the tokenization.html/
+        amm.html doc examples show — confirmed 2026-09-25 against the real
+        API: GET /api/v1/assets/{symbol}/balance flatly rejects a numeric
+        userId ("externalUserId is required") and only resolves once a
+        real wallet exists for that externalUserId string (POST
+        /api/v1/wallets/create). The doc examples' numeric literals appear
+        to be wrong/inconsistent with live behavior — trust this, not them."""
+        payload = {"externalUserId": external_user_id, "from": from_symbol, "to": to_symbol, "amountIn": amount_in}
+        if tenant_slug:
+            payload["tenantSlug"] = tenant_slug
+        return self._post("/api/v1/swap/tokens", payload)
+
     def list_amm_pools(self) -> dict:
         return self._get("/api/v1/swap/pools")
+
+    # --- Tokenization (airtime-backed IMC) ------------------------------
+    # docs.mamlakapsp.com/api/tokenization.html. Distinct from the IMM
+    # swap/rate endpoints above (those serve the admin-priced OTC spread
+    # board — Spread Engine tab); this is the airtime-backed proof-of-
+    # reserve mint the corridor's MINT step actually needs: the invariant
+    # Comet enforces is "on-chain IMC supply = real airtime float
+    # remaining." Comet does NOT verify reserve availability itself — the
+    # docs are explicit: "The caller (typically app-core-backend) must
+    # verify the ImpalaPay float balance before calling this endpoint."
+    # That check is Brain_Engine.risk_engine.check_airtime_backing, called
+    # before every call here, not something this client can skip past.
+
+    IMC_DECIMALS = 6
+
+    @staticmethod
+    def to_base_units(amount: float, decimals: int = IMC_DECIMALS) -> str:
+        return str(int(round(amount * (10 ** decimals))))
+
+    @staticmethod
+    def from_base_units(amount_base: str, decimals: int = IMC_DECIMALS) -> float:
+        return float(amount_base) / (10 ** decimals)
+
+    def tokenize_airtime(self, external_user_id: str, amount_base: str, external_id: str, chain: str = "celo") -> dict:
+        """POST /api/v1/tokenize/airtime. amount_base is a base-unit STRING
+        with 6 decimals (docs example: "10000000" == 10 IMC) — always
+        convert with to_base_units(), never pass a raw float amount.
+
+        externalUserId, not numeric userId — see execute_amm_swap's
+        docstring for the confirmed real evidence this is based on. NOT
+        yet directly confirmed against this specific endpoint (only the
+        balance/wallets endpoints were tested live) — a small real
+        tokenize_airtime call is worth confirming before relying on this
+        for a production-size mint."""
+        return self._post("/api/v1/tokenize/airtime", {
+            "externalUserId": external_user_id, "amountBase": amount_base, "externalId": external_id, "chain": chain,
+        })
+
+    def burn_imc(self, external_user_id: str, amount_base: int, external_id: str) -> dict:
+        """POST /api/v1/assets/imc/burn-by-holder — redemption path (e.g.
+        an eventual real airtime delivery against held IMC), not used by
+        the corridor's exit leg today (that uses execute_amm_swap instead,
+        since the corridor exits to USDC, not to a physical redemption)."""
+        return self._post("/api/v1/assets/imc/burn-by-holder", {
+            "externalUserId": external_user_id, "amountBase": amount_base, "externalId": external_id,
+        })
+
+    def get_tokenize_status(self, tokenize_id: str) -> dict:
+        return self._get(f"/api/v1/tokenize/status/{tokenize_id}")
+
+    def get_or_create_wallet(self, external_user_id: str, chain: str = "celo") -> dict:
+        """POST /api/v1/wallets/create — docs.mamlakapsp.com/api/wallets.html.
+        Idempotent: returns the existing wallet if one already exists for
+        this (tenant, externalUserId, chain family) rather than creating a
+        duplicate. This is the real, Comet-CUSTODIED address that
+        execute_imm_swap/execute_amm_swap operate against — NOT the same
+        wallet tokenize_airtime mints into (that mints to whatever
+        self-custodied treasury address the caller controls). Confirmed
+        live 2026-09-28: a real mint's IMC sat in the treasury's own
+        wallet, and a swap attempt failed with "wallet ... holds 0.000000
+        IMC" against this Comet wallet — the two are genuinely different
+        addresses, and nothing moves between them automatically."""
+        return self._post("/api/v1/wallets/create", {"externalUserId": external_user_id})
+
+    def send_asset(self, symbol: str, external_user_id: str, to: str, amount_base: str) -> dict:
+        """POST /api/v1/assets/{symbol}/send — docs.mamlakapsp.com/api/
+        assets.html. Withdraws from a user's Comet-managed custodial wallet
+        to an arbitrary external address (EVM 0x... or Stellar G...). This
+        is the step _execute_comet_exit needs after swapping to USDC: the
+        AMM swap alone only settles inside Comet's own custody for this
+        user, it does not move funds to CELO_EXIT_ADDRESS (a separate,
+        self-custodied wallet) on its own.
+
+        Uses `externalUserId` (string), NOT the numeric `userId` tokenize/
+        AMM calls take — per docs.mamlakapsp.com/api/wallets.html, wallet
+        identity is string-based. Assumed here that str(COMET_USER_ID) is
+        the same identity Comet's wallet system already knows from the
+        tokenize/AMM calls made under that numeric id — unconfirmed by any
+        single doc page, but it's the only consistent reading across both
+        conventions Comet's docs actually show."""
+        return self._post(f"/api/v1/assets/{symbol.lower()}/send", {
+            "externalUserId": external_user_id, "to": to, "amountBase": amount_base,
+        })
 
     # --- Treasury / corridors (read-only) --------------------------------
 

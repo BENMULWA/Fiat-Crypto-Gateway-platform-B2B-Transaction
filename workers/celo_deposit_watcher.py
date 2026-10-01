@@ -268,29 +268,44 @@ async def _process_scan(db, w3: Web3):
 
         user_id = owner["userId"]
         wallet_index = owner["index"]
-        await db["retail_wallets"].update_one(
-            {"userId": user_id},
-            {"$inc": {match["asset"]: received_amount}},
-            upsert=True,
-        )
+        # Institutional/merchant accounts share the same derived-address scheme
+        # but hold their balances in institutional_wallets (read by the OTC
+        # portal), not retail_wallets. Any lookup failure falls back to the
+        # original retail behaviour.
+        is_institutional = False
+        try:
+            from bson import ObjectId
+            owner_user = await db["users"].find_one({"_id": ObjectId(str(user_id))}, {"role": 1})
+            is_institutional = str((owner_user or {}).get("role", "")).lower() in {"institutional", "merchant"}
+        except Exception:
+            logger.debug("Role lookup failed for %s; treating as retail", user_id)
 
         now = datetime.utcnow()
-        await db["ramp_entries"].insert_one({
-            "_id": f"TRADE_{uuid.uuid4().hex[:8].upper()}",
-            "direction": "on",
-            "channel": "Celo Auto-Detect",
-            "fromAsset": match["asset"],
-            "toAsset": match["asset"],
-            "fromAmount": received_amount,
-            "toAmount": received_amount,
-            "status": "completed",
-            "userId": user_id,
-            "celoTxHash": match["tx_hash"],
-            "depositAddress": match["to"],
-            "createdAt": now,
-            "date": now.strftime("%b %d, %Y"),
-            "timeAgo": "Just now",
-        })
+        if is_institutional:
+            from institutional_wallet_utils import credit_available
+            await credit_available(db, str(user_id), match["asset"], received_amount, source="crypto_deposit")
+        else:
+            await db["retail_wallets"].update_one(
+                {"userId": user_id},
+                {"$inc": {match["asset"]: received_amount}},
+                upsert=True,
+            )
+            await db["ramp_entries"].insert_one({
+                "_id": f"TRADE_{uuid.uuid4().hex[:8].upper()}",
+                "direction": "on",
+                "channel": "Celo Auto-Detect",
+                "fromAsset": match["asset"],
+                "toAsset": match["asset"],
+                "fromAmount": received_amount,
+                "toAmount": received_amount,
+                "status": "completed",
+                "userId": user_id,
+                "celoTxHash": match["tx_hash"],
+                "depositAddress": match["to"],
+                "createdAt": now,
+                "date": now.strftime("%b %d, %Y"),
+                "timeAgo": "Just now",
+            })
 
         try:
             await broadcast_manager.send_user(str(user_id), {
@@ -308,7 +323,8 @@ async def _process_scan(db, w3: Web3):
             db, user_id, "deposit", "success",
             "Deposit received",
             f"{received_amount:g} {match['asset']} arrived on Celo and was credited to your account.",
-            extra={"asset": match["asset"], "amount": received_amount, "txHash": match["tx_hash"]},
+            extra={"asset": match["asset"], "amount": received_amount, "txHash": match["tx_hash"],
+                   **({"route": "/otc/wallet"} if is_institutional else {})},
         )
 
         try:

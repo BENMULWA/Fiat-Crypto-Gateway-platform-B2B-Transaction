@@ -120,6 +120,26 @@ async def _fake_celo_swap(usda_amount):
     return "0x" + "ab" * 32
 
 
+def _make_fake_impala_provider(discount=0.06):
+    """Same shared-state shape as Brain_Engine/simulate.py's fake — PROCURE
+    now tops up via a real STK push (services.impala_airtime.topup_via_stk)
+    and polls the real payout balance for the confirmed delta, so tests
+    need both fakes wired together, not just a send_airtime stand-in."""
+    state = {"balance": 10_000_000.0}
+
+    def fake_get_payout_balance():
+        return {"artm_balance": state["balance"], "currency": "KES", "raw": {}}
+
+    def fake_topup_via_stk(amount_kes, paying_phone_number):
+        state["balance"] += amount_kes * (1 + discount)
+        return {"status": "success"}
+
+    return fake_get_payout_balance, fake_topup_via_stk
+
+
+_fake_get_payout_balance, _fake_topup_via_stk = _make_fake_impala_provider()
+
+
 def _fresh_run_doc(run_id="RUN-TEST-1", status="IDLE", cycle=1, principal=100 / 129.50, cycles=5, find_opportunity_fn=None):
     return {
         "_id": run_id,
@@ -133,6 +153,11 @@ def _fresh_run_doc(run_id="RUN-TEST-1", status="IDLE", cycle=1, principal=100 / 
             "send_airtime_fn": _fake_send_airtime,
             "get_merchant_balance_fn": _fake_get_merchant_balance,
             "get_vault_balance_fn": _fake_get_vault_balance,
+            "get_payout_balance_fn": _fake_get_payout_balance,
+            "topup_via_stk_fn": _fake_topup_via_stk,
+            "stk_paying_phone": "0700000000",
+            "stk_poll_interval_seconds": 0.01,
+            "stk_poll_attempts": 3,
             "celo_swap_fn": _fake_celo_swap,
             "find_opportunity_fn": find_opportunity_fn or (lambda: {
                 "id": "airtel_5x", "node_procure": "N2", "node_liquidate": "N5", "discount": 0.06, "fx_edge": 0.0,
@@ -193,22 +218,25 @@ def test_drive_run_persists_every_intermediate_tick_not_just_the_final_one():
 
 
 def test_drive_run_halts_cleanly_and_records_halt_reason():
-    def no_opportunity():
-        return None  # AWAITING_OPPORTUNITY will hold forever with nothing eligible — force a halt another way instead
-
-    def rejecting_send_airtime(phone, amount_kes, reference):
-        raise RuntimeError("simulated provider rejection")
+    # A rejected/unconfirmed STK top-up no longer halts the run outright —
+    # it pauses into AWAITING_MANUAL_TOPUP and waits for a real balance
+    # increase (see state_engine._execute_procure). To exercise a genuine,
+    # unrecoverable halt here, use a payout-balance read failure instead:
+    # PROCURE refuses to top up blind if it can't even read the starting
+    # balance, regardless of any real PROCUREMENT_WALLET_N2 env value.
+    def failing_get_payout_balance():
+        raise RuntimeError("simulated payout balance outage")
 
     db = FakeDB()
     run_doc = _fresh_run_doc(run_id="RUN-TEST-HALT")
-    run_doc["config"]["send_airtime_fn"] = rejecting_send_airtime
+    run_doc["config"]["get_payout_balance_fn"] = failing_get_payout_balance
     db[corridor_worker.RUNS_COLLECTION].docs[run_doc["_id"]] = run_doc
 
     asyncio.run(corridor_worker._drive_run(db, run_doc["_id"]))
 
     final = db[corridor_worker.RUNS_COLLECTION].docs[run_doc["_id"]]
     assert final["status"] == FSMState.HALTED.value
-    assert "simulated provider rejection" in final["haltReason"]
+    assert "simulated payout balance outage" in final["haltReason"]
 
 
 def test_resume_pending_corridor_runs_relaunches_non_terminal_and_skips_terminal():

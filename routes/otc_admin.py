@@ -7,7 +7,7 @@ from typing import Optional, Dict, Any
 import uuid
 import os
 import httpx
-from routes.ramp import _extract_status_and_success, _has_reconcile_evidence, _apply_wallet_delta_once, build_user_id_candidates, resolve_momo_provider_and_validate
+from routes.ramp import _extract_status_and_success, _has_reconcile_evidence, _apply_wallet_delta_once, build_user_id_candidates, resolve_momo_provider_and_validate, _resolve_tx_explorer
 from routes.treasury import DEFAULT_USD_BASE_RATES
 from services.zigram_client import ZigramClient, ZigramError, is_clear_status, resolve_screening_leg
 from broadcast import broadcast_manager
@@ -59,6 +59,13 @@ async def _screen_dealer_rfq(db, *, rfq: dict, quote: dict, current_user: dict, 
         "created_at": datetime.utcnow(),
         "screened_by": current_user.get("_id"),
     }
+
+    # DEMO ONLY (OTC_DEMO_SKIP_ZIGRAM=true): real screening below is untouched;
+    # this just short-circuits it and leaves an audit record saying so.
+    if settings.otc_demo_skip_zigram:
+        check_doc.update({"outcome": "demo_skipped"})
+        await db["compliance_checks"].insert_one(check_doc)
+        return True
 
     try:
         result = zigram.submit_transaction(
@@ -832,6 +839,32 @@ async def quote_dealer_rfq(rfq_id: str, payload: dict | None = None, db=Depends(
     from routes.treasury import get_or_create_rate_book
     rate_book = await get_or_create_rate_book(db)
     platform_default_spread = max(float(rate_book.get("spread_bps", 0) or 0), 0.0)
+    # Pricing reference: "live" overlays the real market rate (services/fx_feed.py)
+    # onto the rate book for this quote; "rate_book" uses the desk's fixed rates.
+    # Live never silently falls back -- if the feed is down the dealer must pick
+    # the rate book explicitly.
+    price_source = str(payload.get("price_source") or "rate_book").lower()
+    market_info: dict = {"priceSource": "rate_book"}
+    pair = [str(rfq.get("fromAsset", "")), str(rfq.get("toAsset", ""))]
+    if price_source in {"auto", "live", "cbk"}:
+        from services.fx_feed import apply_live_rates, apply_cbk_rates, LiveRateUnavailable
+        try:
+            if price_source == "auto":
+                # Default policy: CBK for pairs involving KES, Live market for everything else.
+                # If CBK can't price the pair, fall back to Live and say so on the quote.
+                if "KES" in {a.upper() for a in pair}:
+                    try:
+                        rate_book, market_info = await apply_cbk_rates(db, rate_book, pair)
+                    except LiveRateUnavailable as cbk_exc:
+                        rate_book, market_info = await apply_live_rates(db, rate_book, pair)
+                        market_info["autoNote"] = f"CBK unavailable for this pair ({cbk_exc}); priced from Live market"
+                else:
+                    rate_book, market_info = await apply_live_rates(db, rate_book, pair)
+            else:
+                apply = apply_cbk_rates if price_source == "cbk" else apply_live_rates
+                rate_book, market_info = await apply(db, rate_book, pair)
+        except LiveRateUnavailable as exc:
+            raise HTTPException(status_code=503, detail=f"{exc}. Switch the pricing source to Rate book to quote anyway.")
     # Dealer-adjustable spread: the frontend (client.ts::quoteDealerRfq) already
     # sends spread_bps, but this endpoint previously ignored it and always used
     # the platform default -- the dealer's entered spread had no effect. Honor
@@ -859,6 +892,11 @@ async def quote_dealer_rfq(rfq_id: str, payload: dict | None = None, db=Depends(
         "spread_bps": spread_bps,
         "expected_pnl": quote_result.get("expected_pnl"),
         "sent": send_quote,
+        # Real dealer attribution -- who on the desk actually priced this,
+        # surfaced on the merchant's Active Quotes panel instead of a
+        # fabricated "your dealer" persona.
+        "quotedBy": current_user.get("displayName") or current_user.get("email"),
+        **market_info,
     }
     if send_quote:
         quote["sentAt"] = datetime.utcnow()
@@ -869,6 +907,19 @@ async def quote_dealer_rfq(rfq_id: str, payload: dict | None = None, db=Depends(
     rfq["status"] = "quoted"
     rfq["updatedAt"] = datetime.utcnow()
     await db["dealer_rfqs"].update_one({"id": rfq_id}, {"$set": {"quote": quote, "status": "quoted", "updatedAt": rfq["updatedAt"]}})
+
+    if send_quote and rfq.get("customerId"):
+        try:
+            await notify_user(
+                db, rfq["customerId"], "settlement", "info",
+                "New quote ready",
+                f"A firm quote is ready for {rfq_id}: {rfq.get('amount'):,.2f} {rfq.get('fromAsset')} -> "
+                f"{float(quote.get('receive_amount') or 0):,.2f} {rfq.get('toAsset')} at {quote.get('execution_rate')}. Expires in 60s.",
+                extra={"rfqId": rfq_id, "event": "quote_ready", "route": f"/otc/rfqs/{rfq_id}"},
+            )
+        except Exception:
+            pass  # notification is best-effort, must never block quoting
+
     return {"status": "success", "rfq": _serialize_dealer_rfq(rfq)}
 
 
@@ -882,10 +933,12 @@ async def _accept_dealer_rfq_core(db, rfq_id: str, current_user: dict, *, extra_
     same path rather than two copies that can drift apart.
 
     `extra_on_success`, if given, is an async callable `(db, rfq, execution)`
-    run right after a successful acceptance -- used by the merchant route to
-    additionally lock the merchant's own wallet funds
-    (institutional_wallet_utils.lock_funds), which the admin path has no
-    reason to know about.
+    run right after a successful acceptance. Currently unused by either
+    caller -- accepting a quote is purely an agreement (rate + amount), never
+    a funds movement; the merchant's obligation to actually pay is only
+    created once execute_dealer_rfq issues settlement-specific payment
+    instructions, kept as an extension point in case a future caller needs
+    to react to acceptance itself.
     """
     rfq = await _fetch_dealer_rfq(db, rfq_id)
     if not rfq:
@@ -969,7 +1022,7 @@ async def _accept_dealer_rfq_core(db, rfq_id: str, current_user: dict, *, extra_
                 db, customer_id, "settlement", "info",
                 "Trade accepted",
                 f"Your quote for RFQ {rfq_id} has been accepted at rate {quote.get('execution_rate')}. Settlement will follow treasury review.",
-                extra={"rfqId": rfq_id},
+                extra={"rfqId": rfq_id, "route": f"/otc/rfqs/{rfq_id}"},
             )
         except Exception:
             pass  # best-effort -- must never block acceptance
@@ -985,7 +1038,8 @@ async def _accept_dealer_rfq_core(db, rfq_id: str, current_user: dict, *, extra_
         "createdAt": accepted_at,
     })
 
-    return {"status": "success", "rfq": _serialize_dealer_rfq(rfq), "execution": execution}
+    # insert_one adds a non-JSON-serializable _id to `execution`; strip it like the rfq.
+    return {"status": "success", "rfq": _serialize_dealer_rfq(rfq), "execution": _serialize_dealer_rfq(execution)}
 
 
 @router.post("/dealer/rfqs/{rfq_id}/accept")
@@ -1032,6 +1086,58 @@ async def release_dealer_rfq_compliance_hold(rfq_id: str, db=Depends(get_db), cu
     }
 
 
+def _build_settlement_payment_instructions(rfq: dict, settlement_id: str) -> dict | None:
+    """
+    Where a merchant self-service settlement's `fromAsset` leg should be
+    sent, generated only now (execution time) rather than at accept -- the
+    merchant should never be told to pay before their quote is locked in.
+    Memo is unique per settlement (never reused), following the same
+    JASIRI-style memo-tagging pattern routes/stellar.py's deposit flow
+    already uses, so treasury can attribute an incoming payment to this
+    exact settlement when they run confirm_customer_funds.
+
+    Crypto legs point at the same treasury deposit addresses routes/
+    stellar.py::get_deposit_info already exposes for retail deposits --
+    reusing the identical env vars rather than a second address config.
+    Fiat legs (the merchant sending KES/XAF/etc in) have no automated
+    collection account yet -- surfaced as a manual instruction for the
+    dealer to arrange over chat, matching the "manual confirmation
+    discipline" already used everywhere else in this file.
+    """
+    if rfq.get("origin") != "merchant_self_service":
+        return None
+    asset = str(rfq.get("fromAsset", "")).upper()
+    amount = float(rfq.get("amount", 0) or 0)
+    memo = f"SETTLE-{settlement_id}"
+
+    crypto_networks = {
+        "USDA": ("cardano", os.environ.get("MASTER_WALLET_ADDRESS", "")),
+        "ADA": ("cardano", os.environ.get("MASTER_WALLET_ADDRESS", "")),
+        "USDC": ("celo", os.environ.get("CELO_HOT_WALLET_ADDRESS", "")),
+        "USDT": ("tron", os.environ.get("TRON_MASTER_ADDRESS", "")),
+        "CUSD": ("celo", os.environ.get("CELO_HOT_WALLET_ADDRESS", "")),
+        "XLM": ("stellar", os.environ.get("STELLAR_MASTER_ADDRESS", "")),
+    }
+    if asset in crypto_networks:
+        network, address = crypto_networks[asset]
+        return {
+            "kind": "crypto",
+            "asset": asset,
+            "amount": amount,
+            "network": network,
+            "address": address,
+            "memo": memo if network == "stellar" else None,
+        }
+
+    return {
+        "kind": "fiat",
+        "asset": asset,
+        "amount": amount,
+        "reference": memo,
+        "note": "Your dealer will share bank/mobile money account details for this reference in the settlement chat.",
+    }
+
+
 @router.post("/dealer/rfqs/{rfq_id}/execute")
 async def execute_dealer_rfq(rfq_id: str, db=Depends(get_db), current_user: dict = Depends(get_current_user_with_role)):
     ensure_admin(current_user)
@@ -1056,7 +1162,18 @@ async def execute_dealer_rfq(rfq_id: str, db=Depends(get_db), current_user: dict
             "id": rfq.get("customerId"),
             "name": rfq.get("customerName"),
         },
+        # Immutable snapshot of what was actually agreed -- market rate,
+        # execution rate and spread at accept time -- so treasury (and the
+        # merchant, on their own settlement view) can see the margin behind
+        # this specific trade without cross-referencing the RFQ separately,
+        # and so a later rate-book change can never retroactively change
+        # what this settlement says was agreed.
+        "fromAsset": rfq.get("fromAsset"),
+        "toAsset": rfq.get("toAsset"),
+        "amount": rfq.get("amount"),
+        "quote": rfq.get("quote"),
         "destinationWallet": rfq.get("destinationWallet"),
+        "bankDetails": rfq.get("bankDetails"),
         "settlementChannel": rfq.get("settlementChannel"),
         "collectionPhone": rfq.get("collectionPhone"),
         "network": rfq.get("network"),
@@ -1086,10 +1203,15 @@ async def execute_dealer_rfq(rfq_id: str, db=Depends(get_db), current_user: dict
         "createdAt": now,
         "updatedAt": now,
     }
+    settlement["paymentInstructions"] = _build_settlement_payment_instructions(rfq, settlement["id"])
     rfq["status"] = "executed"
     rfq["settlementId"] = settlement["id"]
+    rfq["paymentInstructions"] = settlement["paymentInstructions"]
     rfq["updatedAt"] = now
-    await db["dealer_rfqs"].update_one({"id": rfq_id}, {"$set": {"status": "executed", "settlementId": settlement["id"], "updatedAt": now}})
+    await db["dealer_rfqs"].update_one(
+        {"id": rfq_id},
+        {"$set": {"status": "executed", "settlementId": settlement["id"], "paymentInstructions": settlement["paymentInstructions"], "updatedAt": now}},
+    )
     await db["dealer_settlements"].update_one({"id": settlement["id"]}, {"$set": settlement}, upsert=True)
 
     await db["admin_notifications"].insert_one({
@@ -1110,7 +1232,7 @@ async def execute_dealer_rfq(rfq_id: str, db=Depends(get_db), current_user: dict
 async def get_dealer_settlements(db=Depends(get_db), current_user: dict = Depends(get_current_user_with_role)):
     ensure_admin(current_user)
     settlements = await db["dealer_settlements"].find({}).sort("createdAt", -1).to_list(length=200)
-    return {"status": "success", "settlements": [
+    return {"status": "success", "demoMode": {"allowSelfSubmit": settings.otc_demo_allow_self_submit}, "settlements": [
         {key: value for key, value in s.items() if key != "_id"} for s in settlements
     ]}
 
@@ -1216,6 +1338,25 @@ _SETTLEMENT_TRANSITIONS: dict[str, dict[str, str]] = {
 _RELEASE_ON = {"failed", "reservation_released"}
 _SPEND_ON = {"reconciled"}
 
+# Merchant-visible copy per settlement status -- previously only "reconciled"
+# and the release states pushed a live notification, so the merchant's
+# dashboard had no way to show real settlement progress (funds received ->
+# confirming -> completed) short of polling and hoping the status changed.
+# Every transition in _SETTLEMENT_TRANSITIONS now has an entry here so the
+# in-progress tracker on the merchant dashboard can update live off the same
+# /ws/dashboard notification channel onboarding/acceptance already use.
+_SETTLEMENT_PROGRESS_COPY: dict[str, tuple[str, str, str]] = {
+    "treasury_review": ("info", "Settlement under review", "Treasury is reviewing your settlement."),
+    "funds_confirmed": ("info", "Funds received", "Your incoming funds have been confirmed by treasury -- settlement is now processing."),
+    "transfer_approved": ("info", "Settlement approved", "Your settlement has been approved and is being submitted for transfer."),
+    "transfer_pending": ("info", "Transfer submitted", "Your outbound transfer has been submitted and is confirming."),
+    "fiat_confirmed": ("info", "Transfer confirmed", "Your settlement's transfer has been confirmed -- finalizing now."),
+    "crypto_confirmed": ("info", "Transfer confirmed", "Your settlement's transfer has been confirmed -- finalizing now."),
+    "reconciled": ("success", "Settlement completed", "Your OTC settlement has been completed and reconciled."),
+    "failed": ("warning", "Settlement did not complete", "Your OTC settlement was marked 'failed'. Contact support for details."),
+    "reservation_released": ("warning", "Settlement cancelled", "Your OTC settlement's reservation was released. Contact support for details."),
+}
+
 
 @router.post("/dealer/settlements/{settlement_id}/action")
 async def act_on_dealer_settlement(settlement_id: str, payload: dict, db=Depends(get_db), current_user: dict = Depends(get_current_user_with_role)):
@@ -1251,18 +1392,67 @@ async def act_on_dealer_settlement(settlement_id: str, payload: dict, db=Depends
     now = datetime.utcnow()
     updates: dict = {"status": next_status, "updatedAt": now}
     performed_by = current_user.get("email") or current_user.get("_id")
+    demo_self_submit = False
 
     rfq = await _fetch_dealer_rfq(db, settlement.get("rfqId")) or {}
 
+    if (
+        action == "fail_settlement"
+        and str(settlement.get("settlementChannel") or "").upper() == "WALLET_BALANCE"
+        and ((settlement.get("legs") or {}).get("fiat") or {}).get("status") in {"submitted", "confirmed"}
+    ):
+        raise HTTPException(status_code=400, detail="Proceeds were already credited to the merchant's wallet; this settlement can no longer be failed.")
+
     if action == "confirm_customer_funds":
+        # Merchant self-service: treasury must state the amount that actually arrived and it
+        # must match what the merchant owes (the settlement's inbound leg). A mismatch is
+        # refused so a short or wrong payment can't be waved through.
+        expected_in = float(((settlement.get("legs") or {}).get("crypto") or {}).get("amount", 0) or 0)
+        expected_asset = str(((settlement.get("legs") or {}).get("crypto") or {}).get("asset") or "")
+        if rfq.get("origin") == "merchant_self_service" and expected_in > 0:
+            raw_amount = payload.get("payment_amount")
+            if raw_amount in (None, ""):
+                raise HTTPException(status_code=400, detail=f"Enter the Payment amount that actually arrived (expected {expected_in:,.2f} {expected_asset}).")
+            try:
+                received = float(raw_amount)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="Payment amount must be a number.")
+            if abs(received - expected_in) > 0.01:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Amount mismatch: {received:,.2f} entered but {expected_in:,.2f} {expected_asset} is expected. Do not confirm a short or excess payment; contact the merchant or fail the settlement.",
+                )
         updates["paymentEvidence"] = {
             "status": "customer_funds_confirmed",
             "provider": payload.get("payment_provider"),
             "reference": payload.get("payment_reference"),
             "amount": payload.get("payment_amount"),
+            "expectedAmount": expected_in or None,
             "confirmedBy": performed_by,
             "confirmedAt": now,
         }
+        # Merchant self-service quote-then-fund flow: this is the moment the
+        # merchant's inbound leg (sent against the paymentInstructions
+        # execute_dealer_rfq issued) is confirmed to have actually landed --
+        # log it as a Collection so it shows on the merchant's Collections/
+        # Transactions History pages. No institutional_wallets.available
+        # touched: this money was sent to fund this one settlement, not
+        # deposited as a standing balance.
+        if rfq.get("origin") == "merchant_self_service" and rfq.get("customerId"):
+            from institutional_wallet_utils import log_settlement_ledger_entry
+            fiat_leg = (settlement.get("legs") or {}).get("fiat") or {}
+            crypto_leg = (settlement.get("legs") or {}).get("crypto") or {}
+            channel = str(settlement.get("settlementChannel") or "").upper()
+            # The merchant's inbound leg is whichever leg they're the SOURCE
+            # of -- WALLET_TO_BANK/BANK_TRANSFER means they send crypto in;
+            # BANK_TO_WALLET/WALLET_TRANSFER means they send fiat in.
+            inbound_leg = crypto_leg if (rfq.get("origin") == "merchant_self_service" or channel in {"WALLET_TO_BANK", "BANK_TRANSFER"}) else fiat_leg
+            if float(inbound_leg.get("amount", 0) or 0) > 0:
+                await log_settlement_ledger_entry(
+                    db, str(rfq["customerId"]), direction="in",
+                    asset=inbound_leg.get("asset", ""), amount=float(inbound_leg.get("amount", 0) or 0),
+                    source="settlement_funding", related_rfq_id=rfq.get("id"), related_settlement_id=settlement_id,
+                )
 
     elif action == "submit_transfer":
         # This is where real value actually moves -- only reachable after
@@ -1280,13 +1470,75 @@ async def act_on_dealer_settlement(settlement_id: str, payload: dict, db=Depends
         # Legs land at "submitted" here, not "confirmed" -- confirm_fiat_
         # receipt/confirm_crypto_receipt (below) is the separate step that
         # verifies the customer actually received it and marks it confirmed.
+        #
+        # Maker-checker: this is the action that actually fires a real
+        # Cardano/Celo/mobile-money transfer, so the admin who approved the
+        # transfer (approve_crypto_transfer, above) may not be the same one
+        # who submits it -- dual control on the one step that moves real
+        # money, cheap to enforce since both are already separate, audited
+        # transitions in _SETTLEMENT_TRANSITIONS.
+        approver = next(
+            (str(entry.get("performedBy")) for entry in reversed(settlement.get("audit") or [])
+             if entry.get("action") == "approve_crypto_transfer"),
+            None,
+        )
+        if approver and approver == str(performed_by):
+            if settings.otc_demo_allow_self_submit:
+                demo_self_submit = True  # DEMO ONLY: stamped on the audit entry below
+            else:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Maker-checker: the admin who approved this transfer cannot also submit it. Have another admin submit it.",
+                )
+
         channel = str(settlement.get("settlementChannel") or "").upper()
         deliver_crypto = channel in {"BANK_TO_WALLET", "WALLET_TRANSFER"}
         legs = settlement.get("legs") or {}
 
-        if deliver_crypto:
+        if channel == "WALLET_BALANCE":
+            # Merchant chose to receive the converted funds into their Jasiri
+            # wallet: value "moves" by crediting institutional_wallets (the
+            # balance they can then pay beneficiaries from), no external rail.
+            out_leg = legs.get("fiat") or {}
+            out_amount = float(out_leg.get("amount", 0) or 0)
+            out_asset = str(out_leg.get("asset") or "").upper()
+            if out_amount <= 0 or not out_asset or not rfq.get("customerId"):
+                raise HTTPException(status_code=400, detail="Settlement has no receive amount to credit")
+            from institutional_wallet_utils import credit_available
+            await credit_available(
+                db, str(rfq["customerId"]), out_asset, out_amount,
+                source="conversion_proceeds", related_rfq_id=rfq.get("id"), related_settlement_id=settlement_id,
+            )
+            updates["legs.fiat.status"] = "submitted"
+            updates["paymentEvidence"] = {**(settlement.get("paymentEvidence") or {}), "status": "credited_to_wallet", "reference": f"WALLET-{settlement_id}"}
+
+        elif channel == "TO_BANK":
+            # Treasury settles fiat to the merchant's bank account only (never
+            # mobile money). Sent manually from treasury's bank; the bank
+            # transfer reference is required so the payment is traceable.
+            out_leg = legs.get("fiat") or {}
+            out_amount = float(out_leg.get("amount", 0) or 0)
+            bank = settlement.get("bankDetails") or {}
+            reference = str(payload.get("payment_reference") or "").strip()
+            if out_amount <= 0 or not bank.get("accountNumber"):
+                raise HTTPException(status_code=400, detail="Settlement has no bank details or amount to pay out")
+            if not reference:
+                raise HTTPException(status_code=400, detail="Enter the bank transfer reference (Payment reference) before submitting")
+            updates["providerStatus"] = "submitted"
+            updates["paymentEvidence"] = {
+                **(settlement.get("paymentEvidence") or {}),
+                "status": "submitted", "provider": payload.get("payment_provider") or f"Bank transfer to {bank.get('bankName')}",
+                "reference": reference,
+            }
+            updates["legs.fiat.status"] = "submitted"
+
+        elif deliver_crypto or channel == "TO_EXTERNAL_WALLET":
+            ext = channel == "TO_EXTERNAL_WALLET"
+            ext_network = str(settlement.get("network") or "").lower()
             destination = settlement.get("destinationWallet")
-            crypto_leg = legs.get("crypto") or {}
+            # Merchant self-service legs: "fiat" is always the OUTBOUND leg
+            # (toAsset / receive amount), "crypto" the inbound one.
+            crypto_leg = (legs.get("fiat") if ext else legs.get("crypto")) or {}
             asset = str(crypto_leg.get("asset") or "").upper()
             amount = float(crypto_leg.get("amount", 0) or 0)
             if not destination:
@@ -1294,7 +1546,7 @@ async def act_on_dealer_settlement(settlement_id: str, payload: dict, db=Depends
             if amount <= 0:
                 raise HTTPException(status_code=400, detail="Settlement has no crypto amount to send")
 
-            if asset == "USDA":
+            if asset == "USDA" and (not ext or ext_network == "cardano"):
                 from cardano.wallet import CardanoWallet
                 from cardano.usda import send_usda
                 import asyncio as _asyncio
@@ -1307,7 +1559,7 @@ async def act_on_dealer_settlement(settlement_id: str, payload: dict, db=Depends
                     raise HTTPException(status_code=502, detail=f"Cardano USDA transfer failed: {exc}")
                 updates["blockchain"] = {"network": "cardano", "status": "submitted", "txHash": tx_hash}
 
-            elif asset in {"USDC", "USDT", "CUSD"}:
+            elif asset in {"USDC", "USDT", "CUSD"} and (not ext or ext_network == "celo"):
                 from routes.swap_engine import settle_crypto_on_celo
                 celo_asset = "cUSD" if asset == "CUSD" else asset
                 result = await settle_crypto_on_celo(destination, celo_asset, amount)
@@ -1315,10 +1567,19 @@ async def act_on_dealer_settlement(settlement_id: str, payload: dict, db=Depends
                     raise HTTPException(status_code=502, detail=f"Celo {celo_asset} transfer failed: {result.get('error')}")
                 updates["blockchain"] = {"network": "celo", "status": "submitted", "txHash": result.get("tx_hash")}
 
+            elif ext:
+                # Network the platform doesn't send on automatically (Stellar,
+                # Polygon, BEP20, Tron, Ethereum): treasury sends from their own
+                # wallet and records the transaction hash here.
+                manual_hash = str(payload.get("tx_hash") or "").strip()
+                if not manual_hash:
+                    raise HTTPException(status_code=400, detail=f"{ext_network or 'This network'} is settled manually: send {amount:,.2f} {asset} to the wallet, then enter the Blockchain TX hash")
+                updates["blockchain"] = {"network": ext_network, "status": "submitted", "txHash": manual_hash, "manual": True}
+
             else:
                 raise HTTPException(status_code=400, detail=f"Unsupported crypto settlement asset: {asset}")
 
-            updates["legs.crypto.status"] = "submitted"
+            updates["legs.fiat.status" if ext else "legs.crypto.status"] = "submitted"
 
         else:
             phone = settlement.get("collectionPhone")
@@ -1344,16 +1605,21 @@ async def act_on_dealer_settlement(settlement_id: str, payload: dict, db=Depends
             updates["legs.fiat.status"] = "submitted"
 
     elif action in {"confirm_fiat_receipt", "confirm_crypto_receipt"}:
+        prior_evidence = settlement.get("paymentEvidence") or {}
         updates["providerStatus"] = payload.get("payment_provider") or "confirmed"
         updates["paymentEvidence"] = {
-            **(settlement.get("paymentEvidence") or {}),
+            **prior_evidence,
             "status": "received",
-            "provider": payload.get("payment_provider"),
-            "reference": payload.get("payment_reference"),
-            "amount": payload.get("payment_amount"),
+            # Keep the reference/provider recorded at submit_transfer when the
+            # confirmation form is left blank.
+            "provider": payload.get("payment_provider") or prior_evidence.get("provider"),
+            "reference": payload.get("payment_reference") or prior_evidence.get("reference"),
+            "amount": payload.get("payment_amount") if payload.get("payment_amount") is not None else prior_evidence.get("amount"),
             "receivedAt": now,
         }
         leg_key = "fiat" if action == "confirm_fiat_receipt" else "crypto"
+        if rfq.get("origin") == "merchant_self_service":
+            leg_key = "fiat"  # merchant's receiving (outbound) leg is always legs.fiat
         updates[f"legs.{leg_key}.status"] = "confirmed"
 
     reservation_id = settlement.get("reservationId")
@@ -1364,21 +1630,31 @@ async def act_on_dealer_settlement(settlement_id: str, payload: dict, db=Depends
         elif next_status in _SPEND_ON:
             await engine.spend_route(reservation_id)
 
-    # Mirror the same release/spend onto the merchant's own institutional
-    # wallet ledger for merchant-initiated RFQs -- otherwise a failed
-    # self-service trade leaves the merchant's funds stuck in `locked`
-    # forever (accept_dealer_rfq's extra_on_success hook is what moved them
-    # available -> locked in the first place; see
-    # routes/otc_merchant.py::merchant_accept_rfq).
-    if rfq.get("origin") == "merchant_self_service" and (next_status in _RELEASE_ON or next_status in _SPEND_ON):
-        from institutional_wallet_utils import release_locked, spend_locked
-        merchant_id = str(rfq.get("customerId"))
-        merchant_asset = rfq.get("fromAsset")
-        merchant_amount = float(rfq.get("amount", 0) or 0)
-        if next_status in _RELEASE_ON:
-            await release_locked(db, merchant_id, merchant_asset, merchant_amount)
-        else:
-            await spend_locked(db, merchant_id, merchant_asset, merchant_amount)
+    # Log the delivered (outbound) leg as a Payout on the merchant's ledger
+    # once the settlement is fully reconciled -- this is quote-then-fund, not
+    # the old pre-funded standing-balance model, so there is no
+    # institutional_wallets.locked figure to release/spend here; nothing was
+    # ever locked at accept time (see routes/otc_merchant.py::
+    # merchant_accept_rfq). A failed/released settlement needs no unwind for
+    # the same reason -- the merchant's funds were never held by the
+    # platform in the first place.
+    if rfq.get("origin") == "merchant_self_service" and next_status in _SPEND_ON and rfq.get("customerId"):
+        from institutional_wallet_utils import log_settlement_ledger_entry
+        fiat_leg = (settlement.get("legs") or {}).get("fiat") or {}
+        crypto_leg = (settlement.get("legs") or {}).get("crypto") or {}
+        channel = str(settlement.get("settlementChannel") or "").upper()
+        # Whichever leg WE delivered to the external destination is the
+        # merchant's outbound Payout -- the mirror of the inbound leg logged
+        # as a Collection in confirm_customer_funds above.
+        outbound_leg = fiat_leg if (channel in {"WALLET_TO_BANK", "BANK_TRANSFER", "TO_BANK", "TO_EXTERNAL_WALLET"}) else crypto_leg
+        # WALLET_BALANCE proceeds were already credited to the wallet at
+        # submit_transfer (logged as an "in" entry) -- no external payout leg.
+        if channel != "WALLET_BALANCE" and float(outbound_leg.get("amount", 0) or 0) > 0:
+            await log_settlement_ledger_entry(
+                db, str(rfq["customerId"]), direction="out",
+                asset=outbound_leg.get("asset", ""), amount=float(outbound_leg.get("amount", 0) or 0),
+                source="settlement_payout", related_rfq_id=rfq.get("id"), related_settlement_id=settlement_id,
+            )
 
     audit_entry = {
         "action": action,
@@ -1386,7 +1662,7 @@ async def act_on_dealer_settlement(settlement_id: str, payload: dict, db=Depends
         "toStatus": next_status,
         "performedBy": performed_by,
         "performedAt": now,
-        "note": payload.get("note"),
+        "note": payload.get("note") or ("DEMO MODE: maker-checker bypassed (same admin approved and submitted)" if demo_self_submit else None),
     }
 
     await db["dealer_settlements"].update_one(
@@ -1397,22 +1673,15 @@ async def act_on_dealer_settlement(settlement_id: str, payload: dict, db=Depends
         await db["dealer_rfqs"].update_one({"id": rfq["id"]}, {"$set": {"status": next_status, "updatedAt": now}})
 
     customer_id = rfq.get("customerId")
-    if customer_id and next_status in ({"reconciled"} | _RELEASE_ON):
+    progress_copy = _SETTLEMENT_PROGRESS_COPY.get(next_status)
+    if customer_id and progress_copy:
+        severity, title, message = progress_copy
         try:
-            if next_status == "reconciled":
-                await notify_user(
-                    db, customer_id, "settlement", "success",
-                    "Settlement completed",
-                    f"Your OTC settlement {settlement_id} has been completed and reconciled.",
-                    extra={"settlementId": settlement_id, "rfqId": rfq.get("id")},
-                )
-            else:
-                await notify_user(
-                    db, customer_id, "settlement", "warning",
-                    "Settlement did not complete",
-                    f"Your OTC settlement {settlement_id} was marked '{next_status}'. Contact support for details.",
-                    extra={"settlementId": settlement_id, "rfqId": rfq.get("id")},
-                )
+            await notify_user(
+                db, customer_id, "settlement", severity, title,
+                f"{message} (Settlement {settlement_id})",
+                extra={"settlementId": settlement_id, "rfqId": rfq.get("id"), "settlementStatus": next_status, "route": "/otc/settlements"},
+            )
         except Exception:
             pass  # notification is best-effort, must never block a settlement action
 
@@ -1524,6 +1793,7 @@ async def get_all_retail_transactions(userId: str = None, limit: int = 200, db=D
                 customer_name = user.get("displayName") or user.get("name") or user.get("email") or "Unknown User"
 
         provider_report = e.get("providerReport") if isinstance(e.get("providerReport"), dict) else {}
+        tx_hash, network, explorer_url = _resolve_tx_explorer(e)
         formatted_entries.append({
             "id": str(e["_id"]),
             "createdAt": e.get("createdAt", datetime.utcnow()).isoformat() + "Z" if e.get("createdAt") else None,
@@ -1540,6 +1810,10 @@ async def get_all_retail_transactions(userId: str = None, limit: int = 200, db=D
             "mobileMoneyProvider": e.get("mobileMoneyProvider"),
             "providerStatus": e.get("providerStatus"),
             "failureReason": e.get("error_reason") or (e.get("providerReport") or {}).get("message") or (e.get("providerReport") or {}).get("transactionReport") or ((e.get("providerReport") or {}).get("transaction") or {}).get("message"),
+            "txHash": tx_hash,
+            "network": network,
+            "explorerUrl": explorer_url,
+            "counterparty": e.get("counterparty"),
         })
 
     return {"status": "success", "entries": formatted_entries}
@@ -1755,6 +2029,12 @@ async def get_admin_notifications(db=Depends(get_db), current_user: dict = Depen
             "userId": item.get("userId"),
             "userName": item.get("userName"),
             "userEmail": item.get("userEmail"),
+            # So the notification can deep-link straight to the RFQ/settlement
+            # it's about, instead of just the generic queue page -- an admin
+            # clicking "New message on RFQ-X" had no way to land on RFQ-X
+            # specifically.
+            "sourceRfqId": item.get("sourceRfqId"),
+            "sourceSettlementId": item.get("sourceSettlementId"),
         })
 
     return {"status": "success", "unreadCount": unread_count, "notifications": formatted}
@@ -2008,6 +2288,7 @@ async def approve_institutional_onboarding(user_id: str, db=Depends(get_db), cur
         db, user_id, "onboarding", "success",
         "Onboarding approved",
         "Your institutional account is approved. You can now fund your account and request OTC settlements.",
+        extra={"route": "/otc/overview"},
     )
     return {"status": "approved"}
 
@@ -2032,8 +2313,78 @@ async def reject_institutional_onboarding(user_id: str, payload: dict | None = N
         db, user_id, "onboarding", "error",
         "Onboarding rejected",
         f"Your institutional onboarding was rejected: {reason}",
+        extra={"route": "/otc/onboarding"},
     )
     return {"status": "rejected"}
+
+
+# --- OTC desk analytics -------------------------------------------------
+# The dealer/treasury-side equivalent of the merchant dashboard: rolls up
+# dealer_rfqs/dealer_settlements/institutional_profiles into the KPIs a
+# dealer actually needs at a glance (active merchants, funnel, settlement
+# throughput, who's driving volume) instead of the raw per-RFQ queue
+# DealerWorkspaceLive already shows. Deliberately separate from
+# /operations-overview above, which is retail-only (ramp_entries) and
+# doesn't touch the dealer_rfqs/dealer_settlements collections at all.
+
+@router.get("/otc/analytics-overview")
+async def get_otc_analytics_overview(days: int = 30, db=Depends(get_db), current_user: dict = Depends(get_current_user_with_role)):
+    ensure_admin(current_user)
+    days = max(1, min(int(days or 30), 180))
+    now = datetime.utcnow()
+    start_date = now - timedelta(days=days)
+
+    profiles = await db["institutional_profiles"].find(
+        {}, {"onboardingStatus": 1, "legalName": 1, "businessName": 1, "userId": 1},
+    ).to_list(length=2000)
+    approved_merchants = [p for p in profiles if p.get("onboardingStatus") == "approved"]
+
+    rfqs = await db["dealer_rfqs"].find({"createdAt": {"$gte": start_date}}).to_list(length=5000)
+    settlements = await db["dealer_settlements"].find({"createdAt": {"$gte": start_date}}).to_list(length=5000)
+
+    funnel: dict[str, int] = {}
+    for rfq in rfqs:
+        status = rfq.get("status", "unknown")
+        funnel[status] = funnel.get(status, 0) + 1
+
+    reconciled = [s for s in settlements if s.get("status") == "reconciled"]
+    settlement_minutes: list[float] = []
+    for settlement in reconciled:
+        created = _normalize_datetime(settlement.get("createdAt"))
+        reconciled_at = None
+        for entry in settlement.get("audit") or []:
+            if entry.get("toStatus") == "reconciled":
+                reconciled_at = _normalize_datetime(entry.get("performedAt"))
+        if created and reconciled_at:
+            settlement_minutes.append((reconciled_at - created).total_seconds() / 60)
+    avg_settlement_minutes = round(sum(settlement_minutes) / len(settlement_minutes), 1) if settlement_minutes else None
+
+    volume_by_merchant: dict[str, float] = {}
+    counted_statuses = {"accepted", "executed", "reconciled"}
+    for rfq in rfqs:
+        if rfq.get("status") in counted_statuses:
+            name = rfq.get("customerName") or rfq.get("customerId") or "Unknown"
+            volume_by_merchant[name] = volume_by_merchant.get(name, 0) + float(rfq.get("amount", 0) or 0)
+    top_merchants = sorted(volume_by_merchant.items(), key=lambda kv: kv[1], reverse=True)[:8]
+
+    active_settlement_statuses = {"reconciled", "failed", "reservation_released"}
+
+    return {
+        "status": "success",
+        "asOf": now.isoformat(),
+        "kpis": {
+            "activeMerchants": len(approved_merchants),
+            "totalMerchants": len(profiles),
+            "totalRfqs": len(rfqs),
+            "acceptedVolumeCount": sum(1 for rfq in rfqs if rfq.get("status") in counted_statuses),
+            "pendingComplianceReview": funnel.get("pending_compliance_review", 0),
+            "activeSettlements": sum(1 for s in settlements if s.get("status") not in active_settlement_statuses),
+            "reconciledSettlements": len(reconciled),
+            "avgSettlementMinutes": avg_settlement_minutes,
+        },
+        "rfqFunnel": [{"status": status, "count": count} for status, count in sorted(funnel.items(), key=lambda kv: -kv[1])],
+        "topMerchants": [{"name": name, "volume": volume} for name, volume in top_merchants],
+    }
 
 
 @router.post("/institutional-wallets/{user_id}/credit")
@@ -2063,6 +2414,7 @@ async def credit_institutional_wallet(user_id: str, payload: dict, db=Depends(ge
         db, user_id, "wallet", "success",
         "Deposit confirmed",
         f"{amount:,.2f} {asset} has been credited to your available balance.",
+        extra={"route": "/otc/wallet"},
     )
     return {"status": "success"}
 
@@ -2123,3 +2475,441 @@ async def freeze_customer(id: str, db=Depends(get_db)):
 async def unfreeze_customer(id: str, db=Depends(get_db)):
     res = await db["users"].update_one({"_id": safe_obj_id(id)}, {"$set": {"accountStatus": "active", "status": "active"}})
     return {"status": "active"}
+
+
+# --- Beneficiary payout requests (treasury review) -------------------------
+# A merchant's self-service request to pay a saved beneficiary out of their
+# settled balance (routes/otc_merchant.py::create_payout_request). Goes
+# through the same "a human confirms before money moves" discipline as
+# every other payout path here -- approve/reject is a compliance decision,
+# mark_paid is treasury recording that the transfer was actually sent
+# (manually today; wiring settle_bank_transfer/settle_mobilemoney_via_
+# flutterwave to fire automatically here is a real next step, deliberately
+# not done in the same change that introduced the request itself).
+
+@router.get("/otc/payout-requests")
+async def list_otc_payout_requests(status: str | None = None, db=Depends(get_db), current_user: dict = Depends(get_current_user_with_role)):
+    ensure_admin(current_user)
+    query = {"status": status} if status else {}
+    rows = await db["institutional_payout_requests"].find(query).sort("createdAt", -1).to_list(length=500)
+    for r in rows:
+        r.pop("_id", None)
+    return {"status": "success", "requests": rows}
+
+
+@router.post("/otc/payout-requests/{request_id}/action")
+async def act_on_otc_payout_request(request_id: str, payload: dict, db=Depends(get_db), current_user: dict = Depends(get_current_user_with_role)):
+    ensure_admin(current_user)
+    action = str((payload or {}).get("action") or "").strip()
+    if action not in {"approve", "reject", "mark_paid"}:
+        raise HTTPException(status_code=400, detail="action must be approve, reject, or mark_paid")
+
+    request_doc = await db["institutional_payout_requests"].find_one({"id": request_id})
+    if not request_doc:
+        raise HTTPException(status_code=404, detail="Payout request not found")
+
+    current_status = request_doc.get("status")
+    allowed_from = {"approve": "pending_review", "reject": "pending_review", "mark_paid": "approved"}
+    if current_status != allowed_from[action]:
+        raise HTTPException(status_code=400, detail=f"Cannot {action} a request in status '{current_status}'")
+
+    now = datetime.utcnow()
+    next_status = {"approve": "approved", "reject": "rejected", "mark_paid": "paid"}[action]
+    reference = str((payload or {}).get("reference") or "").strip() or None
+    notes = str((payload or {}).get("notes") or "").strip() or None
+    updates = {
+        "status": next_status, "updatedAt": now,
+        "reviewedBy": current_user.get("displayName") or current_user.get("email"),
+        "reviewedAt": now,
+    }
+    if notes:
+        updates["reviewNotes"] = notes
+    if reference:
+        updates["reference"] = reference
+
+    if action == "mark_paid":
+        # Debit first (atomic, guarded) so a paid payout can never leave the
+        # merchant's balance untouched, and a short balance blocks the status change.
+        asset_key = str(request_doc.get("currency", "")).upper()
+        pay_amount = float(request_doc.get("amount", 0) or 0)
+        debited = await db["institutional_wallets"].update_one(
+            {"_id": request_doc["merchantId"], f"{asset_key}.available": {"$gte": pay_amount}},
+            {"$inc": {f"{asset_key}.available": -pay_amount}, "$set": {"updatedAt": now}},
+        )
+        if not debited.modified_count:
+            raise HTTPException(status_code=400, detail="Merchant's available balance no longer covers this payout")
+
+    await db["institutional_payout_requests"].update_one({"id": request_id}, {"$set": updates})
+
+    if action == "mark_paid":
+        from institutional_wallet_utils import log_settlement_ledger_entry
+        await log_settlement_ledger_entry(
+            db, request_doc["merchantId"], direction="out",
+            asset=request_doc.get("currency", ""), amount=float(request_doc.get("amount", 0) or 0),
+            source="beneficiary_payout",
+        )
+
+    notify_copy = {
+        "approve": ("success", "Payout request approved", f"Your payout of {request_doc.get('amount'):,.2f} {request_doc.get('currency')} to {request_doc.get('beneficiaryName')} was approved and is being processed."),
+        "reject": ("warning", "Payout request rejected", f"Your payout request to {request_doc.get('beneficiaryName')} was rejected. {notes or ''}".strip()),
+        "mark_paid": ("success", "Payout sent", f"{request_doc.get('amount'):,.2f} {request_doc.get('currency')} was sent to {request_doc.get('beneficiaryName')}." + (f" Ref: {reference}" if reference else "")),
+    }[action]
+    try:
+        await notify_user(
+            db, request_doc["merchantId"], "payout_request", notify_copy[0], notify_copy[1], notify_copy[2],
+            extra={"route": "/otc/payouts", "payoutRequestId": request_id},
+        )
+    except Exception:
+        pass
+
+    return {"status": "success"}
+
+
+# --- Merchant funding + collection-method requests (treasury desk) ----------
+# Treasury's side of "Fund Balance" and "Request Collection Method" on the
+# merchant portal. Funding is only ever credited here, after a human has
+# confirmed the money actually arrived -- same manual-confirmation discipline
+# as dealer settlements.
+
+def _strip_id(rows: list) -> list:
+    for r in rows:
+        r.pop("_id", None)
+    return rows
+
+
+@router.get("/otc/funding-requests")
+async def list_otc_funding_requests(status: str | None = None, db=Depends(get_db), current_user: dict = Depends(get_current_user_with_role)):
+    ensure_admin(current_user)
+    query = {"status": status} if status else {}
+    rows = await db["institutional_funding_requests"].find(query).sort("createdAt", -1).to_list(length=300)
+    return {"status": "success", "requests": _strip_id(rows)}
+
+
+@router.post("/otc/funding-requests/{request_id}/action")
+async def act_on_otc_funding_request(request_id: str, payload: dict, db=Depends(get_db), current_user: dict = Depends(get_current_user_with_role)):
+    """credit: treasury confirmed the money arrived -> credits the merchant's
+    wallet (amount may differ from what was requested). reject: closes it."""
+    ensure_admin(current_user)
+    action = str((payload or {}).get("action") or "").strip()
+    if action not in {"credit", "reject"}:
+        raise HTTPException(status_code=400, detail="action must be credit or reject")
+
+    req = await db["institutional_funding_requests"].find_one({"id": request_id})
+    if not req:
+        raise HTTPException(status_code=404, detail="Funding request not found")
+    if req.get("status") != "pending":
+        raise HTTPException(status_code=400, detail=f"Request is already '{req.get('status')}'")
+
+    now = datetime.utcnow()
+    reviewer = current_user.get("displayName") or current_user.get("email")
+    reference = str((payload or {}).get("reference") or "").strip() or None
+    notes = str((payload or {}).get("notes") or "").strip() or None
+    updates: dict = {"updatedAt": now, "reviewedBy": reviewer, "reviewedAt": now}
+    if reference:
+        updates["reference"] = reference
+    if notes:
+        updates["reviewNotes"] = notes
+
+    if action == "credit":
+        credited = float((payload or {}).get("amount") or req.get("amount") or 0)
+        if credited <= 0:
+            raise HTTPException(status_code=400, detail="Credit amount must be positive")
+        from institutional_wallet_utils import credit_available
+        await credit_available(db, req["merchantId"], req["currency"], credited, source="treasury_funding")
+        updates.update({"status": "credited", "creditedAmount": credited})
+        copy = ("success", "Wallet funded", f"{credited:,.2f} {req['currency']} has been credited to your wallet." + (f" Ref: {reference}" if reference else ""))
+    else:
+        updates["status"] = "rejected"
+        copy = ("warning", "Funding request rejected", f"Your {req['currency']} funding request was not approved. {notes or ''}".strip())
+
+    await db["institutional_funding_requests"].update_one({"id": request_id}, {"$set": updates})
+    try:
+        await notify_user(db, req["merchantId"], "funding_request", copy[0], copy[1], copy[2], extra={"route": "/otc/wallet", "fundingRequestId": request_id})
+    except Exception:
+        pass
+    return {"status": "success"}
+
+
+@router.get("/otc/collection-requests")
+async def list_otc_collection_requests(status: str | None = None, db=Depends(get_db), current_user: dict = Depends(get_current_user_with_role)):
+    ensure_admin(current_user)
+    query = {"status": status} if status else {}
+    rows = await db["institutional_collection_requests"].find(query).sort("createdAt", -1).to_list(length=300)
+    return {"status": "success", "requests": _strip_id(rows)}
+
+
+@router.post("/otc/collection-requests/{request_id}/action")
+async def act_on_otc_collection_request(request_id: str, payload: dict, db=Depends(get_db), current_user: dict = Depends(get_current_user_with_role)):
+    """provision: the collection method is live; `details` (account number,
+    paybill, instructions) is shown to the merchant. reject: closes it."""
+    ensure_admin(current_user)
+    action = str((payload or {}).get("action") or "").strip()
+    if action not in {"provision", "reject"}:
+        raise HTTPException(status_code=400, detail="action must be provision or reject")
+
+    req = await db["institutional_collection_requests"].find_one({"id": request_id})
+    if not req:
+        raise HTTPException(status_code=404, detail="Collection request not found")
+    if req.get("status") != "pending":
+        raise HTTPException(status_code=400, detail=f"Request is already '{req.get('status')}'")
+
+    details = str((payload or {}).get("details") or "").strip()
+    if action == "provision" and not details:
+        raise HTTPException(status_code=400, detail="Provide the details the merchant should use (account, paybill, instructions)")
+
+    now = datetime.utcnow()
+    updates = {
+        "status": "provisioned" if action == "provision" else "rejected",
+        "updatedAt": now, "reviewedAt": now,
+        "reviewedBy": current_user.get("displayName") or current_user.get("email"),
+    }
+    if details:
+        updates["details"] = details
+    await db["institutional_collection_requests"].update_one({"id": request_id}, {"$set": updates})
+
+    label = str(req.get("method", "")).replace("_", " ")
+    copy = ("success", "Collection method live", f"Your {label} for {req.get('currency')} is ready. Open Collections to see how to use it.") if action == "provision" \
+        else ("warning", "Collection request rejected", f"Your {label} request for {req.get('currency')} was not approved.")
+    try:
+        await notify_user(db, req["merchantId"], "collection_request", copy[0], copy[1], copy[2], extra={"route": "/otc/collections", "collectionRequestId": request_id})
+    except Exception:
+        pass
+    return {"status": "success"}
+
+
+# --- Treasury reconciliation -----------------------------------------------
+# treasury_positions.total is NET tradeable inventory: conversion proceeds
+# credited to a merchant come off it at reconcile, while top-ups and payouts
+# move cash and merchant liabilities together (net zero). So real cash held
+# should equal:   net inventory  +  everything merchants hold in their wallets.
+# This view compares that expectation with the real bank / M-Pesa / on-chain
+# balance treasury records, and flags any variance.
+
+_RECON_TOLERANCE = 0.01
+
+
+@router.get("/otc/reconciliation")
+async def get_otc_reconciliation(db=Depends(get_db), current_user: dict = Depends(get_current_user_with_role)):
+    ensure_admin(current_user)
+
+    positions = {p["asset"].upper(): p for p in await db["treasury_positions"].find({}).to_list(length=200) if p.get("asset")}
+
+    liabilities: dict[str, dict] = {}
+    merchant_counts: dict[str, int] = {}
+    async for w in db["institutional_wallets"].find({}):
+        for asset, bal in w.items():
+            if asset in {"_id", "updatedAt"} or not isinstance(bal, dict):
+                continue
+            key = asset.upper()
+            row = liabilities.setdefault(key, {"available": 0.0, "locked": 0.0})
+            row["available"] += float(bal.get("available", 0) or 0)
+            row["locked"] += float(bal.get("locked", 0) or 0)
+            if (bal.get("available") or 0) or (bal.get("locked") or 0):
+                merchant_counts[key] = merchant_counts.get(key, 0) + 1
+
+    pending_payouts: dict[str, float] = {}
+    async for r in db["institutional_payout_requests"].find({"status": {"$in": ["pending_review", "approved"]}}):
+        k = str(r.get("currency", "")).upper()
+        pending_payouts[k] = pending_payouts.get(k, 0.0) + float(r.get("amount", 0) or 0)
+
+    unconfirmed_funding: dict[str, float] = {}
+    async for r in db["institutional_funding_requests"].find({"status": "pending"}):
+        k = str(r.get("currency", "")).upper()
+        unconfirmed_funding[k] = unconfirmed_funding.get(k, 0.0) + float(r.get("amount", 0) or 0)
+
+    snapshots: dict[str, dict] = {}
+    async for s in db["treasury_balance_snapshots"].find({}).sort("recordedAt", 1):
+        snapshots[str(s["asset"]).upper()] = s
+
+    assets = sorted(set(positions) | set(liabilities) | set(snapshots))
+    rows = []
+    for asset in assets:
+        pos = positions.get(asset) or {}
+        net_total = float(pos.get("total", pos.get("available", 0)) or 0)
+        reserved = float(pos.get("reserved", 0) or 0) + float(pos.get("pending", 0) or 0)
+        held = liabilities.get(asset, {"available": 0.0, "locked": 0.0})
+        merchant_held = held["available"] + held["locked"]
+        expected = net_total + merchant_held
+        snap = snapshots.get(asset)
+        actual = float(snap["balance"]) if snap else None
+        variance = round(actual - expected, 4) if actual is not None else None
+        if actual is None:
+            status = "no_snapshot"
+        elif abs(variance) <= _RECON_TOLERANCE:
+            status = "balanced"
+        else:
+            status = "over" if variance > 0 else "short"
+        rows.append({
+            "asset": asset,
+            "tracked": bool(pos),
+            "netInventory": round(net_total, 4),
+            "reserved": round(reserved, 4),
+            "availableToTrade": round(max(net_total - reserved, 0), 4),
+            "merchantHeld": round(merchant_held, 4),
+            "merchantsHolding": merchant_counts.get(asset, 0),
+            "pendingPayouts": round(pending_payouts.get(asset, 0.0), 4),
+            "unconfirmedFunding": round(unconfirmed_funding.get(asset, 0.0), 4),
+            "expectedHoldings": round(expected, 4),
+            "actualBalance": actual,
+            "actualSource": (snap or {}).get("source"),
+            "actualAsOf": (snap or {}).get("recordedAt"),
+            "variance": variance,
+            "status": status,
+        })
+    return {"status": "success", "rows": rows}
+
+
+@router.post("/otc/reconciliation/snapshot")
+async def record_balance_snapshot(payload: dict, db=Depends(get_db), current_user: dict = Depends(get_current_user_with_role)):
+    """Treasury records the REAL balance it sees (bank statement, M-Pesa
+    float, on-chain wallet) for one asset. Append-only, so history is kept."""
+    ensure_admin(current_user)
+    asset = str((payload or {}).get("asset") or "").strip().upper()
+    try:
+        balance = float((payload or {}).get("balance"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="balance must be a number")
+    if not asset or balance < 0:
+        raise HTTPException(status_code=400, detail="asset and a non-negative balance are required")
+    await db["treasury_balance_snapshots"].insert_one({
+        "asset": asset, "balance": balance,
+        "source": str((payload or {}).get("source") or "manual").strip() or "manual",
+        "note": (payload or {}).get("note"),
+        "recordedBy": current_user.get("displayName") or current_user.get("email"),
+        "recordedAt": datetime.utcnow(),
+    })
+    return {"status": "success"}
+
+
+@router.get("/otc/market-rates")
+async def get_otc_market_rates(assets: str = "KES,UGX,NGN", refresh: bool = False, db=Depends(get_db), current_user: dict = Depends(get_current_user_with_role)):
+    """Live USDT market rate vs the desk's rate book, so a dealer can see how
+    far the book has drifted from the market before pricing a quote."""
+    ensure_admin(current_user)
+    from routes.treasury import get_or_create_rate_book
+    from services.fx_feed import get_live_snapshot, market_rate, LiveRateUnavailable
+    book = await get_or_create_rate_book(db)
+    book_rates = book.get("usd_base_rates", {})
+    try:
+        snap = await get_live_snapshot(db, force=refresh)
+    except LiveRateUnavailable as exc:
+        return {"status": "unavailable", "detail": str(exc), "rows": []}
+    rows = []
+    for asset in [a.strip().upper() for a in assets.split(",") if a.strip()]:
+        live = market_rate(snap, "USDT", asset)
+        bk = (book_rates.get(asset) / book_rates.get("USDT", 1.0)) if book_rates.get(asset) else None
+        rows.append({
+            "asset": asset,
+            "liveRate": round(live, 6) if live else None,
+            "rateBookRate": round(bk, 6) if bk else None,
+            "deviationBps": round((bk - live) / live * 10000, 1) if live and bk else None,
+            "source": (snap.get("sources") or {}).get(asset),
+        })
+    from services.fx_feed import get_cbk_snapshot
+    live_kes = market_rate(snap, "USD", "KES")
+    cbk_snap = None
+    try:
+        cbk_snap = await get_cbk_snapshot(force=refresh)
+    except LiveRateUnavailable:
+        pass
+    cbk_info = None
+    if cbk_snap:
+        cbk_info = {
+            "usdKes": cbk_snap["usdKes"], "source": cbk_snap["provider"], "cbkDate": cbk_snap.get("cbkDate"),
+            "fetchedAt": cbk_snap["fetchedAt"], "automatic": True,
+            "deviationVsLiveBps": round((cbk_snap["usdKes"] - live_kes) / live_kes * 10000, 1) if live_kes else None,
+        }
+        for row in rows:
+            v = market_rate(cbk_snap, "USDT", row["asset"])
+            row["cbkRate"] = round(v, 6) if v else None
+    else:
+        cbk = await db["fx_reference_rates"].find_one({"_id": "CBK_USD_KES"}) or {}
+        if cbk.get("rate"):
+            cbk_info = {
+                "usdKes": cbk["rate"], "source": f"manual entry by {cbk.get('enteredBy')}", "enteredAt": cbk.get("enteredAt"),
+                "automatic": False,
+                "deviationVsLiveBps": round((cbk["rate"] - live_kes) / live_kes * 10000, 1) if live_kes else None,
+            }
+    return {
+        "status": "success", "rows": rows, "cbk": cbk_info,
+        "provider": snap["provider"], "cadence": snap["cadence"],
+        "providerUpdatedAt": snap["providerUpdatedAt"], "fetchedAt": snap["fetchedAt"],
+        "ageSeconds": snap.get("ageSeconds", 0), "usdtUsd": snap.get("usdtUsd"), "degraded": snap.get("degraded"),
+        "providerErrors": snap.get("providerErrors") or [],
+    }
+
+
+@router.post("/otc/market-rates/cbk-reference")
+async def set_cbk_reference(payload: dict, db=Depends(get_db), current_user: dict = Depends(get_current_user_with_role)):
+    """CBK publishes no usable API (its web table stops at Jan 2024), so treasury
+    enters the day's CBK USD/KES mean from the CBK site; dealers see it beside
+    the live market as a cross-check. Never used to price a quote by itself."""
+    ensure_admin(current_user)
+    try:
+        rate = float((payload or {}).get("rate"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="rate must be a number")
+    if not 50 < rate < 500:
+        raise HTTPException(status_code=400, detail="That does not look like a USD/KES rate")
+    await db["fx_reference_rates"].update_one(
+        {"_id": "CBK_USD_KES"},
+        {"$set": {"rate": rate, "enteredBy": current_user.get("displayName") or current_user.get("email"), "enteredAt": datetime.utcnow()}},
+        upsert=True,
+    )
+    return {"status": "success"}
+
+
+# --- Settlement proof uploads ----------------------------------------------
+# Treasury attaches evidence (bank slip, explorer screenshot, exchange withdrawal
+# PDF) to a settlement. Stored like avatars/KYC documents: base64 data URI in its
+# own collection, with only light metadata on the settlement itself so the queue
+# stays fast.
+
+_EVIDENCE_MIME = {"image/png", "image/jpeg", "image/webp", "application/pdf"}
+_EVIDENCE_MAX_BYTES = 3_000_000
+
+
+@router.post("/dealer/settlements/{settlement_id}/evidence")
+async def upload_settlement_evidence(settlement_id: str, payload: dict, db=Depends(get_db), current_user: dict = Depends(get_current_user_with_role)):
+    ensure_admin(current_user)
+    settlement = await db["dealer_settlements"].find_one({"id": settlement_id}, {"status": 1})
+    if not settlement:
+        raise HTTPException(status_code=404, detail="Settlement not found")
+
+    data_url = str((payload or {}).get("dataUrl") or "")
+    if not data_url.startswith("data:") or "," not in data_url:
+        raise HTTPException(status_code=400, detail="Expected a data URI (data:<type>;base64,...)")
+    header, b64 = data_url.split(",", 1)
+    mime = header.split(";")[0].removeprefix("data:")
+    if mime not in _EVIDENCE_MIME:
+        raise HTTPException(status_code=400, detail="Proof must be a PNG, JPEG, WEBP image or a PDF")
+    if (len(b64) * 3) // 4 > _EVIDENCE_MAX_BYTES:
+        raise HTTPException(status_code=400, detail="File is too large (max 3MB)")
+
+    now = datetime.utcnow()
+    evidence_id = f"EV-{uuid.uuid4().hex[:8].upper()}"
+    meta = {
+        "id": evidence_id,
+        "filename": str((payload or {}).get("filename") or "proof")[:120],
+        "mime": mime,
+        "size": (len(b64) * 3) // 4,
+        "note": ((payload or {}).get("note") or None),
+        "step": settlement.get("status"),
+        "uploadedBy": current_user.get("displayName") or current_user.get("email"),
+        "uploadedAt": now,
+    }
+    await db["settlement_evidence"].insert_one({**meta, "settlementId": settlement_id, "dataUrl": data_url})
+    await db["dealer_settlements"].update_one(
+        {"id": settlement_id},
+        {"$push": {"evidence": meta}, "$set": {"updatedAt": now}},
+    )
+    return {"status": "success", "evidence": meta}
+
+
+@router.get("/dealer/settlements/{settlement_id}/evidence/{evidence_id}")
+async def get_settlement_evidence(settlement_id: str, evidence_id: str, db=Depends(get_db), current_user: dict = Depends(get_current_user_with_role)):
+    ensure_admin(current_user)
+    doc = await db["settlement_evidence"].find_one({"id": evidence_id, "settlementId": settlement_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Evidence not found")
+    return {"status": "success", "filename": doc.get("filename"), "mime": doc.get("mime"), "dataUrl": doc.get("dataUrl")}

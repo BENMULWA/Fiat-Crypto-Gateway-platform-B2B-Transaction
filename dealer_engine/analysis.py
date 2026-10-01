@@ -89,6 +89,12 @@ class AnalysisEngine:
             "amount": amount_usd, "currency": "USD",
             "created_at": datetime.utcnow(), "source": "analysis_preview",
         }
+        # DEMO ONLY (OTC_DEMO_SKIP_ZIGRAM=true): real screening below is untouched; this just short-circuits it.
+        from config import settings as _settings
+        if _settings.otc_demo_skip_zigram:
+            check_doc.update({"outcome": "demo_skipped"})
+            await self.db["compliance_checks"].insert_one(check_doc)
+            return {"passed": True, "value": "DEMO MODE - not screened"}
         try:
             result = zigram.submit_transaction(
                 customer_id=zigram_customer_id,
@@ -123,8 +129,28 @@ class AnalysisEngine:
         market_rate = rates.get(to_asset, 0) / rates.get(from_asset, 1) if rates.get(to_asset) else 0
         treasury_asset = from_asset if str(rfq.get("side", "BUY")).upper() == "BUY" else to_asset
         treasury_required = amount if treasury_asset == from_asset else amount * market_rate
+        # Once a quote exists, what treasury actually owes is the quoted receive
+        # amount (which may be priced off the live market, not the rate book) --
+        # size the reservation on that, not on the rate book's market rate.
+        quoted_receive = float(((rfq.get("quote") or {}).get("receive_amount")) or 0)
+        if treasury_asset == to_asset and quoted_receive > 0:
+            treasury_required = quoted_receive
         customer_status = str((customer or {}).get("status", "active")).lower()
-        kyc_status = str((customer or {}).get("kycStatus", "unverified")).lower()
+        customer_role = str((customer or {}).get("role", "")).lower()
+        if customer_role in {"institutional", "merchant"}:
+            # Institutional accounts are vetted through KYB (institutional_
+            # profiles.onboardingStatus, see routes/otc_merchant.py's
+            # onboarding endpoints), not the retail KYC field on the user
+            # doc -- which is never set for these accounts and so always
+            # read "unverified", auto-blocking every self-service RFQ from
+            # an already KYB-approved merchant regardless of real status.
+            profile = await self.db["institutional_profiles"].find_one(
+                {"userId": str(customer_id)}, {"onboardingStatus": 1},
+            )
+            kyb_status = str((profile or {}).get("onboardingStatus", "not_started")).lower()
+            kyc_status = "verified" if kyb_status == "approved" else kyb_status
+        else:
+            kyc_status = str((customer or {}).get("kycStatus", "unverified")).lower()
         customer_limit = float((customer or {}).get("dailyLimit", 10000000) or 10000000)
         # Live, not the never-updated customer.todayVolume field -- see
         # _today_volume_usd's docstring. dailyLimit is USD-denominated, so
