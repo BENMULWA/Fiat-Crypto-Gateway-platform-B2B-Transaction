@@ -308,3 +308,264 @@ def test_start_corridor_run_rejects_non_positive_amount():
     with pytest.raises(ValueError, match="greater than zero"):
         asyncio.run(corridor_worker.start_corridor_run(db, corridor_id="airtel_5x", amount_usd=0))
     assert db[corridor_worker.RUNS_COLLECTION].docs == {}
+
+
+# --- single-cycle runs and the linear reseller markup ---------------------
+
+def test_drive_run_with_one_cycle_goes_straight_to_exit_without_a_rollover_hold():
+    """cycles=1 is a single pass: procure -> liquidate -> mint -> exit. The
+    FSM must not park in AWAITING_OPPORTUNITY or fire a second STK push."""
+    db = FakeDB()
+    run_doc = _fresh_run_doc(cycles=1)
+    db[corridor_worker.RUNS_COLLECTION].docs[run_doc["_id"]] = run_doc
+
+    seen = []
+    original = db[corridor_worker.RUNS_COLLECTION].update_one
+
+    async def spy(query, update):
+        result = await original(query, update)
+        if "$set" in update and "status" in update["$set"]:
+            seen.append(update["$set"]["status"])
+        return result
+
+    db[corridor_worker.RUNS_COLLECTION].update_one = spy
+    asyncio.run(corridor_worker._drive_run(db, run_doc["_id"]))
+
+    final = db[corridor_worker.RUNS_COLLECTION].docs[run_doc["_id"]]
+    assert final["status"] == FSMState.COMPLETED.value
+    assert final["currentCycle"] == 1
+    assert FSMState.AWAITING_OPPORTUNITY.value not in seen
+    assert final["finalUsd"] > final["startingUsd"]
+
+
+@pytest.mark.parametrize("bad_cycles", [0, -1, 11, True, 2.5])
+def test_start_corridor_run_rejects_invalid_cycles(bad_cycles):
+    db = FakeDB()
+    with pytest.raises(ValueError, match="Cycles must be"):
+        asyncio.run(corridor_worker.start_corridor_run(db, corridor_id="airtel_5x", amount_usd=1.0, cycles=bad_cycles))
+    assert db[corridor_worker.RUNS_COLLECTION].docs == {}  # nothing was written
+
+
+def test_start_corridor_run_records_the_requested_cycles_in_the_run_config(monkeypatch):
+    """The persisted config is what _build_fsm reads on start and on a restart
+    resume, so the cycle count must survive in the run document. _drive_run is
+    stubbed so no real STK push or Comet call can happen in a test."""
+    async def _noop(db, run_id):
+        return None
+
+    monkeypatch.setattr(corridor_worker, "_drive_run", _noop)
+    db = FakeDB()
+
+    async def go():
+        doc = await corridor_worker.start_corridor_run(db, corridor_id="airtel_5x", amount_usd=1.0, cycles=1)
+        await asyncio.sleep(0)
+        return doc
+
+    doc = asyncio.run(go())
+    assert doc["config"]["cycles"] == 1
+    assert db[corridor_worker.RUNS_COLLECTION].docs[doc["_id"]]["config"]["cycles"] == 1
+
+
+def test_start_corridor_run_defaults_to_five_cycles(monkeypatch):
+    async def _noop(db, run_id):
+        return None
+
+    monkeypatch.setattr(corridor_worker, "_drive_run", _noop)
+    db = FakeDB()
+
+    async def go():
+        return await corridor_worker.start_corridor_run(db, corridor_id="airtel_5x", amount_usd=1.0)
+
+    assert asyncio.run(go())["config"]["cycles"] == 5
+
+
+def test_projected_yield_uses_the_linear_reseller_markup():
+    """Live evidence: paying 500 KES returned 525 KES of float (x1.05), not
+    500 / (1 - 0.05) = 526.3. One cycle at a 5% discount is exactly 1.05."""
+    from Brain_Engine.Discovery_Engine import IMMDiscoveryEngine
+
+    engine = IMMDiscoveryEngine()
+    one = engine.project_corridor_yield(discount_rate=0.05, fx_edge_pct=0.0, cycles=1)
+    assert one["single_cycle_multiplier"] == pytest.approx(1.05)
+    assert one["projected_profit_pct"] == pytest.approx(5.0)
+
+    five = engine.project_corridor_yield(discount_rate=0.05, fx_edge_pct=0.0, cycles=5)
+    assert five["total_5x_multiplier"] == pytest.approx(1.05 ** 5, abs=1e-4)
+    assert five["skim_mode_multiplier"] == pytest.approx(1 + 5 * 0.05)
+
+
+# --- cancelling a run ------------------------------------------------------
+
+def _stuck_waiting_for_topup_doc(run_id="RUN-STUCK-1"):
+    doc = _fresh_run_doc(run_id=run_id, status="AWAITING_MANUAL_TOPUP")
+    # The fake provider balance never rises above this, so the run waits forever.
+    doc.update(pendingTopupExpectedKes=200.0, pendingTopupPayoutBalanceBefore=10_000_000.0, pendingTopupTxnId="B2B-X-C1")
+    return doc
+
+
+def test_cancel_stops_a_running_task_and_marks_the_run_halted():
+    db = FakeDB()
+    doc = _stuck_waiting_for_topup_doc()
+    db[corridor_worker.RUNS_COLLECTION].docs[doc["_id"]] = doc
+
+    async def go():
+        task = asyncio.create_task(corridor_worker._drive_run(db, doc["_id"]))
+        corridor_worker._active_tasks[doc["_id"]] = task
+        await asyncio.sleep(0.1)
+        assert not task.done()  # it really is stuck waiting
+        result = await corridor_worker.cancel_corridor_run(db, doc["_id"], cancelled_by="admin-1")
+        corridor_worker._active_tasks.pop(doc["_id"], None)
+        return task, result
+
+    task, result = asyncio.run(go())
+    assert task.cancelled()
+    assert result["status"] == FSMState.HALTED.value
+    assert "Cancelled by an operator" in result["haltReason"] and "AWAITING_MANUAL_TOPUP" in result["haltReason"]
+    assert result["cancelledBy"] == "admin-1"
+    assert result["pendingTopupExpectedKes"] is None
+
+
+def test_a_cancelled_run_is_not_resumed_after_a_restart():
+    db = FakeDB()
+    doc = _stuck_waiting_for_topup_doc()
+    db[corridor_worker.RUNS_COLLECTION].docs[doc["_id"]] = doc
+    asyncio.run(corridor_worker.cancel_corridor_run(db, doc["_id"]))  # no live task in this process
+    assert asyncio.run(corridor_worker.resume_pending_corridor_runs(db)) == 0
+
+
+def test_cancel_unknown_and_finished_runs_are_rejected():
+    db = FakeDB()
+    with pytest.raises(LookupError):
+        asyncio.run(corridor_worker.cancel_corridor_run(db, "RUN-NOPE"))
+    done = _fresh_run_doc(run_id="RUN-DONE", status="COMPLETED")
+    db[corridor_worker.RUNS_COLLECTION].docs["RUN-DONE"] = done
+    with pytest.raises(ValueError, match="already finished"):
+        asyncio.run(corridor_worker.cancel_corridor_run(db, "RUN-DONE"))
+
+
+# --- procure from the float already held (no STK push) ---------------------
+
+def _existing_float_doc(balance, run_id="RUN-FLOAT-1"):
+    """A one-cycle run that must not send any STK push, with a fake float of `balance` KES."""
+    stk_calls = []
+
+    def _no_stk(amount_kes, paying_phone_number):
+        stk_calls.append((amount_kes, paying_phone_number))
+        raise AssertionError("existing_float mode must never send an STK push")
+
+    doc = _fresh_run_doc(run_id=run_id, cycles=1)
+    doc["config"].update(
+        procure_mode="existing_float",
+        topup_via_stk_fn=_no_stk,
+        stk_paying_phone=None,  # no phone is needed in this mode
+        get_payout_balance_fn=lambda: {"artm_balance": balance, "currency": "KES", "raw": {}},
+    )
+    return doc, stk_calls
+
+
+def test_existing_float_mode_completes_without_any_stk_push_or_phone():
+    db = FakeDB()
+    doc, stk_calls = _existing_float_doc(balance=10_000.0)
+    db[corridor_worker.RUNS_COLLECTION].docs[doc["_id"]] = doc
+    asyncio.run(corridor_worker._drive_run(db, doc["_id"]))
+
+    final = db[corridor_worker.RUNS_COLLECTION].docs[doc["_id"]]
+    assert stk_calls == []
+    assert final["status"] == FSMState.COMPLETED.value
+    assert final["finalUsd"] > final["startingUsd"]
+
+
+def test_existing_float_mode_allocates_amount_times_one_plus_discount():
+    db = FakeDB()
+    doc, _ = _existing_float_doc(balance=10_000.0)
+    db[corridor_worker.RUNS_COLLECTION].docs[doc["_id"]] = doc
+    asyncio.run(corridor_worker._drive_run(db, doc["_id"]))
+    # The ledger leg that credits the airtime node carries the allocated airtime value.
+    credits = [e for e in db["transactions"].docs.values()
+               if e.get("txn_type") == "PROCURE" and e.get("to_node") == "N2"]
+    assert len(credits) == 1
+    assert credits[0]["amount"] == pytest.approx(doc["startingUsd"] * 129.50 * (1 + 0.06))
+    assert str(credits[0]["external_ref"]).startswith("FLOAT-")
+
+
+def test_existing_float_mode_halts_when_the_float_is_too_small():
+    db = FakeDB()
+    doc, stk_calls = _existing_float_doc(balance=1.0)
+    db[corridor_worker.RUNS_COLLECTION].docs[doc["_id"]] = doc
+    asyncio.run(corridor_worker._drive_run(db, doc["_id"]))
+    final = db[corridor_worker.RUNS_COLLECTION].docs[doc["_id"]]
+    assert final["status"] == FSMState.HALTED.value
+    assert "Not enough free airtime float" in final["haltReason"]
+    assert stk_calls == []
+
+
+def test_existing_float_mode_fails_closed_when_the_float_cannot_be_read():
+    db = FakeDB()
+    doc, _ = _existing_float_doc(balance=10_000.0)
+
+    def boom():
+        raise RuntimeError("provider down")
+
+    doc["config"]["get_payout_balance_fn"] = boom
+    db[corridor_worker.RUNS_COLLECTION].docs[doc["_id"]] = doc
+    asyncio.run(corridor_worker._drive_run(db, doc["_id"]))
+    final = db[corridor_worker.RUNS_COLLECTION].docs[doc["_id"]]
+    assert final["status"] == FSMState.HALTED.value and "refusing to allocate it blind" in final["haltReason"]
+
+
+def test_start_corridor_run_records_and_validates_procure_mode(monkeypatch):
+    async def _noop(db, run_id):
+        return None
+
+    monkeypatch.setattr(corridor_worker, "_drive_run", _noop)
+
+    async def go(mode):
+        return await corridor_worker.start_corridor_run(FakeDB(), corridor_id="airtel_5x", amount_usd=1.0, cycles=1, procure_mode=mode)
+
+    assert asyncio.run(go("existing_float"))["config"]["procure_mode"] == "existing_float"
+    assert asyncio.run(go("stk"))["config"]["procure_mode"] == "stk"
+    with pytest.raises(ValueError, match="procure_mode"):
+        asyncio.run(go("magic"))
+
+
+def test_start_corridor_run_records_and_validates_swap_mode(monkeypatch):
+    async def _noop(db, run_id):
+        return None
+
+    monkeypatch.setattr(corridor_worker, "_drive_run", _noop)
+
+    async def go(mode):
+        return await corridor_worker.start_corridor_run(FakeDB(), corridor_id="airtel_5x", amount_usd=1.0, cycles=1, swap_mode=mode)
+
+    assert asyncio.run(go("pool"))["config"]["swap_mode"] == "pool"
+    assert asyncio.run(go("reserve"))["config"]["swap_mode"] == "reserve"
+    with pytest.raises(ValueError, match="swap_mode"):
+        asyncio.run(go("magic"))
+
+
+@pytest.mark.parametrize("bad", [0, 0.0005, 0.51, 1, True, "0.02"])
+def test_start_corridor_run_rejects_an_unreasonable_pool_slippage_limit(bad, monkeypatch):
+    async def _noop(db, run_id):
+        return None
+
+    monkeypatch.setattr(corridor_worker, "_drive_run", _noop)
+    with pytest.raises(ValueError, match="pool_max_slippage"):
+        asyncio.run(corridor_worker.start_corridor_run(FakeDB(), corridor_id="airtel_5x", amount_usd=1.0, cycles=1, swap_mode="pool", pool_max_slippage=bad))
+
+
+def test_start_corridor_run_records_the_pool_slippage_limit(monkeypatch):
+    async def _noop(db, run_id):
+        return None
+
+    monkeypatch.setattr(corridor_worker, "_drive_run", _noop)
+    doc = asyncio.run(corridor_worker.start_corridor_run(FakeDB(), corridor_id="airtel_5x", amount_usd=1.0, cycles=1, swap_mode="pool", pool_max_slippage=0.05))
+    assert doc["config"]["pool_max_slippage"] == 0.05 and doc["config"]["swap_mode"] == "pool"
+
+
+def test_a_deliberate_test_run_may_accept_up_to_fifty_percent_slippage(monkeypatch):
+    async def _noop(db, run_id):
+        return None
+
+    monkeypatch.setattr(corridor_worker, "_drive_run", _noop)
+    doc = asyncio.run(corridor_worker.start_corridor_run(FakeDB(), corridor_id="airtel_5x", amount_usd=1.0, cycles=1, swap_mode="pool", pool_max_slippage=0.30))
+    assert doc["config"]["pool_max_slippage"] == 0.30

@@ -123,6 +123,26 @@ class ImpalaAirtimeClient:
             return existing_key
         return self.generate_api_key()
 
+    def _session_call(self, method: str, path: str, json_body: dict | None = None) -> Any:
+        """Session-token authenticated request. The session token is cached, so it
+        can expire while the process is still running; on a 401 this signs in again
+        once and retries, instead of failing every later call until a restart."""
+        send = requests.get if method.upper() == "GET" else requests.post
+        for attempt in (0, 1):
+            token = self.get_session_token()
+            headers = {"Authorization": f"Bearer {token}"}
+            kwargs: dict[str, Any] = {"headers": headers, "timeout": self.timeout}
+            if json_body is not None:
+                headers["Content-Type"] = "application/json"
+                kwargs["json"] = json_body
+            response = send(self._url(path), **kwargs)
+            if response.status_code == 401 and attempt == 0:
+                with self._lock:
+                    self._session_token = None
+                continue
+            response.raise_for_status()
+            return response.json()
+
     def send_airtime(self, phone: str, amount_kes: int, reference: str | None = None) -> dict[str, Any]:
         """POST /api/app/airtime, authenticated with the API key (not the
         session token). Debits the float by exactly amount_kes — this call
@@ -174,14 +194,7 @@ class ImpalaAirtimeClient:
         Returns the real airtime float (`accountBalance`) — the balance
         Brain_Engine.risk_engine.check_airtime_backing gates real IMC
         minting against."""
-        token = self.get_session_token()
-        response = requests.get(
-            self._url("/api/app/details"),
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=self.timeout,
-        )
-        response.raise_for_status()
-        payload = response.json()
+        payload = self._session_call("GET", "/api/app/details")
         balance = payload.get("accountBalance")
         if balance is None:
             raise RuntimeError(f"details response did not contain accountBalance (got keys: {list(payload.keys())})")
@@ -191,14 +204,7 @@ class ImpalaAirtimeClient:
         """GET /api/app/transactions, authenticated with the session
         token. Most recent airtime sales first — not called by the FSM
         today, exposed for reconciliation/audit tooling."""
-        token = self.get_session_token()
-        response = requests.get(
-            self._url("/api/app/transactions"),
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=self.timeout,
-        )
-        response.raise_for_status()
-        return response.json()
+        return self._session_call("GET", "/api/app/transactions")
 
     def topup_via_stk(self, amount_kes: int, paying_phone_number: str) -> dict[str, Any]:
         """POST /api/app/topup, authenticated with the session token. Sends
@@ -211,15 +217,10 @@ class ImpalaAirtimeClient:
         merchant ID, directly."""
         if amount_kes <= 0:
             raise ValueError("Top-up amount must be greater than zero")
-        token = self.get_session_token()
-        response = requests.post(
-            self._url("/api/app/topup"),
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json={"amount": int(amount_kes), "payingPhoneNumber": paying_phone_number},
-            timeout=self.timeout,
+        return self._session_call(
+            "POST", "/api/app/topup",
+            {"amount": int(amount_kes), "payingPhoneNumber": paying_phone_number},
         )
-        response.raise_for_status()
-        return response.json()
 
     def get_wholesale_discount_rate(self, network: str = "airtel") -> float:
         """NOT APPLICABLE to this real provider: the reseller discount is a

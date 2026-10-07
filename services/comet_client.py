@@ -52,13 +52,13 @@ class CometClient:
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
-    def _post(self, path: str, payload: dict, use_service_token: bool = False) -> dict:
+    def _post(self, path: str, payload: dict, use_service_token: bool = False, timeout: float = 15) -> dict:
         try:
             response = requests.post(
                 f"{self.base_url}{path}",
                 json=payload,
                 headers=self._headers(use_service_token),
-                timeout=15,
+                timeout=timeout,
             )
             if response.status_code not in (200, 201, 202):
                 return {"status": "error", "message": response.text, "statusCode": response.status_code}
@@ -215,9 +215,37 @@ class CometClient:
         tokenize/AMM calls made under that numeric id — unconfirmed by any
         single doc page, but it's the only consistent reading across both
         conventions Comet's docs actually show."""
+        # The docs show amountBase as a string ("5000000"), but the live API rejects that:
+        # 'json: cannot unmarshal string into Go struct field .amountBase of type int64' (seen 2026-10-07, on the
+        # withdrawal that ends a pool run; nothing had moved). It needs a JSON number. The swap's amountIn is the
+        # opposite: that one takes a string. Base units here are whole numbers well inside int64.
         return self._post(f"/api/v1/assets/{symbol.lower()}/send", {
-            "externalUserId": external_user_id, "to": to, "amountBase": amount_base,
+            "externalUserId": external_user_id, "to": to, "amountBase": int(amount_base),
         })
+
+    # --- Airtime booking: mint IMC against a real top-up -------------------
+    # docs.mamlakapsp.com/api/airtime.html. These are the INTEGRATOR endpoints: they authenticate with the
+    # tenant's own X-API-Key + X-API-Secret (the same credentials every other call here uses). A service
+    # token or an admin session is refused with 403. The receipt is the idempotency key: one receipt books
+    # exactly once, ever, and a repeat returns 409 with the original txHash. A mint waits for Celo to
+    # confirm, so these calls get a longer timeout than the rest.
+    BOOK_TIMEOUT_SECONDS = 90
+
+    def book_imc(self, receipt: str, cash_kes: float | None = None, chain: str = "celo") -> dict:
+        """POST /api/v1/imc/book — books a gateway receipt and mints the IMC into the tenant's own treasury."""
+        payload: dict = {"receipt": receipt}
+        if cash_kes is not None:
+            payload["cashKes"] = cash_kes
+        return self._post(f"/api/v1/imc/book?chain={chain}", payload, timeout=self.BOOK_TIMEOUT_SECONDS)
+
+    def book_and_send(self, receipt: str, to_address: str, cash_kes: float | None = None, chain: str = "celo") -> dict:
+        """POST /api/v1/imc/book-and-send — books, mints into the treasury, then sends the IMC to `to_address`.
+        If the mint succeeds but the delivery fails Comet answers 502 with minted: true; repeating the identical
+        request only repeats the send."""
+        payload: dict = {"receipt": receipt, "toAddress": to_address}
+        if cash_kes is not None:
+            payload["cashKes"] = cash_kes
+        return self._post(f"/api/v1/imc/book-and-send?chain={chain}", payload, timeout=self.BOOK_TIMEOUT_SECONDS)
 
     # --- Treasury / corridors (read-only) --------------------------------
 

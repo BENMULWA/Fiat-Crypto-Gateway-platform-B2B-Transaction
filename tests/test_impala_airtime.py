@@ -70,3 +70,49 @@ def test_provider_name_for_phone_detects_airtel_numbers_with_leading_zero():
     assert client._provider_name_for_phone("0753253036") == "Airtel"
     assert client._provider_name_for_phone("0783253036") == "Airtel"
     assert client._provider_name_for_phone("254783253036") == "Airtel"
+
+
+def test_session_call_signs_in_again_once_when_the_cached_token_has_expired(monkeypatch):
+    """The session token is cached for the life of the process, so it can expire.
+    A 401 must trigger one fresh login and a retry, not a permanent failure."""
+    monkeypatch.setenv("IMPALA_RESELLER_MERCHANT_ID", "2540012")
+    monkeypatch.setenv("IMPALA_RESELLER_USERNAME", "u")
+    monkeypatch.setenv("IMPALA_RESELLER_PASSWORD", "p")
+    client = ImpalaAirtimeClient()
+    client.merchant_id, client.username, client.password = "2540012", "u", "p"
+    client._session_token = "stale-token"
+
+    seen_tokens = []
+
+    def fake_get(url, headers=None, timeout=None, **kw):
+        seen_tokens.append(headers["Authorization"])
+        if headers["Authorization"] == "Bearer stale-token":
+            return FakeResponse(401, {"message": "expired"})
+        return FakeResponse(200, {"accountBalance": 1234})
+
+    def fake_post(url, json=None, headers=None, timeout=None, **kw):
+        assert url.endswith("/api/app/reseller/login")
+        return FakeResponse(200, {"token": "fresh-token"})
+
+    monkeypatch.setattr("services.impala_airtime.requests.get", fake_get)
+    monkeypatch.setattr("services.impala_airtime.requests.post", fake_post)
+
+    assert client.get_payout_balance()["artm_balance"] == 1234.0
+    assert seen_tokens == ["Bearer stale-token", "Bearer fresh-token"]
+
+
+def test_session_call_gives_up_after_one_retry(monkeypatch):
+    client = ImpalaAirtimeClient()
+    client.merchant_id, client.username, client.password = "2540012", "u", "p"
+    client._session_token = "t"
+    calls = {"n": 0}
+
+    def fake_get(url, headers=None, timeout=None, **kw):
+        calls["n"] += 1
+        return FakeResponse(401, {"message": "no"})
+
+    monkeypatch.setattr("services.impala_airtime.requests.get", fake_get)
+    monkeypatch.setattr("services.impala_airtime.requests.post", lambda *a, **k: FakeResponse(200, {"token": "t2"}))
+    with pytest.raises(RuntimeError):
+        client.get_payout_balance()
+    assert calls["n"] == 2

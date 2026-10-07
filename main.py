@@ -21,6 +21,12 @@ try:
 except ImportError:
     celo_deposit_watcher_loop = None
 
+# IMC arriving at the treasury (a manual Comet mint), recorded from Transfer events
+try:
+    from workers.imc_receipt_watcher import imc_receipt_watcher_loop
+except ImportError:
+    imc_receipt_watcher_loop = None
+
 # Persistent Cardano per-user deposit detection (see workers/cardano_deposit_watcher.py)
 try:
     from workers.cardano_deposit_watcher import cardano_deposit_watcher_loop
@@ -47,7 +53,7 @@ from routes import (
     auth, dashboard, market_maker, trade, ramp,
     airtime_ledger, general_ledger, rates, tokens,
     cardano, treasury, retail, otc_admin, otc_merchant, swap_engine, valora, stellar,
-    imm_control, base_rate
+    imm_control, base_rate, impala_float, imc_receipts, imc_booking
 )
 from routes import realtime
 
@@ -63,6 +69,8 @@ async def lifespan(app: FastAPI):
     airtel_timeout_task = None
     celo_watcher_task = None
     celo_watcher_stop = None
+    imc_watcher_task = None
+    imc_watcher_stop = None
     cardano_watcher_task = None
     cardano_watcher_stop = None
     stellar_watcher_task = None
@@ -129,6 +137,12 @@ async def lifespan(app: FastAPI):
             celo_watcher_stop = asyncio.Event()
             celo_watcher_task = asyncio.create_task(celo_deposit_watcher_loop(db, celo_watcher_stop))
             print("✓ Celo Deposit Watcher Initiated")
+
+        # Start the IMC receipt watcher (records IMC transfers into the treasury)
+        if imc_receipt_watcher_loop:
+            imc_watcher_stop = asyncio.Event()
+            imc_watcher_task = asyncio.create_task(imc_receipt_watcher_loop(db, imc_watcher_stop))
+            print("✓ IMC Receipt Watcher Initiated")
 
         # Start the Cardano deposit watcher (real-time, per-user deposit detection)
         if cardano_deposit_watcher_loop:
@@ -235,6 +249,11 @@ async def lifespan(app: FastAPI):
         await celo_watcher_task
         print("✓ Celo Deposit Watcher safely stopped.")
 
+    if imc_watcher_task and imc_watcher_stop:
+        imc_watcher_stop.set()
+        await imc_watcher_task
+        print("✓ IMC Receipt Watcher safely stopped.")
+
     if cardano_watcher_task and cardano_watcher_stop:
         cardano_watcher_stop.set()
         await cardano_watcher_task
@@ -287,6 +306,9 @@ app.include_router(dashboard.router)
 app.include_router(market_maker.router)
 app.include_router(imm_control.router)
 app.include_router(base_rate.router)
+app.include_router(impala_float.router)
+app.include_router(imc_receipts.router)
+app.include_router(imc_booking.router)
 app.include_router(trade.router)
 app.include_router(ramp.router)
 app.include_router(ramp.callback_router)

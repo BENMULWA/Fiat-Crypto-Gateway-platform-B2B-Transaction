@@ -37,7 +37,15 @@ TERMINAL_STATES = {FSMState.COMPLETED.value, FSMState.HALTED.value}
 _active_tasks: dict[str, asyncio.Task] = {}
 
 
-async def start_corridor_run(db, corridor_id: str, amount_usd: float, started_by: Optional[str] = None) -> dict[str, Any]:
+MAX_CYCLES = 10
+PROCURE_MODES = {"stk", "existing_float"}
+SWAP_MODES = {"reserve", "pool"}
+
+
+async def start_corridor_run(
+    db, corridor_id: str, amount_usd: float, started_by: Optional[str] = None, cycles: int = 5,
+    procure_mode: str = "stk", swap_mode: str = "reserve", pool_max_slippage: float = 0.02,
+) -> dict[str, Any]:
     """Creates the persisted run record and launches its background task.
     Returns the run doc immediately — the caller does not wait for a
     single tick, let alone the whole run, to complete."""
@@ -50,6 +58,18 @@ async def start_corridor_run(db, corridor_id: str, amount_usd: float, started_by
         )
     if amount_usd <= 0:
         raise ValueError("Amount must be greater than zero.")
+    # cycles=1 runs procure -> liquidate -> mint -> exit once, with no rollover:
+    # the FSM goes straight to the exit when current_cycle >= max cycles.
+    if not isinstance(cycles, int) or isinstance(cycles, bool) or not 1 <= cycles <= MAX_CYCLES:
+        raise ValueError(f"Cycles must be a whole number from 1 to {MAX_CYCLES}.")
+
+    if procure_mode not in PROCURE_MODES:
+        raise ValueError(f"procure_mode must be one of {sorted(PROCURE_MODES)}.")
+
+    if isinstance(pool_max_slippage, bool) or not isinstance(pool_max_slippage, (int, float)) or not 0.001 <= pool_max_slippage <= 0.50:
+        raise ValueError("pool_max_slippage must be between 0.1% and 50%.")
+    if swap_mode not in SWAP_MODES:
+        raise ValueError(f"swap_mode must be one of {sorted(SWAP_MODES)}.")
 
     corridor = CORRIDORS[corridor_id]
     run_id = f"RUN-{corridor_id.upper()}-{int(datetime.utcnow().timestamp() * 1000)}"
@@ -59,7 +79,10 @@ async def start_corridor_run(db, corridor_id: str, amount_usd: float, started_by
         "_id": run_id,
         "corridorId": corridor_id,
         "config": {
-            "cycles": 5,
+            "cycles": cycles,
+            "procure_mode": procure_mode,
+            "swap_mode": swap_mode,
+            "pool_max_slippage": float(pool_max_slippage),
             "discount": corridor["discount"],
             "fx_edge": corridor["fx_edge"],
             "node_procure": corridor["node_procure"],
@@ -93,6 +116,85 @@ async def start_corridor_run(db, corridor_id: str, amount_usd: float, started_by
     task.add_done_callback(lambda t, rid=run_id: _active_tasks.pop(rid, None))
 
     return run_doc
+
+
+async def cancel_corridor_run(db, run_id: str, cancelled_by: Optional[str] = None) -> dict[str, Any]:
+    """Stops a run that is not finished and marks it HALTED, so it no longer holds the
+    float or resumes after a restart. This only stops FURTHER steps: anything the run already
+    did (an STK push, a mint, a swap) is real and is not reversed.
+
+    Raises LookupError for an unknown run and ValueError for one that already finished."""
+    run = await db[RUNS_COLLECTION].find_one({"_id": run_id})
+    if not run:
+        raise LookupError(f"Unknown corridor run ID: {run_id}")
+    if run.get("status") in TERMINAL_STATES:
+        raise ValueError(f"Run {run_id} has already finished ({run.get('status')}).")
+
+    # Stop the background task first and wait for it, so it cannot write another tick
+    # over the status we are about to set.
+    task = _active_tasks.get(run_id)
+    if task and not task.done():
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    try:
+        from services.imc_receipts import ImcReceipts
+        await ImcReceipts(db).release_run(run_id)  # free any IMC it had reserved but not booked
+    except Exception as e:  # never block a cancel on this
+        logger.warning("Could not release IMC reserved by %s: %s", run_id, e)
+
+    now = datetime.utcnow()
+    note = f"Cancelled by an operator while {run.get('status')} (cycle {run.get('currentCycle')})."
+    await db[RUNS_COLLECTION].update_one(
+        {"_id": run_id},
+        {"$set": {
+            "status": FSMState.HALTED.value, "haltReason": note,
+            "cancelledBy": cancelled_by, "cancelledAt": now, "updatedAt": now,
+            "pendingTopupExpectedKes": None, "pendingMintExpectedImc": None,
+        }},
+    )
+    return await db[RUNS_COLLECTION].find_one({"_id": run_id})
+
+
+async def retry_exit(db, run_id: str, requested_by: Optional[str] = None, balance_fn=None) -> dict[str, Any]:
+    """Resumes a pool run that stopped at its final withdrawal: the IMC was already sold for USDC, the USDC sits in
+    the engine's Comet wallet, and only the withdrawal to the exit wallet is left. Re-runs just that step.
+
+    Refuses unless the run is HALTED, has a recorded swap and no recorded withdrawal, and the engine wallet still
+    holds the USDC (so a withdrawal that did go through is never repeated).
+    Raises LookupError for an unknown run and ValueError for anything that cannot be retried."""
+    run = await db[RUNS_COLLECTION].find_one({"_id": run_id})
+    if not run:
+        raise LookupError(f"Unknown corridor run ID: {run_id}")
+    if run.get("status") != FSMState.HALTED.value:
+        raise ValueError(f"Run {run_id} is {run.get('status')}, not stopped. Only a stopped run can be retried.")
+    swap, config = run.get("swap"), run.get("config") or {}
+    if config.get("swap_mode") != "pool" or not swap or not swap.get("outAmount"):
+        raise ValueError("This run has no recorded pool swap, so there is no withdrawal to retry.")
+    if run.get("exit"):
+        raise ValueError("This run's withdrawal already went through.")
+    if run_id in _active_tasks and not _active_tasks[run_id].done():
+        raise ValueError("This run is still working.")
+
+    amount, wallet = float(swap["outAmount"]), swap.get("engineWallet")
+    if not wallet:
+        raise ValueError("The run did not record which wallet holds the USDC.")
+    if balance_fn is None:
+        from Brain_Engine.state_engine import _real_celo_token_balance_of as balance_fn
+    held = await asyncio.to_thread(balance_fn, str(swap.get("outSymbol") or "USDC"), wallet)
+    if held + 1e-6 < amount:
+        raise ValueError(f"The engine wallet holds {held:.6f} USDC but this run's withdrawal needs {amount:.6f}. It may already have been withdrawn.")
+
+    now = datetime.utcnow()
+    await db[RUNS_COLLECTION].update_one(
+        {"_id": run_id},
+        {"$set": {"status": FSMState.CELO_EXIT.value, "haltReason": None, "currentUsdPrincipal": amount,
+                  "exitSwapBooked": True, "exitRetriedBy": requested_by, "exitRetriedAt": now, "updatedAt": now}},
+    )
+    task = asyncio.create_task(_drive_run(db, run_id))
+    _active_tasks[run_id] = task
+    task.add_done_callback(lambda t, rid=run_id: _active_tasks.pop(rid, None))
+    return await db[RUNS_COLLECTION].find_one({"_id": run_id})
 
 
 async def get_run_status(db, run_id: str) -> Optional[dict[str, Any]]:
@@ -133,6 +235,7 @@ def _build_fsm(db, ledger: ImmutableLedger, run_doc: dict[str, Any]) -> HFTCorri
     # (whose custodial wallet turned out not to recognize a plain on-chain
     # deposit — see state_engine._execute_mint_comet's docstring).
     config["db"] = db
+    config["run_started_at"] = run_doc.get("createdAt")
     config["resume_cycle"] = run_doc["currentCycle"]
     config["resume_principal_usd"] = run_doc["currentUsdPrincipal"]
     config["resume_kes_float"] = run_doc.get("currentKesFloat", 0.0)
@@ -143,6 +246,9 @@ def _build_fsm(db, ledger: ImmutableLedger, run_doc: dict[str, Any]) -> HFTCorri
     # restores what a real on-chain balance poll is waiting to observe, so
     # a restart mid-wait resumes watching for the same mint rather than
     # losing track of it.
+    config["resume_swap_report"] = run_doc.get("swap")
+    config["resume_exit_swap_booked"] = bool(run_doc.get("exitSwapBooked"))
+    config["resume_exit_report"] = run_doc.get("exit")
     config["resume_pending_mint_expected_imc"] = run_doc.get("pendingMintExpectedImc")
     config["resume_pending_mint_external_id"] = run_doc.get("pendingMintExternalId")
     config["resume_pending_mint_treasury_imc_before"] = run_doc.get("pendingMintTreasuryImcBefore")
@@ -171,6 +277,10 @@ async def _persist_tick(db, run_id: str, bot: HFTCorridorFSM) -> None:
         "pendingTopupPayoutBalanceBefore": bot.pending_topup_payout_balance_before,
         "updatedAt": datetime.utcnow(),
     }
+    if bot.swap_report is not None:
+        update["swap"] = bot.swap_report
+    if bot.exit_report is not None:
+        update["exit"] = bot.exit_report
     if bot.state == FSMState.HALTED and bot.halt_reason:
         update["haltReason"] = bot.halt_reason
     if bot.state == FSMState.COMPLETED:

@@ -12,6 +12,7 @@ from Brain_Engine.risk_engine import is_rate_stale, rate_age_seconds, RATE_STALE
 from services.comet_client import CometClient
 from routes.auth import get_current_user_with_role, is_admin_role
 from routes.treasury import _read_celo_usdc_balance_sync
+from database import get_db
 
 
 router = APIRouter(prefix="/api/market-maker", tags=["Market Maker API"])
@@ -166,6 +167,150 @@ async def execute_comet_swap(
         "requestedBy": str(current_user.get("_id")),
         **result["data"],
     }
+
+@router.get("/pool-check")
+async def pool_check(
+    imc: float,
+    to_symbol: str = "USDC",
+    max_slippage: float = 0.02,
+    db=Depends(get_db),
+    current_user=Depends(get_current_user_with_role),
+):
+    """Read-only: would the Comet pool take `imc` IMC for `to_symbol` right now? Quotes the swap and reads the
+    pool's reserves (public on-chain figures, so any signed-in user may see them). For operators it also reports
+    whether the engine's Comet wallet already holds the IMC or would be topped up from the treasury. Nothing is
+    swapped or moved. The same 1-IMC-=-$1 guard the run enforces is applied."""
+    is_admin = is_admin_role(current_user.get("role"))
+    if imc <= 0:
+        raise HTTPException(status_code=400, detail="imc must be greater than zero.")
+    if to_symbol not in ("USDC", "USDT"):
+        raise HTTPException(status_code=400, detail="to_symbol must be USDC or USDT.")
+
+    from routes.valora import ASSET_CONTRACTS
+    from Brain_Engine.state_engine import _real_celo_imc_balance_of
+    from services.imc_receipts import ImcReceipts
+    import os
+
+    amount_base = comet.to_base_units(imc)
+
+    # pool reserves for IMC / to_symbol
+    pools = comet.list_amm_pools()
+    data = pools.get("data") if isinstance(pools, dict) else None
+    rows = data if isinstance(data, list) else (data or {}).get("pools", []) if isinstance(data, dict) else []
+    imc_addr, out_addr = ASSET_CONTRACTS["IMC"].lower(), ASSET_CONTRACTS[to_symbol].lower()
+    pool = {"pair": f"IMC/{to_symbol}", "seeded": False, "imcReserve": 0.0, "outReserve": 0.0, "price": None}
+    for p in rows:
+        t0, t1 = p["token0"].lower(), p["token1"].lower()
+        if {t0, t1} == {imc_addr, out_addr}:
+            r0, r1 = int(p["reserve0"]) / 1e6, int(p["reserve1"]) / 1e6
+            imc_r, out_r = (r0, r1) if t0 == imc_addr else (r1, r0)
+            pool.update(seeded=bool(imc_r and out_r), imcReserve=imc_r, outReserve=out_r, price=(out_r / imc_r if imc_r else None))
+
+    # quote
+    quote = {"ok": False, "out": None, "ratio": None, "slippage": None, "withinGuard": False, "guard": max_slippage, "error": None}
+    q = comet.get_amm_quote("IMC", to_symbol, amount_base)
+    if q.get("status") == "success":
+        out = comet.from_base_units(str(q["data"].get("amountOut", 0)))
+        if out > 0:
+            ratio = out / imc
+            quote.update(ok=True, out=out, ratio=ratio, slippage=1 - ratio, withinGuard=abs(ratio - 1.0) <= max_slippage)
+        else:
+            quote["error"] = "The pool quoted nothing."
+    else:
+        quote["error"] = str(q.get("message") or "No quote")
+
+    # engine wallet and master free IMC: operator-only information
+    engine = {"address": None, "imc": None, "error": None}
+    try:
+        if not is_admin:
+            raise PermissionError("operators only")
+        uid = os.getenv("COMET_TREASURY_USER_ID")
+        w = comet.get_or_create_wallet(str(uid))
+        addr = (w.get("data") or {}).get("address")
+        engine["address"] = addr
+        if addr:
+            engine["imc"] = await asyncio.to_thread(_real_celo_imc_balance_of, addr)
+    except PermissionError:
+        pass
+    except Exception as exc:
+        engine["error"] = str(exc)
+    free = None
+    if is_admin:
+        try:
+            free = (await ImcReceipts(db).free_imc())["free"]
+        except Exception:
+            pass
+    held = engine["imc"] or 0.0
+    shortfall = max(imc - held, 0.0)
+    return {
+        "status": "success", "imc": imc, "pool": pool, "quote": quote, "engineWallet": engine,
+        "masterFreeImc": free, "shortfall": shortfall,
+        "needsFunding": is_admin and shortfall > 1e-9, "canFund": (not is_admin) or (free is not None and free + 1e-9 >= shortfall),
+    }
+
+
+def _rebalance_deps(db):
+    """The real wiring: Comet's swap API, the treasury key for funding, and Celo for balances and receipts."""
+    import os
+    from routes.valora import ASSET_CONTRACTS
+    from routes.swap_engine import settle_crypto_on_celo
+    from routes.valora import get_treasury_address
+    from Brain_Engine.state_engine import _real_celo_token_balance_of, _real_swap_receipt
+    from services import pool_rebalance as pr
+
+    uid = os.getenv("COMET_TREASURY_USER_ID")
+    if not uid:
+        raise HTTPException(status_code=503, detail="COMET_TREASURY_USER_ID is not configured.")
+
+    async def fund(symbol, address, amount):
+        r = await settle_crypto_on_celo(address, symbol, amount)
+        if not r.get("success"):
+            raise RuntimeError(r.get("error", "Celo transfer failed"))
+        return r["tx_hash"]
+
+    return pr.Deps(
+        comet=comet, contracts={s: ASSET_CONTRACTS[s] for s in ("IMC", "USDC", "USDT") if s in ASSET_CONTRACTS},
+        balance_fn=_real_celo_token_balance_of, fund_fn=fund, receipt_fn=_real_swap_receipt,
+        user_id=uid, treasury_address=get_treasury_address(), db=db)
+
+
+class RebalanceRequest(BaseModel):
+    confirm: bool = False
+
+
+@router.get("/pool-rebalance")
+async def pool_rebalance_preview(db=Depends(get_db), current_user=Depends(get_current_user_with_role)):
+    """Read-only: the swaps that would bring every IMC pool back to $1, and anything that blocks them."""
+    _ensure_admin(current_user)
+    from services import pool_rebalance as pr
+    try:
+        return {"status": "success", **await pr.preview(_rebalance_deps(db))}
+    except pr.RebalanceError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@router.get("/pool-rebalance/job")
+async def pool_rebalance_job(current_user=Depends(get_current_user_with_role)):
+    """The newest rebalance job and its progress, for the console to follow. Read-only."""
+    _ensure_admin(current_user)
+    from services import pool_rebalance as pr
+    return {"status": "success", "job": pr.latest_job()}
+
+
+@router.post("/pool-rebalance", status_code=202)
+async def pool_rebalance_execute(req: RebalanceRequest, db=Depends(get_db), current_user=Depends(get_current_user_with_role)):
+    """Moves real funds: one swap per skewed IMC pool, in the opposite direction, to bring each back to $1.
+    Requires `confirm: true`. Refuses while a corridor run is open. Starts in the background and returns a job;
+    follow it with GET /pool-rebalance/job."""
+    _ensure_admin(current_user)
+    if not req.confirm:
+        raise HTTPException(status_code=400, detail="Send confirm: true to rebalance the pool.")
+    from services import pool_rebalance as pr
+    try:
+        return {"status": "started", "job": await pr.start(_rebalance_deps(db), requested_by=str(current_user.get("_id")))}
+    except pr.RebalanceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
 
 @router.get("/opportunities")
 async def get_dynamic_opportunities():

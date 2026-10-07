@@ -1,6 +1,7 @@
 import os
 import uuid
 import asyncio
+import math
 from enum import Enum
 from datetime import datetime
 from pydantic import BaseModel, Field
@@ -150,6 +151,77 @@ def _get_real_treasury_imc_balance() -> float:
     treasury_address = get_treasury_address()
     contract = celo_w3.eth.contract(address=ASSET_CONTRACTS["IMC"], abi=balance_abi)
     return float(contract.functions.balanceOf(treasury_address).call()) / (10 ** 6)
+
+def _real_celo_imc_balance_of(address: str) -> float:
+    """Real on-chain IMC balance of any Celo address (6 decimals)."""
+    from routes.valora import ASSET_CONTRACTS, w3 as celo_w3
+    abi = [{"constant": True, "inputs": [{"name": "account", "type": "address"}], "name": "balanceOf",
+            "outputs": [{"name": "", "type": "uint256"}], "type": "function"}]
+    contract = celo_w3.eth.contract(address=ASSET_CONTRACTS["IMC"], abi=abi)
+    return float(contract.functions.balanceOf(celo_w3.to_checksum_address(address)).call()) / (10 ** 6)
+
+
+def _real_celo_token_balance_of(symbol: str, address: str) -> float:
+    """Real on-chain balance of IMC, USDC or USDT (6 decimals) for any Celo address."""
+    from routes.valora import ASSET_CONTRACTS, w3 as celo_w3
+    if symbol not in ("IMC", "USDC", "USDT"):
+        raise ValueError(f"Unsupported token for a balance read: {symbol}")
+    abi = [{"constant": True, "inputs": [{"name": "account", "type": "address"}], "name": "balanceOf",
+            "outputs": [{"name": "", "type": "uint256"}], "type": "function"}]
+    contract = celo_w3.eth.contract(address=ASSET_CONTRACTS[symbol], abi=abi)
+    return float(contract.functions.balanceOf(celo_w3.to_checksum_address(address)).call()) / (10 ** 6)
+
+
+def _real_swap_receipt(tx_hash: str, out_symbol: str, attempts: int = 20, delay: float = 3.0):
+    """Reads a finished swap on Celo and returns what the pool really paid out.
+
+    Finds the pair contract that emitted a Swap event in the transaction, then adds up the `out_symbol`
+    transfers that came from that pair. Returns {"amount": float, "pair": address}, or None when the
+    transaction cannot be read, reverted, or paid nothing. Comet's own reply carries no amount."""
+    import time
+    from web3 import Web3
+    from routes.valora import ASSET_CONTRACTS, w3 as celo_w3
+
+    swap_topic = Web3.keccak(text="Swap(address,uint256,uint256,uint256,uint256,address)").hex().removeprefix("0x").lower()
+    transfer_topic = Web3.keccak(text="Transfer(address,address,uint256)").hex().removeprefix("0x").lower()
+    out_token = ASSET_CONTRACTS[out_symbol].lower().removeprefix("0x")
+    hx = lambda v: (v.hex() if hasattr(v, "hex") else str(v)).removeprefix("0x").lower()
+
+    receipt = None
+    for i in range(attempts):
+        try:
+            receipt = celo_w3.eth.get_transaction_receipt(tx_hash)
+            break
+        except Exception:
+            if i + 1 < attempts:
+                time.sleep(delay)
+    if receipt is None or receipt.get("status") != 1:
+        return None
+    logs = receipt.get("logs") or []
+    pairs = {hx(l["address"]) for l in logs if l["topics"] and hx(l["topics"][0]) == swap_topic}
+    total = 0
+    for l in logs:
+        if hx(l["address"]) != out_token or len(l["topics"]) < 3 or hx(l["topics"][0]) != transfer_topic:
+            continue
+        if hx(l["topics"][1])[-40:] in pairs:
+            total += int(hx(l["data"]) or "0", 16)
+    if total <= 0:
+        return None
+    return {"amount": total / 10 ** 6, "pair": "0x" + sorted(pairs)[0]}
+
+
+async def _real_fund_comet_wallet(address: str, amount_imc: float) -> str:
+    """Sends IMC from the treasury (master) wallet to the engine's Comet wallet: a real on-chain transfer,
+    the same mechanism as POST /api/treasury/master-wallet/withdraw. Returns the transaction hash."""
+    from routes.swap_engine import settle_crypto_on_celo
+    # settle_crypto_on_celo truncates amount * 1e6 to an integer: round up to a whole unit and nudge past float error,
+    # or the wallet can end up one unit short of what the swap needs.
+    amount_imc = math.ceil(round(amount_imc * 1e6, 4)) / 1e6 + 1e-9
+    result = await settle_crypto_on_celo(address, "IMC", amount_imc)
+    if not result.get("success"):
+        raise RuntimeError(result.get("error", "Celo transfer failed"))
+    return result["tx_hash"]
+
 
 # =====================================================================
 # 1. SCHEMAS & DATA MODELS
@@ -377,6 +449,28 @@ class HFTCorridorFSM:
         # mint_provider: "cardano" (default, _execute_mint / USDA vault) or
         # "comet" (_execute_mint_comet / real KES->IMC swap via Comet).
         self.MINT_PROVIDER = config.get("mint_provider", "cardano")
+        # procure_mode: "stk" (default) sends a fresh M-Pesa STK top-up each cycle;
+        # "existing_float" uses airtime float the reseller account already holds, so no
+        # STK push is sent and no paying phone is needed. The reseller commission was
+        # already captured when that float was topped up.
+        self.PROCURE_MODE = config.get("procure_mode", "stk")
+        # swap_mode: "reserve" (default) pays USDT out of the treasury reserve at the rate book's price and
+        # exits with a USDT -> USDC swap. "pool" sells the minted IMC for USDC in Comet's AMM pool from the
+        # engine's Comet wallet, then only withdraws the USDC at the exit.
+        self.SWAP_MODE = config.get("swap_mode", "reserve")
+        self.POOL_TO_SYMBOL = config.get("pool_to_symbol", "USDC")
+        self.POOL_MAX_SLIPPAGE = float(config.get("pool_max_slippage", 0.02))
+        self.POOL_FUND_POLL_ATTEMPTS = int(config.get("pool_fund_poll_attempts", 20))
+        self.POOL_FUND_POLL_SECONDS = float(config.get("pool_fund_poll_seconds", 3.0))
+        self._comet_wallet_imc_balance_fn = config.get("comet_wallet_imc_balance_fn", _real_celo_imc_balance_of)
+        self._fund_comet_wallet_fn = config.get("fund_comet_wallet_fn", _real_fund_comet_wallet)
+        self._swap_receipt_fn = config.get("swap_receipt_fn", _real_swap_receipt)
+        # What the pool swap really did, for the console: amounts, whether they were read from Celo, and the
+        # transaction hashes. Persisted with every tick and restored on resume.
+        self.swap_report = config.get("resume_swap_report")
+        # True when the exit is being retried after its withdrawal failed: the swap's ledger entry already exists.
+        self.exit_swap_booked = bool(config.get("resume_exit_swap_booked"))
+        self.exit_report = config.get("resume_exit_report")
         # exit_provider, checked before EXIT_CHAIN's native-chain dispatch:
         # "native" (default, today's _execute_celo_exit/_execute_stellar_exit),
         # "comet" (IMC->USDC via Comet's Celo AMM), or "kes" (real cash payout).
@@ -485,6 +579,16 @@ class HFTCorridorFSM:
         self._get_treasury_imc_balance_fn = config.get(
             "get_treasury_imc_balance_fn", _get_real_treasury_imc_balance
         )
+        # IMC received at the treasury, tracked from the chain's Transfer events
+        # (services/imc_receipts.py). When available, the manual-mint wait claims a
+        # specific incoming transfer instead of watching for a balance rise, which
+        # cannot see a mint that landed before the wait began. Without a database
+        # (simulations, some tests) the original balance-delta wait is used.
+        self.run_started_at = config.get("run_started_at")
+        self._receipts = config.get("imc_receipts")
+        if self._receipts is None and self._db is not None and not config.get("simulate", False):
+            from services.imc_receipts import ImcReceipts
+            self._receipts = ImcReceipts(self._db)
         # AWAITING_MANUAL_MINT state — populated by _execute_mint_comet when
         # Comet rejects a tenant-triggered tokenize, consumed/persisted by
         # _check_manual_mint and workers.corridor_worker. None outside that
@@ -614,6 +718,10 @@ class HFTCorridorFSM:
         """
         print(f"\n[CYCLE {self.current_cycle}] STATE 1: PROCURE via {self.NODE_PROCURE}")
 
+        if self.PROCURE_MODE == "existing_float":
+            await self._procure_from_existing_float()
+            return
+
         if not self.STK_PAYING_PHONE:
             self.halt_reason = f"No STK paying phone configured for {self.NODE_PROCURE}"
             print(f"  ↳ ❌ {self.halt_reason}")
@@ -692,7 +800,7 @@ class HFTCorridorFSM:
             # you pay Paybill 5600000 manually instead), the run picks it up
             # and continues on its own — see _check_manual_topup.
             print(f"  ↳ ⏸️  STK call failed ({e}). Pausing — top up manually "
-                  f"(Paybill 5600000, account {self.NODE_PROCURE}) or fix the "
+                  f"(Paybill 5600000, account = your ImpalaPay merchant ID, never a phone number or node id) or fix the "
                   f"configured phone number; this run will detect the real "
                   f"balance increase and continue automatically.")
             self.pending_topup_expected_kes = amount_to_pay_kes
@@ -735,6 +843,56 @@ class HFTCorridorFSM:
             return
 
         await self._finish_procure(airtime_value_kes, receipt_id=txn_id)
+
+    async def _procure_from_existing_float(self):
+        """PROCURE without an STK push: allocate airtime from the float the reseller account
+        already holds. The run's airtime value is amount * (1 + discount), exactly what an STK
+        top-up of that amount would have delivered, because that commission was captured when the
+        float was topped up.
+
+        The float is also the backing for every IMC already minted, so only the part that is not
+        already backing IMC may be used. Without that check, two runs could count the same float
+        twice. Fails closed: if the real float cannot be read, nothing is allocated."""
+        print(f"  ↳ Using airtime float already held (no STK push)")
+        try:
+            await check_daily_procurement_limit(
+                self.ledger, self.NODE_PROCURE, self.current_usd_principal, TransactionType.PROCURE
+            )
+            await check_min_balance(self.ledger, self.NODE_MINT, self.current_usd_principal)
+        except RiskLimitExceeded as e:
+            self.halt_reason = f"RISK LIMIT: {e}"
+            print(f"  ↳ 🛑 {self.halt_reason}")
+            self.state = FSMState.HALTED
+            return
+
+        amount_kes = self.current_usd_principal * self.BASE_RATE
+        airtime_value_kes = amount_kes * (1 + self.DISCOUNT)
+
+        try:
+            balance = await asyncio.to_thread(self._get_payout_balance_fn)
+            real_float_kes = balance["artm_balance"]
+        except Exception as e:
+            self.halt_reason = f"Could not read the real ImpalaPay float — refusing to allocate it blind: {e}"
+            print(f"  ↳ 🛑 {self.halt_reason}")
+            self.state = FSMState.HALTED
+            return
+
+        already_backed_imc = await self.ledger.get_vault_backed_total(self.NODE_MINT, "IMC")
+        already_backed_kes = already_backed_imc * self.INTERNAL_FX_RATE
+        available_kes = real_float_kes - already_backed_kes
+        if airtime_value_kes > available_kes:
+            self.halt_reason = (
+                f"Not enough free airtime float: this run needs {airtime_value_kes:,.2f} KES, but of the "
+                f"{real_float_kes:,.2f} KES float, {already_backed_kes:,.2f} KES already backs minted IMC, "
+                f"leaving {max(available_kes, 0):,.2f} KES. Top up the float or use a smaller amount."
+            )
+            print(f"  ↳ 🛑 {self.halt_reason}")
+            self.state = FSMState.HALTED
+            return
+
+        print(f"  ↳ ✅ Allocated {airtime_value_kes:,.2f} KES of the {real_float_kes:,.2f} KES float "
+              f"({already_backed_kes:,.2f} KES already backs IMC)")
+        await self._finish_procure(airtime_value_kes, receipt_id=f"FLOAT-{self.run_id}-C{self.current_cycle}")
 
     async def _check_manual_topup(self):
         """Polls the real ImpalaPay payout balance while paused in
@@ -1009,7 +1167,50 @@ class HFTCorridorFSM:
 
         await self._finish_mint_with_internal_swap(new_imc_amount, profit)
 
+    async def _check_manual_mint_via_receipts(self):
+        """Waits for a specific incoming IMC transfer: one an operator attached by hash (already
+        reserved for this run), or the oldest unclaimed one within +/-1% of the expected amount that
+        arrived after the run started. The chain is scanned each tick, so detection does not depend on
+        any background process being up."""
+        expected = self.pending_mint_expected_imc or 0.0
+        try:
+            await self._receipts.scan()
+        except Exception as e:
+            print(f"  ↳ ⚠️  Could not scan Celo for IMC transfers ({e}); checking what is already recorded")
+        try:
+            rec = await self._receipts.find_for_run(self.run_id, expected, self.run_started_at)
+        except Exception as e:
+            print(f"  ↳ ⚠️  Could not read the IMC receipts ({e}); retrying in {self._poll_seconds:.0f}s")
+            await asyncio.sleep(self._poll_seconds)
+            return
+
+        if rec is None:
+            print(f"[CYCLE {self.current_cycle}] STATE 3b: AWAITING MANUAL MINT — expecting ~{expected:,.6f} IMC "
+                  f"(±1%) into the treasury; re-checking in {self._poll_seconds:.0f}s")
+            await asyncio.sleep(self._poll_seconds)
+            return
+
+        new_imc_amount = float(rec["amountImc"])
+        profit = new_imc_amount - self.current_usd_principal
+        print(f"  ↳ ✅ IMC receipt claimed: {new_imc_amount:,.6f} IMC in tx {rec['txHash']}. Profit: {profit:+,.4f}")
+
+        await self.ledger.append(LedgerEntry(
+            from_node=self.NODE_LIQ, to_node=self.NODE_MINT, asset="IMC",
+            amount=new_imc_amount, internal_usd_value=new_imc_amount,
+            txn_type=TransactionType.MINT, cycle=self.current_cycle,
+            external_ref=rec["txHash"], vault_backed=True,
+        ))
+        await self._receipts.mark_consumed(rec["_id"])
+
+        self.pending_mint_expected_imc = None
+        self.pending_mint_external_id = None
+        self.pending_mint_treasury_imc_before = None
+        await self._finish_mint_with_internal_swap(new_imc_amount, profit)
+
     async def _check_manual_mint(self):
+        if self._receipts is not None:
+            await self._check_manual_mint_via_receipts()
+            return
         """Polls the treasury's real on-chain IMC balance while paused in
         AWAITING_MANUAL_MINT, waiting for someone to mint the expected
         amount through Comet's dashboard directly (the only path Comet
@@ -1052,12 +1253,169 @@ class HFTCorridorFSM:
 
         await self._finish_mint_with_internal_swap(new_imc_amount, profit)
 
+    async def _finish_mint_with_pool_swap(self, new_imc_amount: float, profit: float):
+        """Sells the minted IMC for USDC in Comet's AMM pool, from the engine's Comet wallet.
+
+        Order matters, and the irreversible part comes last:
+          1. find the engine's Comet wallet;
+          2. quote the swap (read-only) and refuse a pool whose price is more than POOL_MAX_SLIPPAGE
+             from $1, so a thin or mispriced pool halts BEFORE any IMC moves;
+          3. top the wallet up with the IMC it needs from the treasury wallet (only the shortfall, so a
+             retry never sends twice) and wait for it to be visible on-chain;
+          4. execute the swap.
+        The USDC then stays in Comet's custody until the exit withdraws it. If anything fails, the IMC is
+        still in the treasury or the engine wallet, never lost."""
+        if self.COMET_USER_ID is None:
+            self.halt_reason = "No Comet treasury user id configured — refusing to swap under an arbitrary account (IMC mint already settled)."
+            print(f"  ↳ 🛑 {self.halt_reason}")
+            self.state = FSMState.HALTED
+            return
+
+        out_symbol = self.POOL_TO_SYMBOL
+        pair = f"IMC/{out_symbol}"
+        principal_before = self.current_usd_principal
+
+        # 1. the engine's Comet wallet
+        try:
+            wallet = await asyncio.to_thread(self._comet.get_or_create_wallet, str(self.COMET_USER_ID))
+            address = (wallet.get("data") or {}).get("address")
+            if wallet.get("status") != "success" or not address:
+                raise RuntimeError(wallet.get("message") or "Comet returned no wallet address")
+        except Exception as e:
+            self.halt_reason = f"Could not find the engine's Comet wallet (IMC mint already settled): {e}"
+            print(f"  ↳ 🛑 {self.halt_reason}")
+            self.state = FSMState.HALTED
+            return
+
+        # 2. quote first: nothing has moved yet
+        amount_base = self._comet.to_base_units(new_imc_amount)
+        try:
+            quote = await asyncio.to_thread(self._comet.get_amm_quote, "IMC", out_symbol, amount_base)
+        except Exception as e:
+            self.halt_reason = f"Could not quote the {pair} pool (IMC mint already settled): {e}"
+            print(f"  ↳ 🛑 {self.halt_reason}")
+            self.state = FSMState.HALTED
+            return
+        if quote.get("status") != "success":
+            self.halt_reason = f"The {pair} pool gave no quote — it may be empty (IMC mint already settled): {quote.get('message')}"
+            print(f"  ↳ 🛑 {self.halt_reason}")
+            self.state = FSMState.HALTED
+            return
+        quoted_out = self._comet.from_base_units(str(quote.get("data", {}).get("amountOut", 0)))
+        if quoted_out <= 0:
+            self.halt_reason = f"The {pair} pool quoted nothing for {new_imc_amount:,.6f} IMC (IMC mint already settled)."
+            print(f"  ↳ 🛑 {self.halt_reason}")
+            self.state = FSMState.HALTED
+            return
+        try:
+            check_swap_slippage(new_imc_amount, quoted_out, expected_rate=1.0, pair_label=pair,
+                                max_deviation_pct=self.POOL_MAX_SLIPPAGE)
+        except RiskLimitExceeded as e:
+            self.halt_reason = f"RISK LIMIT: {e} — the IMC stays in the treasury (IMC mint already settled)."
+            print(f"  ↳ 🛑 {self.halt_reason}")
+            self.state = FSMState.HALTED
+            return
+
+        # 3. make sure the engine wallet holds the IMC it is about to sell
+        try:
+            held = await asyncio.to_thread(self._comet_wallet_imc_balance_fn, address)
+        except Exception as e:
+            self.halt_reason = f"Could not read the engine wallet's IMC balance (IMC mint already settled): {e}"
+            print(f"  ↳ 🛑 {self.halt_reason}")
+            self.state = FSMState.HALTED
+            return
+        if held + 1e-9 < new_imc_amount:
+            shortfall = new_imc_amount - held
+            try:
+                fund_tx = await self._fund_comet_wallet_fn(address, shortfall)
+            except Exception as e:
+                self.halt_reason = f"Could not move {shortfall:,.6f} IMC to the engine's Comet wallet (IMC stays in the treasury): {e}"
+                print(f"  ↳ 🛑 {self.halt_reason}")
+                self.state = FSMState.HALTED
+                return
+            print(f"  ↳ Sent {shortfall:,.6f} IMC to the engine's Comet wallet (tx {fund_tx})")
+            await self.ledger.append(LedgerEntry(
+                from_node=self.NODE_MINT, to_node="COMET_WALLET", asset="IMC",
+                amount=shortfall, internal_usd_value=shortfall,
+                txn_type=TransactionType.TRANSFER, cycle=self.current_cycle, external_ref=fund_tx,
+            ))
+            for _ in range(self.POOL_FUND_POLL_ATTEMPTS):
+                await asyncio.sleep(self.POOL_FUND_POLL_SECONDS)
+                try:
+                    held = await asyncio.to_thread(self._comet_wallet_imc_balance_fn, address)
+                except Exception:
+                    continue
+                if held + 1e-9 >= new_imc_amount:
+                    break
+            else:
+                self.halt_reason = (f"Sent IMC to the engine wallet (tx {fund_tx}) but it is not visible there yet. "
+                                    "It is not lost; retry once it shows on-chain.")
+                print(f"  ↳ 🛑 {self.halt_reason}")
+                self.state = FSMState.HALTED
+                return
+
+        # 4. the swap itself
+        try:
+            result = await asyncio.to_thread(
+                self._comet.execute_amm_swap,
+                external_user_id=str(self.COMET_USER_ID), from_symbol="IMC", to_symbol=out_symbol, amount_in=amount_base,
+            )
+        except Exception as e:
+            self.halt_reason = f"Comet AMM swap ({pair}) failed — the IMC is in the engine wallet, not lost: {e}"
+            print(f"  ↳ ❌ {self.halt_reason}")
+            self.state = FSMState.HALTED
+            return
+        if result.get("status") != "success":
+            self.halt_reason = f"Comet rejected the {pair} swap — the IMC is in the engine wallet, not lost: {result.get('message')}"
+            print(f"  ↳ 🛑 {self.halt_reason}")
+            self.state = FSMState.HALTED
+            return
+
+        tx_hash = result.get("data", {}).get("txHash")
+        # Comet's reply carries no amount, so read what the pool really paid out from the transaction on Celo.
+        # If Celo cannot be read, fall back to the quote and say so: it is then an estimate.
+        confirmed = None
+        if tx_hash:
+            try:
+                confirmed = await asyncio.to_thread(self._swap_receipt_fn, tx_hash, out_symbol)
+            except Exception as e:
+                print(f"  ↳ ⚠️  Could not read swap tx {tx_hash} on Celo: {e}")
+        out_amount = confirmed["amount"] if confirmed else quoted_out
+        self.swap_report = {
+            "inImc": new_imc_amount, "outSymbol": out_symbol, "outAmount": out_amount, "quotedOut": quoted_out,
+            "confirmed": bool(confirmed), "txHash": tx_hash, "pair": (confirmed or {}).get("pair"), "engineWallet": address,
+        }
+        print(f"  ↳ 🔁 Sold {new_imc_amount:,.6f} IMC for {out_amount:,.6f} {out_symbol} in the pool "
+              f"({'confirmed on Celo' if confirmed else 'estimate from the quote'}; tx {tx_hash}).")
+
+        await self.ledger.append(LedgerEntry(
+            from_node=self.NODE_MINT, to_node="AMM", asset="IMC",
+            amount=new_imc_amount, internal_usd_value=new_imc_amount,
+            txn_type=TransactionType.TRANSFER, cycle=self.current_cycle, external_ref=tx_hash,
+        ))
+        await self.ledger.append(LedgerEntry(
+            from_node="AMM", to_node=self.NODE_MINT, asset=out_symbol,
+            amount=out_amount, internal_usd_value=out_amount,
+            txn_type=TransactionType.TRANSFER, cycle=self.current_cycle, external_ref=tx_hash,
+        ))
+
+        # Realised result of this cycle, after the pool's fee and price impact.
+        realised = out_amount - principal_before
+        self.last_cycle_pnl_usd = realised
+        self.cumulative_pnl_usd += realised
+        self.current_usd_principal = out_amount
+        await self._transition_to(FSMState.ROLLOVER)
+
     async def _finish_mint_with_internal_swap(self, new_imc_amount: float, profit: float):
         """Shared tail end of both the direct-tokenize path
         (_execute_mint_comet) and the manual-mint path (_check_manual_mint):
         convert freshly-minted IMC to USDT internally, priced off the
         real treasury rate book retail swaps use, and hand off to ROLLOVER.
         """
+        if self.SWAP_MODE == "pool":
+            await self._finish_mint_with_pool_swap(new_imc_amount, profit)
+            return
+
         # Convert the freshly-minted IMC to USDT INTERNALLY, priced off the
         # same treasury rate book retail swaps use
         # (routes.swap_engine.calculate_backend_rate), rather than through
@@ -1241,6 +1599,62 @@ class HFTCorridorFSM:
         else:
             await self._execute_celo_exit()
 
+    async def _comet_usdt_to_usdc_swap(self):
+        """USDT -> USDC on Comet's Celo AMM: the original exit swap, unchanged, moved here so the pool
+        mode can skip it. Returns (usdc_received, tx_hash), or None after halting the run."""
+        amount_base = self._comet.to_base_units(self.current_usd_principal)
+
+        try:
+            quote = await asyncio.to_thread(self._comet.get_amm_quote, "USDT", "USDC", amount_base)
+        except Exception as e:
+            self.halt_reason = f"Could not fetch Comet AMM quote before exit — refusing to swap blind: {e}"
+            print(f"  ↳ 🛑 {self.halt_reason}")
+            self.state = FSMState.HALTED
+            return
+        if quote.get("status") != "success":
+            self.halt_reason = f"Comet AMM quote failed: {quote.get('message')}"
+            print(f"  ↳ 🛑 {self.halt_reason}")
+            self.state = FSMState.HALTED
+            return
+        quoted_usdc = self._comet.from_base_units(str(quote.get("data", {}).get("amountOut", 0)))
+        if quoted_usdc <= 0:
+            self.halt_reason = f"Comet AMM quote returned no usable amountOut: {quote.get('data')}"
+            print(f"  ↳ 🛑 {self.halt_reason}")
+            self.state = FSMState.HALTED
+            return
+
+        # Same slippage/price-sanity guard as the mint-side IMC->USDT swap:
+        # both legs of this pair are meant to track $1.
+        try:
+            check_swap_slippage(self.current_usd_principal, quoted_usdc, expected_rate=1.0, pair_label="USDT/USDC")
+        except RiskLimitExceeded as e:
+            self.halt_reason = f"RISK LIMIT: {e}"
+            print(f"  ↳ 🛑 {self.halt_reason}")
+            self.state = FSMState.HALTED
+            return
+
+        try:
+            result = await asyncio.to_thread(
+                self._comet.execute_amm_swap,
+                external_user_id=str(self.COMET_USER_ID),
+                from_symbol="USDT", to_symbol="USDC", amount_in=amount_base,
+            )
+        except Exception as e:
+            self.halt_reason = f"Comet AMM swap (USDT->USDC) failed: {e}"
+            print(f"  ↳ ❌ {self.halt_reason}")
+            self.state = FSMState.HALTED
+            return
+        if result.get("status") != "success":
+            self.halt_reason = f"Comet rejected the USDT->USDC exit: {result.get('message')}"
+            print(f"  ↳ 🛑 {self.halt_reason}")
+            self.state = FSMState.HALTED
+            return
+
+        data = result.get("data", {})
+        tx_hash = data.get("txHash")
+        usdc_received = quoted_usdc  # execute's own response doesn't echo amountOut per the docs — see docstring
+        return usdc_received, tx_hash
+
     async def _execute_comet_exit(self):
         """USDT -> USDC via Comet's real Celo AMM (POST /api/v1/swap/tokens
         — docs.mamlakapsp.com/api/amm.html), NOT the IMM swap endpoint.
@@ -1285,65 +1699,24 @@ class HFTCorridorFSM:
             self.state = FSMState.HALTED
             return
 
-        amount_base = self._comet.to_base_units(self.current_usd_principal)
-
-        try:
-            quote = await asyncio.to_thread(self._comet.get_amm_quote, "USDT", "USDC", amount_base)
-        except Exception as e:
-            self.halt_reason = f"Could not fetch Comet AMM quote before exit — refusing to swap blind: {e}"
-            print(f"  ↳ 🛑 {self.halt_reason}")
-            self.state = FSMState.HALTED
-            return
-        if quote.get("status") != "success":
-            self.halt_reason = f"Comet AMM quote failed: {quote.get('message')}"
-            print(f"  ↳ 🛑 {self.halt_reason}")
-            self.state = FSMState.HALTED
-            return
-        quoted_usdc = self._comet.from_base_units(str(quote.get("data", {}).get("amountOut", 0)))
-        if quoted_usdc <= 0:
-            self.halt_reason = f"Comet AMM quote returned no usable amountOut: {quote.get('data')}"
-            print(f"  ↳ 🛑 {self.halt_reason}")
-            self.state = FSMState.HALTED
-            return
-
-        # Same slippage/price-sanity guard as the mint-side IMC->USDT swap:
-        # both legs of this pair are meant to track $1.
-        try:
-            check_swap_slippage(self.current_usd_principal, quoted_usdc, expected_rate=1.0, pair_label="USDT/USDC")
-        except RiskLimitExceeded as e:
-            self.halt_reason = f"RISK LIMIT: {e}"
-            print(f"  ↳ 🛑 {self.halt_reason}")
-            self.state = FSMState.HALTED
-            return
-
         external_id = f"EXIT-{self.run_id}-C{self.current_cycle}"
-        try:
-            result = await asyncio.to_thread(
-                self._comet.execute_amm_swap,
-                external_user_id=str(self.COMET_USER_ID),
-                from_symbol="USDT", to_symbol="USDC", amount_in=amount_base,
-            )
-        except Exception as e:
-            self.halt_reason = f"Comet AMM swap (USDT->USDC) failed: {e}"
-            print(f"  ↳ ❌ {self.halt_reason}")
-            self.state = FSMState.HALTED
-            return
-        if result.get("status") != "success":
-            self.halt_reason = f"Comet rejected the USDT->USDC exit: {result.get('message')}"
-            print(f"  ↳ 🛑 {self.halt_reason}")
-            self.state = FSMState.HALTED
-            return
+        if self.SWAP_MODE == "pool":
+            # The IMC was already swapped into USDC in the pool, and that USDC sits in Comet's custody.
+            # Only the withdrawal to the exit wallet remains.
+            usdc_received, tx_hash = self.current_usd_principal, None
+        else:
+            swapped = await self._comet_usdt_to_usdc_swap()
+            if swapped is None:
+                return
+            usdc_received, tx_hash = swapped
 
-        data = result.get("data", {})
-        tx_hash = data.get("txHash")
-        usdc_received = quoted_usdc  # execute's own response doesn't echo amountOut per the docs — see docstring
-
-        await self.ledger.append(LedgerEntry(
-            from_node=self.NODE_MINT, to_node=self.NODE_EXIT, asset="USDC",
-            amount=usdc_received, internal_usd_value=usdc_received,
-            txn_type=TransactionType.CELO_EXIT, cycle=self.current_cycle,
-            external_ref=tx_hash or external_id,
-        ))
+        if not self.exit_swap_booked:
+            await self.ledger.append(LedgerEntry(
+                from_node=self.NODE_MINT, to_node=self.NODE_EXIT, asset="USDC",
+                amount=usdc_received, internal_usd_value=usdc_received,
+                txn_type=TransactionType.CELO_EXIT, cycle=self.current_cycle,
+                external_ref=tx_hash or external_id,
+            ))
         print(f"  ↳ 🚀 Swapped to {usdc_received:,.4f} USDC inside Comet's custodial wallet (tx {tx_hash}).")
 
         # The swap alone only settles inside Comet's own custody for this
@@ -1378,6 +1751,7 @@ class HFTCorridorFSM:
             return
 
         withdraw_tx_hash = send_result.get("data", {}).get("txHash")
+        self.exit_report = {"txHash": withdraw_tx_hash, "to": self.COMET_EXIT_ADDRESS, "amount": usdc_received, "symbol": "USDC"}
         await self.ledger.append(LedgerEntry(
             from_node=self.NODE_EXIT, to_node=self.NODE_EXIT, asset="USDC",
             amount=usdc_received, internal_usd_value=usdc_received,

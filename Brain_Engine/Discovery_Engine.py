@@ -38,8 +38,8 @@ class IMMDiscoveryEngine:
         fee_pct: float = 0.0,
     ) -> Dict[str, Any]:
         """
-        Projects the exact mathematical multiplier for a corridor based on
-        the UI state parameters (e.g., 6% Discount, 0% FX Edge).
+        Projects the mathematical multiplier for a corridor from its reseller
+        discount (a linear top-up markup) and its FX edge.
 
         slippage_pct/fee_pct default to 0.0 (today's unchanged behavior for
         every existing caller) but let a caller that DOES have a real AMM
@@ -50,7 +50,13 @@ class IMMDiscoveryEngine:
         projection until now.
         """
         # Step 1: Procurement Edge (The Yield)
-        procurement_multiplier = 1 / (1 - discount_rate)
+        # The reseller discount is a LINEAR markup on the top-up: confirmed live
+        # against the ImpalaPay reseller API, a 500 KES top-up returned 525 KES of
+        # float, i.e. amount * (1 + discount). The earlier 1 / (1 - discount) form
+        # overstated every cycle (5.26% instead of 5.00% at a 5% discount) and
+        # compounded that error across cycles. If a provider ever sells airtime at
+        # a true price-below-face discount instead, that is a different formula.
+        procurement_multiplier = 1 + discount_rate
 
         # Step 2: Internal Mint Edge (The Spread)
         mint_multiplier = 1 / (1 - fx_edge_pct)

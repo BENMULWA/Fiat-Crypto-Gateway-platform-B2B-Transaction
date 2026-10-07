@@ -2423,6 +2423,15 @@ async def credit_institutional_wallet(user_id: str, payload: dict, db=Depends(ge
 async def get_customers_list(db=Depends(get_db), current_user: dict = Depends(get_current_user_with_role)):
     ensure_admin(current_user)
     users = await db["users"].find().sort("createdAt", -1).limit(100).to_list(100)
+    # Institutional merchants are approved through institutional_profiles
+    # (onboardingStatus), not users.kycStatus, so show their real KYB state here.
+    inst_status = {
+        p["userId"]: p.get("onboardingStatus")
+        async for p in db["institutional_profiles"].find(
+            {"userId": {"$in": [str(u["_id"]) for u in users]}}, {"userId": 1, "onboardingStatus": 1}
+        )
+    }
+    inst_kyc_map = {"approved": "verified", "under_review": "pending", "rejected": "rejected", "not_started": "unverified"}
     customers = []
     for u in users:
         wallet = await db["retail_wallets"].find_one({"userId": {"$in": build_user_id_candidates(u["_id"])}})
@@ -2459,7 +2468,8 @@ async def get_customers_list(db=Depends(get_db), current_user: dict = Depends(ge
             },
             "kycSubmittedAt": kyc_date_iso,
             "joinedAt": joined_at_iso,
-            "kyc": u.get("kycStatus", "unverified").lower(),
+            "accountType": "institutional" if str(u["_id"]) in inst_status else "individual",
+            "kyc": inst_kyc_map.get(inst_status.get(str(u["_id"]), ""), u.get("kycStatus", "unverified").lower()),
             "risk": "low" if total_vol < 100000 else "high",
             "volume": f"KES {total_vol:,.0f}",
             "status": u.get("accountStatus", u.get("status", "active")),
