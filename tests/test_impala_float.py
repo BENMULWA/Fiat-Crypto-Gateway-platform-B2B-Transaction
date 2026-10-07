@@ -34,6 +34,8 @@ def _match(doc, query):
                 return False
             if "$nin" in cond and v in cond["$nin"]:
                 return False
+            if "$exists" in cond and (k in doc) != bool(cond["$exists"]):
+                return False
         elif v != cond:
             return False
     return True
@@ -181,6 +183,13 @@ def test_start_refuses_while_a_corridor_run_is_in_flight():
     with pytest.raises(svc.TopupConflict, match="RUN-1"):
         start(db, c)
     assert c.sent == []
+
+
+def test_a_cancelled_run_does_not_block_a_topup_even_if_its_status_was_rewritten():
+    """2026-10-07: a stray worker on another server kept writing AWAITING_MANUAL_MINT over a cancelled run."""
+    db, c = DB(), FakeClient()
+    run(db["corridor_runs"].insert_one({"_id": "RUN-9", "status": "AWAITING_MANUAL_MINT", "cancelledAt": "2026-10-07T11:09:13"}))
+    assert start(db, c)["status"] == "PENDING" and len(c.sent) == 1
 
 
 def test_a_finished_run_does_not_block_a_topup():

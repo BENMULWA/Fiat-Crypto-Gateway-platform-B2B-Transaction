@@ -6,6 +6,7 @@ from pydantic import BaseModel
 
 from database import get_db
 from routes.auth import get_current_user_with_role, is_admin_role
+from workers.corridor_worker import effective_run
 from services.imc_receipts import AttachError, HeldError, ImcReceipts
 
 router = APIRouter(prefix="/api/imm/imc", tags=["IMC Receipts"])
@@ -48,7 +49,7 @@ async def allocate_held(req: HeldRequest, db=Depends(get_db), current_user=Depen
     exactly the run's expected amount, and only from IMC no other run has used. For testing the flow end
     to end without a new mint."""
     _admin(current_user)
-    run = await db["corridor_runs"].find_one({"_id": req.run_id})
+    run = effective_run(await db["corridor_runs"].find_one({"_id": req.run_id}))   # a cancelled run is not waiting for IMC
     if not run:
         raise HTTPException(status_code=404, detail="Unknown corridor run ID")
     if run.get("status") != "AWAITING_MANUAL_MINT":
@@ -71,7 +72,7 @@ async def attach_mint(req: AttachRequest, db=Depends(get_db), current_user=Depen
     """Reserve an on-chain IMC transfer for a run that is waiting for its manual mint. The transaction is
     verified on Celo first; its amount must match what the run expects (within 1%)."""
     _admin(current_user)
-    run = await db["corridor_runs"].find_one({"_id": req.run_id})
+    run = effective_run(await db["corridor_runs"].find_one({"_id": req.run_id}))   # a cancelled run is not waiting for IMC
     if not run:
         raise HTTPException(status_code=404, detail="Unknown corridor run ID")
     if run.get("status") != "AWAITING_MANUAL_MINT":

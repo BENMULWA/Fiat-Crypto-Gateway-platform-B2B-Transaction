@@ -21,10 +21,11 @@ from __future__ import annotations
 
 import logging
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import asyncio
+import uuid
 
 from Brain_Engine.node_registry import CORRIDORS, corridor_eligible
 from Brain_Engine.state_engine import HFTCorridorFSM, ImmutableLedger, FSMState
@@ -33,6 +34,13 @@ logger = logging.getLogger("treasury.corridor_worker")
 
 RUNS_COLLECTION = "corridor_runs"
 TERMINAL_STATES = {FSMState.COMPLETED.value, FSMState.HALTED.value}
+
+# Who drives a run. The database is shared by every server that has this .env (a second machine, a leftover terminal),
+# and two servers driving one real-money run could both swap or mint. A run is claimed by one server at a time: the
+# owner stamps a heartbeat on every step, and another server may only take it over once that heartbeat has gone stale.
+PROCESS_ID = uuid.uuid4().hex
+LEASE_SECONDS = 180
+LEASE_RETRY_SECONDS = 15
 
 _active_tasks: dict[str, asyncio.Task] = {}
 
@@ -130,12 +138,18 @@ async def cancel_corridor_run(db, run_id: str, cancelled_by: Optional[str] = Non
     if run.get("status") in TERMINAL_STATES:
         raise ValueError(f"Run {run_id} has already finished ({run.get('status')}).")
 
-    # Stop the background task first and wait for it, so it cannot write another tick
-    # over the status we are about to set.
+    # Record the cancel FIRST. Any worker still alive for this run (this process's task, or one that survived a
+    # reload) sees it before its next step and stops, and its status writes are refused from now on.
+    stamp = datetime.utcnow()
+    await db[RUNS_COLLECTION].update_one({"_id": run_id}, {"$set": {"cancelledAt": stamp, "cancelledBy": cancelled_by}})
+
+    # Then stop the background task and wait for it.
     task = _active_tasks.get(run_id)
     if task and not task.done():
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+    else:
+        logger.warning("Cancelling %s: this process has no live task for it. Another worker may still be driving it; it will stop at its next step.", run_id)
 
     try:
         from services.imc_receipts import ImcReceipts
@@ -153,7 +167,7 @@ async def cancel_corridor_run(db, run_id: str, cancelled_by: Optional[str] = Non
             "pendingTopupExpectedKes": None, "pendingMintExpectedImc": None,
         }},
     )
-    return await db[RUNS_COLLECTION].find_one({"_id": run_id})
+    return effective_run(await db[RUNS_COLLECTION].find_one({"_id": run_id}))
 
 
 async def retry_exit(db, run_id: str, requested_by: Optional[str] = None, balance_fn=None) -> dict[str, Any]:
@@ -189,21 +203,30 @@ async def retry_exit(db, run_id: str, requested_by: Optional[str] = None, balanc
     await db[RUNS_COLLECTION].update_one(
         {"_id": run_id},
         {"$set": {"status": FSMState.CELO_EXIT.value, "haltReason": None, "currentUsdPrincipal": amount,
-                  "exitSwapBooked": True, "exitRetriedBy": requested_by, "exitRetriedAt": now, "updatedAt": now}},
+                  "exitSwapBooked": True, "exitRetriedBy": requested_by, "exitRetriedAt": now, "updatedAt": now},
+         "$unset": {"cancelledAt": "", "cancelledBy": ""}},
     )
     task = asyncio.create_task(_drive_run(db, run_id))
     _active_tasks[run_id] = task
     task.add_done_callback(lambda t, rid=run_id: _active_tasks.pop(rid, None))
-    return await db[RUNS_COLLECTION].find_one({"_id": run_id})
+    return effective_run(await db[RUNS_COLLECTION].find_one({"_id": run_id}))
+
+
+def effective_run(doc: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """What the console should believe about a run. A run an operator cancelled is cancelled, whatever status a stray
+    worker on another server wrote back over it afterwards."""
+    if doc and doc.get("cancelledAt") and doc.get("status") not in TERMINAL_STATES:
+        return {**doc, "status": FSMState.HALTED.value, "haltReason": doc.get("haltReason") or "Cancelled by an operator."}
+    return doc
 
 
 async def get_run_status(db, run_id: str) -> Optional[dict[str, Any]]:
-    return await db[RUNS_COLLECTION].find_one({"_id": run_id})
+    return effective_run(await db[RUNS_COLLECTION].find_one({"_id": run_id}))
 
 
 async def list_runs(db, limit: int = 25) -> list[dict[str, Any]]:
     cursor = db[RUNS_COLLECTION].find({}).sort("createdAt", -1).limit(limit)
-    return await cursor.to_list(length=limit)
+    return [effective_run(d) for d in await cursor.to_list(length=limit)]
 
 
 async def resume_pending_corridor_runs(db) -> int:
@@ -212,7 +235,10 @@ async def resume_pending_corridor_runs(db) -> int:
     exactly the cycle/principal/state it last persisted. Returns how many
     were resumed."""
     resumed = 0
-    cursor = db[RUNS_COLLECTION].find({"status": {"$nin": list(TERMINAL_STATES)}})
+    # A run an operator cancelled stays halted, even if a stray worker wrote its old status back.
+    await db[RUNS_COLLECTION].update_many({"cancelledAt": {"$exists": True}, "status": {"$nin": list(TERMINAL_STATES)}},
+                                          {"$set": {"status": FSMState.HALTED.value}})
+    cursor = db[RUNS_COLLECTION].find({"status": {"$nin": list(TERMINAL_STATES)}, "cancelledAt": {"$exists": False}})
     async for run_doc in cursor:
         run_id = run_doc["_id"]
         if run_id in _active_tasks:
@@ -260,7 +286,7 @@ def _build_fsm(db, ledger: ImmutableLedger, run_doc: dict[str, Any]) -> HFTCorri
     return HFTCorridorFSM(ledger, starting_capital_usd=run_doc["startingUsd"], config=config)
 
 
-async def _persist_tick(db, run_id: str, bot: HFTCorridorFSM) -> None:
+async def _persist_tick(db, run_id: str, bot: HFTCorridorFSM) -> bool:
     update: dict[str, Any] = {
         "status": bot.state.value,
         "currentCycle": bot.current_cycle,
@@ -291,7 +317,28 @@ async def _persist_tick(db, run_id: str, bot: HFTCorridorFSM) -> None:
         run_doc = await db[RUNS_COLLECTION].find_one({"_id": run_id}, {"startingUsd": 1})
         starting_usd = (run_doc or {}).get("startingUsd", bot.current_usd_principal)
         update["profit"] = bot.current_usd_principal - starting_usd
-    await db[RUNS_COLLECTION].update_one({"_id": run_id}, {"$set": update})
+    # Never write over a run an operator has cancelled: the cancel is recorded as `cancelledAt`, and a worker that is
+    # still alive (it can lose a race with the cancel) must stop instead of putting its old status back.
+    update["ownerId"], update["ownerHeartbeat"] = PROCESS_ID, datetime.utcnow()
+    res = await db[RUNS_COLLECTION].update_one(
+        {"_id": run_id, "cancelledAt": {"$exists": False}, "$or": [{"ownerId": PROCESS_ID}, {"ownerId": {"$exists": False}}]},
+        {"$set": update})
+    return getattr(res, "matched_count", 1) != 0
+
+
+async def _claim_run(db, run_id: str) -> bool:
+    """Takes (or keeps) the lease on a run. False when another server holds a fresh lease or the run was cancelled."""
+    now = datetime.utcnow()
+    res = await db[RUNS_COLLECTION].update_one(
+        {"_id": run_id, "cancelledAt": {"$exists": False},
+         "$or": [{"ownerId": {"$exists": False}}, {"ownerId": PROCESS_ID}, {"ownerHeartbeat": {"$lt": now - timedelta(seconds=LEASE_SECONDS)}}]},
+        {"$set": {"ownerId": PROCESS_ID, "ownerHeartbeat": now}})
+    return getattr(res, "matched_count", 1) != 0
+
+
+async def _is_cancelled(db, run_id: str) -> bool:
+    doc = await db[RUNS_COLLECTION].find_one({"_id": run_id}, {"cancelledAt": 1})
+    return bool(doc and doc.get("cancelledAt"))
 
 
 async def _drive_run(db, run_id: str) -> None:
@@ -304,6 +351,18 @@ async def _drive_run(db, run_id: str) -> None:
     if not run_doc:
         logger.warning("Corridor run %s vanished before its worker could start", run_id)
         return
+
+    # One server per run. If another server holds a fresh lease, wait: take over only if it stops (crash, shutdown).
+    warned = False
+    while not await _claim_run(db, run_id):
+        current = await db[RUNS_COLLECTION].find_one({"_id": run_id}, {"status": 1, "cancelledAt": 1})
+        if not current or current.get("cancelledAt") or current.get("status") in TERMINAL_STATES:
+            return
+        if not warned:
+            logger.warning("Corridor run %s is being driven by another server; this one will only take over if it stops", run_id)
+            warned = True
+        await asyncio.sleep(LEASE_RETRY_SECONDS)
+    run_doc = await db[RUNS_COLLECTION].find_one({"_id": run_id}) or run_doc
 
     ledger = ImmutableLedger(db_collection=db["transactions"])
 
@@ -322,13 +381,18 @@ async def _drive_run(db, run_id: str) -> None:
 
     try:
         while bot.state not in (FSMState.COMPLETED, FSMState.HALTED):
+            if await _is_cancelled(db, run_id):          # checked before every step, so a cancelled run never takes another
+                logger.info("Corridor run %s was cancelled; its worker is stopping", run_id)
+                return
             await bot.tick()
-            await _persist_tick(db, run_id, bot)
+            if not await _persist_tick(db, run_id, bot):
+                logger.info("Corridor run %s was cancelled during a step; its worker is stopping", run_id)
+                return
     except Exception as e:
         traceback.print_exc()
         logger.error("Corridor run %s crashed mid-tick: %s", run_id, e)
         await db[RUNS_COLLECTION].update_one(
-            {"_id": run_id},
+            {"_id": run_id, "cancelledAt": {"$exists": False}, "ownerId": PROCESS_ID},
             {"$set": {"status": FSMState.HALTED.value, "haltReason": str(e), "updatedAt": datetime.utcnow()}},
         )
         return

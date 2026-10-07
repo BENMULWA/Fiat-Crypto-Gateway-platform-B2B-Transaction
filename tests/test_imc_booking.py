@@ -263,3 +263,46 @@ def test_a_failed_booking_ends_the_job_as_failed_and_frees_the_slot():
         return await _wait(ok["id"])
 
     assert run(main())["status"] == "done"
+
+
+# --------------------------------------------------------------------------------------------- 2026-10-07: what the first live bookings showed
+def test_by_default_the_mint_is_sent_on_to_our_own_wallet():
+    """A plain /imc/book minted 0.151743 IMC into Comet's treasury (0xa4ec…), not into our master wallet."""
+    async def main():
+        comet = FakeComet()
+        d = deps(comet, FakeReceipts({"0xSEND": 0.081081}))
+        job = await ib.start(d, "UJ7DEFAULT1", None, None, "admin-1")        # no delivery address given
+        done = await _wait(job["id"])
+        return comet, done
+
+    comet, done = run(main())
+    assert comet.calls == [("book-and-send", "UJ7DEFAULT1", TREASURY, None, "celo")]       # delivered to our wallet, cashKes not sent
+    assert done["status"] == "done" and done["result"]["arrivedImc"] == pytest.approx(0.081081)
+
+
+def test_nothing_to_mint_is_a_clear_final_answer_not_a_wait():
+    body = json.dumps({"error": "nothing to book: every KES of airtime in the float is already issued as IMC (float 1711.50 KES, issued 1711.50 KES)"})
+    comet = FakeComet({"status": "error", "message": body, "statusCode": 409})
+    d = deps(comet, FakeReceipts())
+    with pytest.raises(ib.BookingError) as e:
+        book(d)
+    assert "Nothing to mint" in str(e.value) and "Top up first" in str(e.value) and "still confirming" not in str(e.value)
+    assert run(d.db["imc_bookings"].find_one({"_id": "UJ7ABC1234"}))["status"] == "nothing"
+
+
+def test_a_mint_left_in_comets_treasury_can_be_delivered_to_our_wallet_once():
+    d = deps(FakeComet(), FakeReceipts({"0xSEND": 0.151743}))
+    run(d.db["imc_bookings"].update_one({"_id": "UJ7HD9ITVC"}, {"$set": {"status": "booked", "txHash": "0xMINT", "treasury": "0xa4ec", "imc": 0.151743, "arrivedImc": None, "sendTxHash": None}}, upsert=True))
+    steps = []
+    out = book(d, receipt="UJ7HD9ITVC", cash=None, to=TREASURY, steps=steps)
+    assert any("already minted into Comet's treasury" in s for s in steps)
+    assert out["sendTxHash"] == "0xSEND" and out["arrivedImc"] == pytest.approx(0.151743)
+    with pytest.raises(ib.BookingError, match="already booked"):                           # now delivered: it cannot be delivered twice
+        book(deps(FakeComet(), FakeReceipts(), d.db), receipt="UJ7HD9ITVC", cash=None, to=TREASURY)
+
+
+def test_if_comet_says_already_booked_and_sends_nothing_we_say_the_imc_was_not_delivered():
+    body = json.dumps({"error": "receipt already booked", "txHash": "0xMINT"})
+    comet = FakeComet({"status": "error", "message": body, "statusCode": 409})
+    with pytest.raises(ib.BookingError, match="did not send the IMC to your wallet"):
+        book(deps(comet, FakeReceipts()), to=TREASURY)

@@ -156,7 +156,7 @@ async def _live_run(db) -> Optional[str]:
     if db is None:
         return None
     from workers.corridor_worker import RUNS_COLLECTION, TERMINAL_STATES
-    doc = await db[RUNS_COLLECTION].find_one({"status": {"$nin": list(TERMINAL_STATES)}}, {"_id": 1})
+    doc = await db[RUNS_COLLECTION].find_one({"status": {"$nin": list(TERMINAL_STATES)}, "cancelledAt": {"$exists": False}}, {"_id": 1})
     return (doc or {}).get("_id")
 
 

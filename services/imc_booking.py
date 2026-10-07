@@ -76,6 +76,14 @@ def _parse(msg: Any) -> dict:
         return {"error": str(msg)}
 
 
+def _undelivered(existing: Optional[dict]) -> bool:
+    """A booking that minted (into Comet's treasury) but was never delivered to our wallet: it may be delivered once."""
+    return bool(existing and existing.get("status") == "booked" and not existing.get("sendTxHash") and not existing.get("arrivedImc"))
+
+
+NOTHING_TO_BOOK = ("nothing to book", "already issued")
+
+
 async def _save(d: Deps, receipt: str, fields: dict) -> None:
     try:
         await d.db[COLLECTION].update_one({"_id": receipt}, {"$set": {**fields, "updatedAt": datetime.utcnow()},
@@ -103,9 +111,11 @@ async def book(d: Deps, receipt: str, cash_kes: Optional[float], deliver_to: Opt
     step = on_step or (lambda m: None)
     step("Checking the receipt")
     existing = await d.db[COLLECTION].find_one({"_id": receipt})
-    if existing and existing.get("status") == "booked":
+    if existing and existing.get("status") == "booked" and not (_undelivered(existing) and deliver_to):
         raise BookingError(f"Receipt {receipt} was already booked (transaction {existing.get('txHash')}). A receipt books once, ever.")
-    await _save(d, receipt, {"status": "pending", "cashKes": cash_kes, "deliverTo": deliver_to, "by": requested_by, "chain": d.chain})
+    if _undelivered(existing):
+        step(f"This receipt already minted into Comet's treasury ({existing.get('treasury')}). Asking Comet to deliver it to your wallet")
+    await _save(d, receipt, {"status": "pending" if not _undelivered(existing) else "booked", "cashKes": cash_kes, "deliverTo": deliver_to, "by": requested_by, "chain": d.chain})
 
     step("Asking Comet to verify the receipt and mint. This can take up to a minute while Celo confirms")
     try:
@@ -122,6 +132,10 @@ async def book(d: Deps, receipt: str, cash_kes: Optional[float], deliver_to: Opt
         body, code = _parse(res.get("message")), res.get("statusCode")
         text = body.get("error") or body.get("message") or str(res.get("message"))
         tx = body.get("txHash")
+        if any(p in str(text).lower() for p in NOTHING_TO_BOOK):
+            await _save(d, receipt, {"status": "nothing", "error": text})
+            raise BookingError("Nothing to mint. Comet mints the airtime in the float that is not yet IMC, whichever receipt you give, and every KES in the float is already issued. "
+                               f"Top up first, then book. (Comet said: {text})")
         if code == 409 and tx:                                                 # booked before: recover the original mint
             step("Comet says this receipt was already booked. Recovering the original transaction")
             data = {"txHash": tx, "recovered": True}
@@ -139,6 +153,10 @@ async def book(d: Deps, receipt: str, cash_kes: Optional[float], deliver_to: Opt
         data = res.get("data") or {}
 
     tx, send_tx = data.get("txHash"), data.get("sendTxHash")
+    if deliver_to and data.get("recovered") and not send_tx:
+        await _save(d, receipt, {"status": "booked", "txHash": tx, "warning": "Comet reports this receipt already booked and did not deliver it."})
+        raise BookingError(f"Comet reports this receipt already booked (mint {tx}) and did not send the IMC to your wallet. It sits in Comet's treasury wallet. "
+                           "Ask Comet to transfer it to your wallet (a service-token transfer), or contact them with the mint transaction.")
     preview = data.get("preview") or {}
     treasury = data.get("treasury")
     note = None
@@ -188,11 +206,13 @@ def _snapshot(job: dict) -> dict:
 async def start(d: Deps, receipt: str, cash_kes: Any, deliver_to: Optional[str], requested_by: str) -> dict:
     """Validates, then books in the background so the browser request returns at once."""
     global _current
-    r, cash, addr = clean_receipt(receipt), clean_cash(cash_kes), clean_address(deliver_to)
+    # By default the IMC is sent on to our own wallet: a plain /imc/book leaves it in Comet's treasury wallet, which is
+    # not ours (seen 2026-10-07: minted into 0xa4ec…, not the master wallet).
+    r, cash, addr = clean_receipt(receipt), clean_cash(cash_kes), (clean_address(deliver_to) or d.treasury_address)
     if _current is not None:
         raise BookingError("A booking is already in progress.")
     existing = await d.db[COLLECTION].find_one({"_id": r})
-    if existing and existing.get("status") == "booked":
+    if existing and existing.get("status") == "booked" and not _undelivered(existing):
         raise BookingError(f"Receipt {r} was already booked (transaction {existing.get('txHash')}). A receipt books once, ever.")
     job = {"id": uuid.uuid4().hex[:12], "receipt": r, "status": "running", "startedAt": datetime.utcnow().isoformat() + "Z",
            "steps": [], "result": None, "error": None}

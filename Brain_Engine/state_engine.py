@@ -164,12 +164,13 @@ def _real_celo_imc_balance_of(address: str) -> float:
 def _real_celo_token_balance_of(symbol: str, address: str) -> float:
     """Real on-chain balance of IMC, USDC or USDT (6 decimals) for any Celo address."""
     from routes.valora import ASSET_CONTRACTS, w3 as celo_w3
-    if symbol not in ("IMC", "USDC", "USDT"):
+    if symbol not in ("IMC", "USDC", "USDT", "cUSD"):
         raise ValueError(f"Unsupported token for a balance read: {symbol}")
     abi = [{"constant": True, "inputs": [{"name": "account", "type": "address"}], "name": "balanceOf",
             "outputs": [{"name": "", "type": "uint256"}], "type": "function"}]
     contract = celo_w3.eth.contract(address=ASSET_CONTRACTS[symbol], abi=abi)
-    return float(contract.functions.balanceOf(celo_w3.to_checksum_address(address)).call()) / (10 ** 6)
+    decimals = 18 if symbol == "cUSD" else 6
+    return float(contract.functions.balanceOf(celo_w3.to_checksum_address(address)).call()) / (10 ** decimals)
 
 
 def _real_swap_receipt(tx_hash: str, out_symbol: str, attempts: int = 20, delay: float = 3.0):

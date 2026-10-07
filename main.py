@@ -53,7 +53,7 @@ from routes import (
     auth, dashboard, market_maker, trade, ramp,
     airtime_ledger, general_ledger, rates, tokens,
     cardano, treasury, retail, otc_admin, otc_merchant, swap_engine, valora, stellar,
-    imm_control, base_rate, impala_float, imc_receipts, imc_booking
+    imm_control, base_rate, impala_float, imc_receipts, imc_booking, holdings
 )
 from routes import realtime
 
@@ -309,6 +309,7 @@ app.include_router(base_rate.router)
 app.include_router(impala_float.router)
 app.include_router(imc_receipts.router)
 app.include_router(imc_booking.router)
+app.include_router(holdings.router)
 app.include_router(trade.router)
 app.include_router(ramp.router)
 app.include_router(ramp.callback_router)

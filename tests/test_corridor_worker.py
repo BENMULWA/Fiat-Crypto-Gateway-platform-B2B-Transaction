@@ -13,6 +13,7 @@ doubles, not real Mongo documents (a real BSON document can't hold a
 function, which is exactly why a real /corridor/start caller can never do
 this — every real run always uses the real singletons)."""
 import asyncio
+import types
 
 import pytest
 
@@ -41,21 +42,47 @@ class FakeCollection:
             return {k: doc.get(k) for k in projection if projection[k]}
         return dict(doc)
 
+    @classmethod
+    def _matches(cls, doc, query):
+        """The parts of a Mongo filter these tests use: equality, $exists, $lt, $nin and $or."""
+        for key, cond in query.items():
+            if key == "$or":
+                if not any(cls._matches(doc, sub) for sub in cond):
+                    return False
+            elif isinstance(cond, dict) and cond and all(k.startswith("$") for k in cond):
+                have = doc.get(key)
+                if "$exists" in cond and (key in doc) != bool(cond["$exists"]):
+                    return False
+                if "$nin" in cond and have in set(cond["$nin"]):
+                    return False
+                if "$lt" in cond and not (key in doc and have is not None and have < cond["$lt"]):
+                    return False
+            elif doc.get(key) != cond:
+                return False
+        return True
+
+    @staticmethod
+    def _apply(doc, update):
+        doc.update(update.get("$set", {}))
+        for k in update.get("$unset", {}):
+            doc.pop(k, None)
+
     async def update_one(self, query, update):
         doc = self.docs.get(query.get("_id"))
-        if doc is None:
+        if doc is None or not self._matches(doc, query):
             return {"matched_count": 0}
-        if "$set" in update:
-            doc.update(update["$set"])
+        self._apply(doc, update)
         return {"matched_count": 1, "modified_count": 1}
+
+    async def update_many(self, query, update):
+        hit = [d for d in self.docs.values() if self._matches(d, query)]
+        for d in hit:
+            self._apply(d, update)
+        return {"matched_count": len(hit), "modified_count": len(hit)}
 
     def find(self, query=None):
         query = query or {}
-        matches = list(self.docs.values())
-        if "status" in query and "$nin" in query["status"]:
-            excluded = set(query["status"]["$nin"])
-            matches = [d for d in matches if d.get("status") not in excluded]
-        return FakeCursor(matches)
+        return FakeCursor([d for d in self.docs.values() if self._matches(d, query)])
 
     def aggregate(self, pipeline):
         # Used by ImmutableLedger's risk-check helpers (get_node_volume_today,
@@ -569,3 +596,199 @@ def test_a_deliberate_test_run_may_accept_up_to_fifty_percent_slippage(monkeypat
     monkeypatch.setattr(corridor_worker, "_drive_run", _noop)
     doc = asyncio.run(corridor_worker.start_corridor_run(FakeDB(), corridor_id="airtel_5x", amount_usd=1.0, cycles=1, swap_mode="pool", pool_max_slippage=0.30))
     assert doc["config"]["pool_max_slippage"] == 0.30
+
+
+
+# ------------------------------------------------------------------ a cancel must stick
+class _Res(dict):
+    """The fake's update result: a dict, but with the attribute Motor's UpdateResult has."""
+    matched_count = property(lambda self: self["matched_count"])
+
+
+def _wrap_results(col):
+    for name in ("update_one", "update_many"):
+        orig = getattr(col, name)
+
+        async def wrapped(*a, _orig=orig, **k):
+            return _Res(await _orig(*a, **k))
+
+        setattr(col, name, wrapped)
+    return col
+
+
+def _db_with_run(status="AWAITING_MANUAL_MINT"):
+    db = FakeDB()
+    col = _wrap_results(db["corridor_runs"])
+    col.docs["RUN-C"] = {"_id": "RUN-C", "status": status, "currentCycle": 1, "currentUsdPrincipal": 0.0386, "startingUsd": 0.0386,
+                         "currentKesFloat": 0.0, "cumulativePnl": 0.0, "config": {"swap_mode": "pool"}}
+    return db, col
+
+
+def test_a_cancel_is_recorded_before_anything_else_and_survives_a_late_write_from_a_stray_worker():
+    """The 2026-10-07 bug: the cancel set HALTED, then a worker that was still alive wrote AWAITING_MANUAL_MINT back."""
+    db, col = _db_with_run()
+
+    async def go():
+        doc = await corridor_worker.cancel_corridor_run(db, "RUN-C", cancelled_by="admin-1")
+        # a stray worker now tries to persist its old state, exactly what overwrote the cancel before
+        stray = types.SimpleNamespace(state=corridor_worker.FSMState.AWAITING_MANUAL_MINT, current_cycle=1, current_usd_principal=0.0386,
+                                      current_kes_float=0.0, exit_path_chosen=None, last_cycle_pnl_usd=0.0, cumulative_pnl_usd=0.0,
+                                      pending_mint_expected_imc=0.04, pending_mint_external_id=None, pending_mint_treasury_imc_before=None,
+                                      pending_topup_expected_kes=None, pending_topup_txn_id=None, pending_topup_payout_balance_before=None,
+                                      swap_report=None, exit_report=None, halt_reason=None)
+        wrote = await corridor_worker._persist_tick(db, "RUN-C", stray)
+        return doc, wrote
+
+    doc, wrote = asyncio.run(go())
+    assert wrote is False                                                      # the stray write was refused
+    assert doc["status"] == "HALTED" and col.docs["RUN-C"]["status"] == "HALTED" and col.docs["RUN-C"]["cancelledBy"] == "admin-1"
+
+
+def test_a_worker_for_a_cancelled_run_stops_before_taking_another_step(monkeypatch):
+    db, col = _db_with_run()
+    col.docs["RUN-C"]["cancelledAt"] = "now"                                   # cancelled while this worker was still alive
+    ticks = []
+
+    class Bot:
+        state = corridor_worker.FSMState.AWAITING_MANUAL_MINT
+
+        async def tick(self):
+            ticks.append(1)
+
+    monkeypatch.setattr(corridor_worker, "_build_fsm", lambda db_, ledger, doc: Bot())
+    asyncio.run(corridor_worker._drive_run(db, "RUN-C"))
+    assert ticks == []                                                         # not one more step on a cancelled run
+
+
+def test_startup_heals_a_cancelled_run_whose_status_was_overwritten_and_does_not_resume_it(monkeypatch):
+    db, col = _db_with_run(status="AWAITING_MANUAL_MINT")
+    col.docs["RUN-C"]["cancelledAt"] = "earlier"                               # cancelled, but a stray worker put the old status back
+    started = []
+
+    async def fake_drive(db_, run_id):
+        started.append(run_id)
+
+    monkeypatch.setattr(corridor_worker, "_drive_run", fake_drive)
+    resumed = asyncio.run(corridor_worker.resume_pending_corridor_runs(db))
+    assert resumed == 0 and started == []
+    assert col.docs["RUN-C"]["status"] == "HALTED"                             # healed, so the console stops showing it as open
+
+
+def test_an_uncancelled_open_run_is_still_resumed_after_a_restart(monkeypatch):
+    db, col = _db_with_run()
+    started = []
+
+    async def fake_drive(db_, run_id):
+        started.append(run_id)
+
+    monkeypatch.setattr(corridor_worker, "_drive_run", fake_drive)
+
+    async def go():
+        n = await corridor_worker.resume_pending_corridor_runs(db)
+        await asyncio.sleep(0)
+        return n
+
+    assert asyncio.run(go()) == 1 and started == ["RUN-C"]
+
+
+
+# ------------------------------------------------------------------ only one server drives a run
+def test_a_second_server_cannot_take_a_run_another_server_is_driving(monkeypatch):
+    db, col = _db_with_run()
+
+    async def go():
+        monkeypatch.setattr(corridor_worker, "PROCESS_ID", "server-A")
+        a1 = await corridor_worker._claim_run(db, "RUN-C")           # A takes it
+        a2 = await corridor_worker._claim_run(db, "RUN-C")           # A re-claiming its own run is fine
+        monkeypatch.setattr(corridor_worker, "PROCESS_ID", "server-B")
+        b = await corridor_worker._claim_run(db, "RUN-C")            # B is refused while A's lease is fresh
+        return a1, a2, b
+
+    a1, a2, b = asyncio.run(go())
+    assert (a1, a2, b) == (True, True, False)
+    assert col.docs["RUN-C"]["ownerId"] == "server-A"
+
+
+def test_a_server_can_take_over_once_the_owners_lease_has_gone_stale(monkeypatch):
+    db, col = _db_with_run()
+    from datetime import datetime, timedelta
+    col.docs["RUN-C"].update(ownerId="server-A", ownerHeartbeat=datetime.utcnow() - timedelta(seconds=corridor_worker.LEASE_SECONDS + 5))
+    monkeypatch.setattr(corridor_worker, "PROCESS_ID", "server-B")
+    assert asyncio.run(corridor_worker._claim_run(db, "RUN-C")) is True            # A stopped heartbeating: crash or shutdown
+    assert col.docs["RUN-C"]["ownerId"] == "server-B"
+
+
+def test_a_cancelled_run_cannot_be_claimed(monkeypatch):
+    db, col = _db_with_run()
+    col.docs["RUN-C"]["cancelledAt"] = "now"
+    assert asyncio.run(corridor_worker._claim_run(db, "RUN-C")) is False
+
+
+def test_a_server_that_lost_the_run_stops_writing_to_it(monkeypatch):
+    """Server B took over after A went quiet. If A wakes up and persists, it must be refused, not overwrite B."""
+    db, col = _db_with_run()
+    from datetime import datetime, timedelta
+    col.docs["RUN-C"].update(ownerId="server-B", ownerHeartbeat=datetime.utcnow())
+    bot = types.SimpleNamespace(state=corridor_worker.FSMState.AWAITING_MANUAL_MINT, current_cycle=1, current_usd_principal=0.0386,
+                                current_kes_float=0.0, exit_path_chosen=None, last_cycle_pnl_usd=0.0, cumulative_pnl_usd=0.0,
+                                pending_mint_expected_imc=0.04, pending_mint_external_id=None, pending_mint_treasury_imc_before=None,
+                                pending_topup_expected_kes=None, pending_topup_txn_id=None, pending_topup_payout_balance_before=None,
+                                swap_report=None, exit_report=None, halt_reason=None)
+    monkeypatch.setattr(corridor_worker, "PROCESS_ID", "server-A")
+    assert asyncio.run(corridor_worker._persist_tick(db, "RUN-C", bot)) is False
+    assert col.docs["RUN-C"]["ownerId"] == "server-B" and "swap" not in col.docs["RUN-C"]
+
+
+def test_a_worker_that_cannot_claim_waits_and_never_ticks(monkeypatch):
+    """A second server's worker must not take a single step while another server owns the run."""
+    db, col = _db_with_run()
+    from datetime import datetime
+    col.docs["RUN-C"].update(ownerId="server-A", ownerHeartbeat=datetime.utcnow())
+    monkeypatch.setattr(corridor_worker, "PROCESS_ID", "server-B")
+    monkeypatch.setattr(corridor_worker, "LEASE_RETRY_SECONDS", 0.01)
+    ticks = []
+
+    class Bot:
+        state = corridor_worker.FSMState.AWAITING_MANUAL_MINT
+
+        async def tick(self):
+            ticks.append(1)
+
+    monkeypatch.setattr(corridor_worker, "_build_fsm", lambda db_, ledger, doc: Bot())
+
+    async def go():
+        task = asyncio.create_task(corridor_worker._drive_run(db, "RUN-C"))
+        await asyncio.sleep(0.1)                                                   # waits, retrying the claim
+        assert not task.done() and ticks == []
+        col.docs["RUN-C"]["cancelledAt"] = "now"                                   # the run is cancelled meanwhile: the worker gives up
+        await asyncio.wait_for(task, timeout=2)
+
+    asyncio.run(go())
+    assert ticks == []
+
+
+
+# ------------------------------------------------------------------ a cancelled run reads as cancelled
+def test_the_console_sees_a_cancelled_run_as_halted_even_if_a_stray_worker_rewrote_its_status():
+    db, col = _db_with_run(status="AWAITING_MANUAL_MINT")
+    col.docs["RUN-C"]["cancelledAt"] = "earlier"                               # cancelled, then a stray worker put the old status back
+
+    async def go():
+        one = await corridor_worker.get_run_status(db, "RUN-C")
+        many = await corridor_worker.list_runs(db)
+        return one, many
+
+    one, many = asyncio.run(go())
+    assert one["status"] == "HALTED" and many[0]["status"] == "HALTED"
+    assert col.docs["RUN-C"]["status"] == "AWAITING_MANUAL_MINT"               # the stored value is untouched; only what is reported changes
+
+
+def test_an_uncancelled_open_run_still_reads_as_open():
+    db, col = _db_with_run(status="AWAITING_MANUAL_MINT")
+    assert asyncio.run(corridor_worker.get_run_status(db, "RUN-C"))["status"] == "AWAITING_MANUAL_MINT"
+
+
+def test_a_finished_run_keeps_its_own_status_even_if_it_was_also_cancelled():
+    db, col = _db_with_run(status="COMPLETED")
+    col.docs["RUN-C"]["cancelledAt"] = "x"
+    assert asyncio.run(corridor_worker.get_run_status(db, "RUN-C"))["status"] == "COMPLETED"

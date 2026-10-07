@@ -150,7 +150,8 @@ async def start_topup(
         raise ValueError(f"Amount is above the per-top-up limit of {MAX_TOPUP_KES:,} KES.")
     phone = normalize_kenyan_phone(paying_phone or default_phone or "")  # raises if none was given
 
-    active_run = await db[RUNS_COLLECTION].find_one({"status": {"$nin": TERMINAL_RUN_STATES}})
+    # A run an operator cancelled is not in flight, even if a stray worker on another server wrote its old status back.
+    active_run = await db[RUNS_COLLECTION].find_one({"status": {"$nin": TERMINAL_RUN_STATES}, "cancelledAt": {"$exists": False}})
     if active_run:
         raise TopupConflict(
             f"Corridor run {active_run.get('_id')} is in flight. It measures the same float balance, "

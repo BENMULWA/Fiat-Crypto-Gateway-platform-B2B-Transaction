@@ -319,3 +319,14 @@ def test_a_job_that_fails_records_the_reason_and_frees_the_lock():
         return await _wait_for(nxt["id"])
 
     assert run(main())["status"] == "done"
+
+
+
+def test_a_cancelled_run_does_not_block_the_rebalance():
+    class CancelledRuns:
+        async def find_one(self, q, proj=None):
+            # a real database applies the cancelledAt filter: a cancelled run is not an open run
+            return None if "cancelledAt" in q else {"_id": "RUN-STRAY"}
+
+    out = run(pr.preview(deps(FakeComet(listing()), Chain(), {"corridor_runs": CancelledRuns(), "pool_rebalances": Audit()})))
+    assert out["liveRun"] is None and out["canExecute"] is True
