@@ -1,4 +1,5 @@
 import asyncio
+import math
 import uuid
 from datetime import datetime, timezone
 
@@ -13,6 +14,7 @@ from services.comet_client import CometClient
 from routes.auth import get_current_user_with_role, is_admin_role
 from routes.treasury import _read_celo_usdc_balance_sync
 from database import get_db
+from admin_audit import log_admin_action
 
 
 router = APIRouter(prefix="/api/market-maker", tags=["Market Maker API"])
@@ -51,8 +53,25 @@ async def get_spread_config():
     }
 
 @router.post("/spread")
-async def update_spread_config(config: SpreadUpdate):
+async def update_spread_config(
+    config: SpreadUpdate,
+    db=Depends(get_db),
+    current_user=Depends(get_current_user_with_role),
+):
     """Admin updates the spread. Instantly applied to all retail quotes."""
+    _ensure_admin(current_user)
+    if not (math.isfinite(config.bid) and math.isfinite(config.ask)) or config.bid <= 0 or config.ask <= 0:
+        raise HTTPException(status_code=400, detail="Bid and ask must be positive numbers.")
+    if config.bid >= config.ask:
+        raise HTTPException(status_code=400, detail="Bid must be lower than ask.")
+    await log_admin_action(
+        db, current_user, "spread_updated",
+        active=config.active, autoPeg=config.autoPeg, bid=config.bid, ask=config.ask,
+        previous={
+            "bid": memory_cache.get("spread:usda_kes:bid"),
+            "ask": memory_cache.get("spread:usda_kes:ask"),
+        },
+    )
     memory_cache.set("spread:usda_kes:active", config.active)
     memory_cache.set("spread:usda_kes:auto_peg", config.autoPeg)
     memory_cache.set("spread:usda_kes:bid", config.bid)
@@ -63,7 +82,7 @@ async def update_spread_config(config: SpreadUpdate):
 
 
 @router.get("/spread/comet")
-async def get_comet_spread(base: str = "KES", quote: str = "IMC", amount_in: float = 1.0):
+async def get_comet_spread(base: str = "KES", quote: str = "IMC", amount_in: float = 1.0, current_user=Depends(get_current_user_with_role)):
     """Live KES/IMC pricing sourced from Comet Engine's IMM (docs.mamlakapsp.com)
     instead of an admin-typed number — this is real-time market making, not a
     static spread. Comet enforces its own 60-minute rate-staleness rule and
@@ -71,6 +90,7 @@ async def get_comet_spread(base: str = "KES", quote: str = "IMC", amount_in: flo
     recently; we surface that error as-is rather than silently falling back,
     since a fallback here would hide exactly the staleness Comet is designed
     to catch."""
+    _ensure_admin(current_user)
     result = comet.get_imm_quote(base, quote, amount_in)
     if result["status"] == "error":
         raise HTTPException(status_code=502, detail=f"Comet IMM quote failed: {result['message']}")
@@ -78,10 +98,11 @@ async def get_comet_spread(base: str = "KES", quote: str = "IMC", amount_in: flo
 
 
 @router.get("/exposure/comet")
-async def get_comet_exposure(chain: str = "celo", asset: str = "IMC"):
+async def get_comet_exposure(chain: str = "celo", asset: str = "IMC", current_user=Depends(get_current_user_with_role)):
     """Live vault-backed vs. synthetic exposure for one Comet-tracked asset —
     the risk picture your own node_registry.py exposure_cap_usd fields don't
     have today, since they only bound your local ledger, not real reserves."""
+    _ensure_admin(current_user)
     result = comet.get_exposure(chain, asset)
     if result["status"] == "error":
         raise HTTPException(status_code=502, detail=f"Comet exposure check failed: {result['message']}")
@@ -89,7 +110,7 @@ async def get_comet_exposure(chain: str = "celo", asset: str = "IMC"):
 
 
 @router.get("/n9-reference/comet")
-async def get_n9_comet_reference(to_symbol: str = "USDT"):
+async def get_n9_comet_reference(to_symbol: str = "USDT", current_user=Depends(get_current_user_with_role)):
     """Read-only reference price for the corridor's real Celo exit leg
     (node_registry.py's N9 — 'Celo Exit', live=True — same real balance as
     treasury.py's CELO_USDC, NOT the frontend's separate 'N9' Stellar
@@ -98,6 +119,7 @@ async def get_n9_comet_reference(to_symbol: str = "USDT"):
     This is the join point we scoped: N9 already produces a real
     Comet-registered asset (USDC), so it's the one place Comet's pricing
     is meaningful today without re-platforming anything else."""
+    _ensure_admin(current_user)
     try:
         usdc_balance = await asyncio.wait_for(asyncio.to_thread(_read_celo_usdc_balance_sync), timeout=20)
     except Exception as exc:

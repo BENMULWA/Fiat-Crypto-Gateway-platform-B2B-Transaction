@@ -13,6 +13,8 @@ from database import get_db
 from routes.auth import get_current_user, get_verified_current_user
 from celo_wallet import derive_celo_account, get_or_create_celo_wallet_index
 from celo_audit import log_celo_audit_event
+from celo_nonce import reserve_treasury_nonce
+from request_lock import single_flight
 from flutterwave_payouts import list_banks, settle_bank_transfer
 from fiat_payout_audit import log_fiat_payout_audit_event
 from notifications import notify_user
@@ -283,7 +285,7 @@ async def verify_valora_deposit(req: VerifyRequest, db=Depends(get_db), current_
     })
     
     return {"status": "success", "message": f"{req.amount} {req.asset} verified and credited!"}
-@router.post("/withdraw")
+@router.post("/withdraw", dependencies=[Depends(single_flight())])
 async def withdraw_from_valora(req: WithdrawReq, db=Depends(get_db), current_user=Depends(get_verified_current_user)):
     import asyncio
     # Verified before anything else touches the balance.
@@ -400,7 +402,7 @@ async def withdraw_from_valora(req: WithdrawReq, db=Depends(get_db), current_use
         await asyncio.to_thread(check_token_balance)
 
         def execute_tx():
-            nonce = w3.eth.get_transaction_count(account.address)
+            nonce = reserve_treasury_nonce(w3, account.address)
             tx = contract.functions.transfer(target_address, amount_base).build_transaction({
                 'chainId': 42220, # Hardcoded chain ID from earlier to ensure safety
                 'gas': 150000,

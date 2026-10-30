@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 import asyncio
 import traceback
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import uuid
 import requests
 import os
@@ -124,7 +124,7 @@ async def withdraw_from_celo_master_wallet(
     db=Depends(get_db),
     current_user=Depends(get_current_user_with_role),
 ):
-    """Send USDT, USDC, or cUSD directly from the Celo treasury wallet."""
+    """Send USDT, USDC, or cUSD IMC directly from the Celo treasury wallet."""
     ensure_admin(current_user)
 
     asset = payload.asset.strip()
@@ -233,6 +233,42 @@ async def get_or_create_rate_book(db):
     doc = _default_rate_book()
     await db["treasury_rate_book"].update_one({"_id": RATE_BOOK_ID}, {"$setOnInsert": doc}, upsert=True)
     return doc
+
+
+
+
+
+def assert_rate_book_fresh(rate_book: dict) -> None:
+    updated_at = rate_book.get("updatedAt")
+
+    if isinstance(updated_at, str):
+        try:
+            updated_at = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+        except ValueError:
+            updated_at = None
+
+    if not isinstance(updated_at, datetime):
+        raise HTTPException(status_code=503, detail="Treasury rate book has no valid update timestamp.")
+
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    else:
+        updated_at = updated_at.astimezone(timezone.utc)
+
+    try:
+        refresh_hours = max(int(rate_book.get("refresh_interval_hours", 3) or 3), 1)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=503, detail="Treasury rate book has an invalid refresh interval.")
+
+    expires_at = updated_at + timedelta(hours=refresh_hours)
+    if datetime.now(timezone.utc) >= expires_at:
+        raise HTTPException(
+            status_code=503,
+            detail="Treasury rates are stale. Please try again after rates are refreshed.",
+        )
+
+
+
 
 
 def compute_swap_quote_from_book(from_asset: str, to_asset: str, amount: float, rate_book: dict) -> dict:
@@ -446,10 +482,6 @@ class StartCorridorRequest(BaseModel):
     amount: float
     corridor_id: str
     currency: str = "USD"  # "KES" or "USD" — same convention as SimulateCorridorRequest
-    cycles: int = 5  # 1 = a single pass (procure, liquidate, mint, exit); max 10
-    procure_mode: str = "stk"  # "stk" = new STK push per cycle; "existing_float" = use float already held
-    pool_max_slippage: float = 0.02  # pool mode: refuse a swap that pays more than this fraction below $1 per IMC
-    swap_mode: str = "reserve"  # "reserve" = USDT from the treasury reserve; "pool" = sell the IMC for USDC in the Comet AMM pool
 
 
 @router.post("/corridor/start")
@@ -475,9 +507,7 @@ async def start_hft_corridor(
     try:
         run_doc = await start_corridor_run(
             db, corridor_id=req.corridor_id, amount_usd=principal_usd,
-            started_by=str(current_user.get("_id")), cycles=req.cycles,
-            procure_mode=req.procure_mode, swap_mode=req.swap_mode,
-            pool_max_slippage=req.pool_max_slippage,
+            started_by=str(current_user.get("_id")),
         )
         return {"status": "started", "run": run_doc}
     except ValueError as e:
@@ -500,46 +530,6 @@ async def get_hft_corridor_status(
     if not run_doc:
         raise HTTPException(status_code=404, detail="Unknown corridor run ID")
     return run_doc
-
-
-@router.post("/corridor/{run_id}/cancel")
-async def cancel_hft_corridor_run(
-    run_id: str,
-    db=Depends(get_db),
-    current_user=Depends(get_current_user_with_role),
-):
-    """Stops an unfinished run and marks it HALTED. It stops further steps only: anything the
-    run already did on-chain or at a provider is real and is not reversed."""
-    ensure_admin(current_user)
-    from workers.corridor_worker import cancel_corridor_run
-
-    try:
-        run_doc = await cancel_corridor_run(db, run_id, cancelled_by=str(current_user.get("_id")))
-    except LookupError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except ValueError as e:
-        raise HTTPException(status_code=409, detail=str(e))
-    return {"status": "cancelled", "run": run_doc}
-
-
-@router.post("/corridor/{run_id}/retry-exit")
-async def retry_hft_corridor_exit(
-    run_id: str,
-    db=Depends(get_db),
-    current_user=Depends(get_current_user_with_role),
-):
-    """Moves real funds: re-runs the final withdrawal of a pool run that stopped there, sending the USDC from the
-    engine's Comet wallet to CELO_EXIT_ADDRESS. Refuses anything that is not such a run."""
-    ensure_admin(current_user)
-    from workers.corridor_worker import retry_exit
-
-    try:
-        run_doc = await retry_exit(db, run_id, requested_by=str(current_user.get("_id")))
-    except LookupError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except ValueError as e:
-        raise HTTPException(status_code=409, detail=str(e))
-    return {"status": "retrying", "run": run_doc}
 
 
 @router.get("/corridor/runs")

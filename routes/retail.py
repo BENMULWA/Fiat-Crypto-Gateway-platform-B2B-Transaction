@@ -74,10 +74,13 @@ def _send_admin_kyc_email(subject: str, body: str) -> None:
         pass
 
 # Import shared JWT config and auth helper
-from routes.auth import get_current_user
+from routes.auth import get_current_user, get_verified_current_user
 from database import get_db
+from request_lock import single_flight
+from rate_limit import rate_limit_user
 from typing import Optional
 from celo_wallet import get_onchain_celo_snapshot
+import math
 import uuid
 
 router = APIRouter(prefix="/api/retail", tags=["Retail User"])
@@ -484,7 +487,28 @@ def _mask_display_name(name: str) -> str:
 # "confirm recipient name" screen on a bank's own-bank transfer flow. Returns
 # only a masked display name, never the full name/phone, so a sender can't
 # use this to enumerate account holder details from a bare email guess.
-@router.get("/transfer/lookup")
+async def _resolve_user_email(db, current_user: dict) -> str:
+    """The logged-in user's email, read from the user document.
+
+    get_current_user only decodes the JWT and returns {_id, workspaceId,
+    sessionId} -- there is no "email" key. The transfer endpoints used to call
+    current_user.get("email") and silently got "" every time, which (a) made
+    the "can't transfer to yourself" check never trigger, (b) stored
+    senderEmail="" on every transfer, and (c) made GET /transfers match
+    {"senderEmail": ""} -- i.e. return EVERY transfer in the system (other
+    people's recipient emails, assets and amounts) to any logged-in user.
+    """
+    email = (current_user.get("email") or "").strip().lower()
+    if email:
+        return email
+    doc = await db["users"].find_one({"_id": safe_object_id(str(current_user.get("_id")))}, {"email": 1})
+    return ((doc or {}).get("email") or "").strip().lower()
+
+
+_CANONICAL_ASSETS = {a.upper(): a for a in SUPPORTED_ASSETS}
+
+
+@router.get("/transfer/lookup", dependencies=[Depends(rate_limit_user("transfer_lookup", 20, 60))])
 async def lookup_transfer_recipient(
     email: str,
     db=Depends(get_db),
@@ -494,7 +518,7 @@ async def lookup_transfer_recipient(
     if not recipient_email:
         raise HTTPException(status_code=400, detail="Email is required.")
 
-    sender_email = (current_user.get("email") or "").strip().lower()
+    sender_email = await _resolve_user_email(db, current_user)
     if recipient_email == sender_email:
         return {"status": "success", "found": False, "isSelf": True}
 
@@ -518,11 +542,14 @@ async def lookup_transfer_recipient(
 # two_factor.verify_withdrawal_2fa) because it moves funds out of an account
 # just as irreversibly from the sender's point of view, even though nothing
 # touches a chain.
-@router.post("/transfer")
+@router.post("/transfer", dependencies=[Depends(single_flight())])
 async def transfer_to_user(
     payload: InternalTransferRequest,
     db=Depends(get_db),
-    current_user=Depends(get_current_user),
+    # Verified (approved-KYC) users only. This route used get_current_user, so
+    # the KYC requirement existed only as a frontend route guard that a direct
+    # API call bypasses -- unlike deposit/withdraw/swap, which already use this.
+    current_user=Depends(get_verified_current_user),
 ):
     # Imported locally, not at module load: wallet_utils imports
     # build_user_id_candidates from this module, so importing wallet_utils at
@@ -530,17 +557,20 @@ async def transfer_to_user(
     from wallet_utils import debit_wallet, credit_wallet
     from two_factor import verify_withdrawal_2fa
 
-    asset = payload.asset.strip().upper()
-    if asset not in SUPPORTED_ASSETS:
-        raise HTTPException(status_code=400, detail=f"Unsupported asset: {asset}")
-    if payload.amount <= 0:
+    # Case-insensitive match onto the canonical ticker: .upper() alone turned
+    # "cUSD" into "CUSD", which is not in SUPPORTED_ASSETS (so cUSD transfers
+    # could never succeed).
+    asset = _CANONICAL_ASSETS.get((payload.asset or "").strip().upper())
+    if asset is None:
+        raise HTTPException(status_code=400, detail=f"Unsupported asset: {payload.asset}")
+    if not math.isfinite(payload.amount) or payload.amount <= 0:
         raise HTTPException(status_code=400, detail="Transfer amount must be greater than zero.")
 
     recipient_email = (payload.recipient_email or "").strip().lower()
     if not recipient_email:
         raise HTTPException(status_code=400, detail="Recipient email is required.")
 
-    sender_email = (current_user.get("email") or "").strip().lower()
+    sender_email = await _resolve_user_email(db, current_user)
     if recipient_email == sender_email:
         raise HTTPException(status_code=400, detail="You can't transfer to your own account.")
 
@@ -553,20 +583,17 @@ async def transfer_to_user(
 
     sender_id = current_user.get("_id")
     recipient_id = recipient_doc["_id"]
+    if str(sender_id) == str(recipient_id):
+        raise HTTPException(status_code=400, detail="You can't transfer to your own account.")
 
-    await debit_wallet(db, sender_id, asset, payload.amount)
-    try:
-        await credit_wallet(db, recipient_id, asset, payload.amount)
-    except Exception as exc:
-        # Credit failed after the debit succeeded — reverse it immediately so
-        # the sender's funds aren't stranded in limbo.
-        await credit_wallet(db, sender_id, asset, payload.amount)
-        raise HTTPException(status_code=502, detail=f"Transfer failed and was reversed: {exc}")
-
+    # Write the intent BEFORE any balance moves. If the process dies between
+    # the debit and the credit, this row (status "started") is the only trace
+    # that funds are in flight -- it is what an admin reconciles from.
     now = datetime.utcnow()
     transfer_id = str(uuid.uuid4())
     await db["internal_transfers"].insert_one({
         "_id": transfer_id,
+        "status": "started",
         "asset": asset,
         "amount": payload.amount,
         "senderId": sender_id,
@@ -576,6 +603,30 @@ async def transfer_to_user(
         "note": (payload.note or "").strip()[:280],
         "createdAt": now,
     })
+
+    await debit_wallet(db, sender_id, asset, payload.amount)
+    try:
+        await credit_wallet(db, recipient_id, asset, payload.amount)
+    except Exception as exc:
+        # Credit failed after the debit succeeded — reverse it immediately so
+        # the sender's funds aren't stranded in limbo.
+        try:
+            await credit_wallet(db, sender_id, asset, payload.amount)
+            await db["internal_transfers"].update_one(
+                {"_id": transfer_id}, {"$set": {"status": "reversed", "error": str(exc), "finishedAt": datetime.utcnow()}}
+            )
+        except Exception as reverse_exc:
+            # Both legs failed: money is in limbo. Leave a loud, queryable marker.
+            await db["internal_transfers"].update_one(
+                {"_id": transfer_id},
+                {"$set": {"status": "needs_reconciliation", "error": str(exc),
+                          "reverseError": str(reverse_exc), "finishedAt": datetime.utcnow()}},
+            )
+        raise HTTPException(status_code=502, detail="Transfer failed. If your balance looks wrong, contact support with reference " + transfer_id)
+
+    await db["internal_transfers"].update_one(
+        {"_id": transfer_id}, {"$set": {"status": "completed", "finishedAt": datetime.utcnow()}}
+    )
 
     return {
         "status": "success",
@@ -590,19 +641,39 @@ async def transfer_to_user(
 @router.get("/transfers")
 async def get_transfer_history(db=Depends(get_db), current_user=Depends(get_current_user)):
     """Sent and received internal transfers for the logged-in user, newest first."""
-    email = (current_user.get("email") or "").strip().lower()
-    records = await db["internal_transfers"].find(
-        {"$or": [{"senderEmail": email}, {"recipientEmail": email}]}
-    ).sort("createdAt", -1).limit(100).to_list(100)
+    # Match on the user's id (string or ObjectId), never on email: earlier
+    # transfers were stored with senderEmail="" (see _resolve_user_email), and
+    # an email filter of "" returned every user's transfers to every caller.
+    # Only completed transfers are shown; legacy rows have no status field.
+    ids = build_user_id_candidates(current_user.get("_id"))
+    records = await db["internal_transfers"].find({
+        "$and": [
+            {"$or": [{"senderId": {"$in": ids}}, {"recipientId": {"$in": ids}}]},
+            {"$or": [{"status": "completed"}, {"status": {"$exists": False}}]},
+        ]
+    }).sort("createdAt", -1).limit(100).to_list(100)
+
+    me = {str(i) for i in ids}
+
+    # Legacy rows lack a sender email; resolve it from the user document.
+    missing = {str(r.get("senderId")) for r in records if not r.get("senderEmail") and r.get("senderId") is not None}
+    email_by_id = {}
+    if missing:
+        docs = await db["users"].find(
+            {"_id": {"$in": [safe_object_id(m) for m in missing]}}, {"email": 1}
+        ).to_list(len(missing))
+        email_by_id = {str(d["_id"]): d.get("email") for d in docs}
 
     transfers = []
     for r in records:
+        sent = str(r.get("senderId")) in me
+        sender_email = r.get("senderEmail") or email_by_id.get(str(r.get("senderId"))) or ""
         transfers.append({
             "id": r.get("_id"),
             "asset": r.get("asset"),
             "amount": r.get("amount"),
-            "direction": "sent" if r.get("senderEmail") == email else "received",
-            "counterparty": r.get("recipientEmail") if r.get("senderEmail") == email else r.get("senderEmail"),
+            "direction": "sent" if sent else "received",
+            "counterparty": r.get("recipientEmail") if sent else sender_email,
             "note": r.get("note", ""),
             "createdAt": r.get("createdAt").isoformat() + "Z" if r.get("createdAt") else None,
         })

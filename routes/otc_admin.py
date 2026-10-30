@@ -19,6 +19,7 @@ from database import get_db, get_client
 from dealer_engine.analysis import AnalysisEngine
 from dealer_engine.positions import TreasuryPositionEngine
 from routes.auth import get_current_user_with_role, is_admin_role
+from admin_audit import log_admin_action
 
 try:
     from bson import ObjectId
@@ -387,7 +388,8 @@ async def _build_risk_alerts(db):
     return alerts[:20]
 
 @router.get("/operations-overview")
-async def get_operations_overview(days: int = 7, scope: str = "retail", db=Depends(get_db)):
+async def get_operations_overview(days: int = 7, scope: str = "retail", db=Depends(get_db), current_user: dict = Depends(get_current_user_with_role)):
+    ensure_admin(current_user)
     now = datetime.utcnow()
     days = max(1, min(int(days or 7), 90))
     start_date = now - timedelta(days=days)
@@ -1713,7 +1715,8 @@ async def get_dealer_clients(db=Depends(get_db), current_user: dict = Depends(ge
     return {"status": "success", "clients": clients}
 
 @router.get("/analytics/chart-data")
-async def get_chart_analytics(days: int = 7, scope: str = "retail", db=Depends(get_db)):
+async def get_chart_analytics(days: int = 7, scope: str = "retail", db=Depends(get_db), current_user: dict = Depends(get_current_user_with_role)):
+    ensure_admin(current_user)
     days = max(1, min(int(days or 7), 90))
     now = datetime.utcnow()
     start_date = now - timedelta(days=days)
@@ -1823,6 +1826,9 @@ async def get_all_retail_transactions(userId: str = None, limit: int = 200, db=D
 async def moderate_transaction(tx_id: str, payload: TxStatusUpdate, db=Depends(get_db), current_user: dict = Depends(get_current_user_with_role)):
     if not is_admin_role(current_user.get("role")):
         raise HTTPException(status_code=403, detail="Admin role required.")
+
+    # Who changed which customer transaction to what, recorded before the change applies.
+    await log_admin_action(db, current_user, "retail_tx_status_change", txId=tx_id, requestedStatus=payload.status)
 
     query = {"_id": tx_id}
     try:

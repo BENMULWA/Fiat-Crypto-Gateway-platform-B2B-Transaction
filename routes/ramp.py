@@ -19,12 +19,15 @@ from database import get_db
 from services.safaricom_daraja import DarajaService
 from services.zigram_client import ZigramClient, ZigramError, is_clear_status, is_zigram_configured, resolve_screening_leg
 from routes.auth import get_current_user, get_current_user_with_role, get_verified_current_user, is_admin_role
-from routes.treasury import get_or_create_rate_book, compute_swap_quote_from_book, DEFAULT_USD_BASE_RATES
+from routes.treasury import get_or_create_rate_book, compute_swap_quote_from_book, assert_rate_book_fresh, DEFAULT_USD_BASE_RATES
+from routes.retail import SUPPORTED_ASSETS
 from routes.swap_engine import settle_crypto_on_celo
 from broadcast import broadcast_manager
 from notifications import notify_user
 from two_factor import verify_withdrawal_2fa
 from wallet_utils import debit_wallet, credit_wallet
+from request_lock import acquire_user_lock, release_user_lock, MONEY_OUT
+from rate_limit import rate_limit_user
 from cardano.airt import burn_airt, mint_airt, receipt_hash
 from cardano.client import get_blockfrost_api
 from cardano.wallet import CardanoWallet, get_or_create_wallet_index
@@ -418,6 +421,11 @@ class RampExecute(BaseModel):
     otp_session_id: str = ""
     otp_code: str = ""
     totp_code: str = ""
+    # Slippage guard for swaps: the smallest to-asset amount the customer will
+    # accept (the quote they were shown, less any tolerance). The server always
+    # re-prices from the rate book, so without this a rate-book change between
+    # "quote" and "confirm" silently executed at the new, worse price.
+    min_receive: float | None = None
 
 
 class ReconcileDepositsRequest(BaseModel):
@@ -511,6 +519,22 @@ async def _extract_callback_payload(request: Request) -> tuple[dict, str]:
     return payload, raw_text
 
 
+def _is_production() -> bool:
+    return os.environ.get("APP_ENV", "development").strip().lower() in {"production", "prod"}
+
+
+def _with_callback_token(url: str | None) -> str | None:
+    """Append the shared callback token to the URL handed to the gateway.
+
+    Only ever applied to the copy sent to the gateway -- never to the value
+    stored on ramp_entries or returned to the customer, which would hand the
+    secret to exactly the person it is meant to keep out."""
+    token = os.environ.get("AIRTEL_CALLBACK_TOKEN", "").strip()
+    if not url or not token:
+        return url
+    return f"{url}{'&' if '?' in url else '?'}token={token}"
+
+
 def _verify_airtel_callback_signature(request: Request, raw_text: str) -> dict[str, Any]:
     """Verify an HMAC callback signature only when direct-callback verification is enabled."""
     enabled = os.environ.get("AIRTEL_CALLBACK_AUTH_ENABLED", "false").strip().lower() == "true"
@@ -523,6 +547,30 @@ def _verify_airtel_callback_signature(request: Request, raw_text: str) -> dict[s
         "signaturePresent": bool(signature),
         "valid": None,
     }
+
+    # Second, independent mechanism for gateways that can't sign the body: a
+    # shared secret the gateway echoes back (X-Callback-Token header, or the
+    # ?token= we append to the callback URL we hand it -- see
+    # _with_callback_token). Without ANY of HMAC / token, these endpoints
+    # accept a forged "TS" from anyone who knows a providerReference -- and
+    # that reference is returned to the customer in the deposit response.
+    token_secret = os.environ.get("AIRTEL_CALLBACK_TOKEN", "").strip()
+    auth["tokenConfigured"] = bool(token_secret)
+    auth["tokenValid"] = None
+    if token_secret:
+        provided_token = (request.headers.get("X-Callback-Token") or request.query_params.get("token") or "").strip()
+        auth["tokenValid"] = hmac.compare_digest(provided_token, token_secret)
+
+    # Refuse callbacks that cannot be authenticated, in EVERY environment. Previously this only held when
+    # APP_ENV=production, so a deployment that forgot that one variable accepted forged "success" callbacks.
+    # Local development can opt out explicitly with ALLOW_UNAUTHENTICATED_CALLBACKS=true; that flag is
+    # ignored in production.
+    allow_unauthenticated = (
+        not _is_production()
+        and os.environ.get("ALLOW_UNAUTHENTICATED_CALLBACKS", "false").strip().lower() == "true"
+    )
+    auth["failClosed"] = not enabled and not token_secret and not allow_unauthenticated
+
     if not enabled:
         return auth
 
@@ -542,6 +590,15 @@ def _verify_airtel_callback_signature(request: Request, raw_text: str) -> dict[s
     if not auth["valid"]:
         auth["reason"] = "signature mismatch"
     return auth
+
+
+def _callback_rejected(auth: dict[str, Any]) -> bool:
+    """True when a callback must be refused before it can touch a wallet."""
+    return bool(
+        auth.get("failClosed")
+        or (auth["enabled"] and auth["valid"] is not True)
+        or (auth.get("tokenConfigured") and auth.get("tokenValid") is not True)
+    )
 
 
 async def _handle_airtel_callback(request: Request, db, source: str):
@@ -568,7 +625,7 @@ async def _handle_airtel_callback(request: Request, db, source: str):
     }
     await db["airtel_callback_events"].insert_one(callback_event)
 
-    if callback_auth["enabled"] and callback_auth["valid"] is not True:
+    if _callback_rejected(callback_auth):
         await db["airtel_callback_events"].update_one(
             {"_id": event_id},
             {"$set": {"error": "Callback authentication failed", "processedAt": datetime.utcnow()}},
@@ -732,12 +789,103 @@ def _resolve_airtel_callback_base_url() -> str:
 
     return legacy.rstrip("/")
 
-@router.post("/execute", status_code=201)
+_RAMP_DIRECTIONS = {"on", "off", "swap"}
+# Hard sanity ceiling on a single request, in the asset's own units. Real
+# per-user/per-day limits belong in a policy layer; this only exists so an
+# absurd value (1e300, inf) can never reach balance arithmetic.
+_RAMP_MAX_AMOUNT = float(os.getenv("RAMP_MAX_AMOUNT_PER_REQUEST", "10000000"))
+
+
+def _validate_ramp_request(body: "RampExecute") -> None:
+    """Reject malformed money requests before anything touches a balance.
+
+    Previously RampExecute.amount was never checked: a negative amount made
+    debit_wallet() *credit* the from-asset ($inc by a positive number, and
+    its `$gte: negative` guard always passes), and the matching credit on the
+    to-asset side went negative -- a user could mint balance in one asset at
+    the expense of an unchecked negative balance in another, then withdraw the
+    positive side as real crypto. from_asset/to_asset were also used straight
+    as MongoDB field names, so any string created a new wallet field.
+    """
+    if body.direction not in _RAMP_DIRECTIONS:
+        raise HTTPException(status_code=400, detail=f"Unsupported direction: {body.direction!r}")
+
+    for name, value in (("amount", body.amount), ("rate", body.rate), ("fee", body.fee)):
+        if not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise HTTPException(status_code=400, detail=f"Invalid {name}.")
+    if body.min_receive is not None and (not math.isfinite(body.min_receive) or body.min_receive < 0):
+        raise HTTPException(status_code=400, detail="Invalid min_receive.")
+    if body.amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be greater than zero.")
+    if body.amount > _RAMP_MAX_AMOUNT:
+        raise HTTPException(status_code=400, detail="Amount exceeds the maximum allowed per request.")
+
+    for name, asset in (("from_asset", body.from_asset), ("to_asset", body.to_asset)):
+        if asset not in SUPPORTED_ASSETS:
+            raise HTTPException(status_code=400, detail=f"Unsupported asset in {name}: {asset!r}")
+
+    if body.direction == "swap" and body.from_asset == body.to_asset:
+        raise HTTPException(status_code=400, detail="Cannot swap an asset for itself.")
+
+    # Mobile-money rails take whole shillings (int(amount) is sent to the gateway).
+    if body.channel == "Mobile Money" and body.amount < 1:
+        raise HTTPException(status_code=400, detail="Minimum mobile-money amount is 1 KES.")
+
+
+@router.post("/execute", status_code=201, dependencies=[Depends(rate_limit_user("ramp_execute", 30, 60))])
 async def execute_ramp(body: RampExecute, db=Depends(get_db), current_user=Depends(get_verified_current_user)):
+    """Validate, serialise per user, and leave an audit trail around the real work.
+
+    * one in-flight ramp request per user -- a double-click or retry gets a 429
+      instead of racing the first one past the balance check;
+    * a `ramp_intents` row is written BEFORE any balance moves and closed with
+      the outcome afterwards. A row stuck in "started" is the only trace of a
+      request that died mid-flight (after a debit, before a credit/refund), so
+      the admin audit view lists exactly those for reconciliation.
+    """
+    _validate_ramp_request(body)
+    user_key = str(current_user["_id"])
+    lock_token = await acquire_user_lock(db, user_key, MONEY_OUT)
+    trade_id = f"TRADE_{uuid.uuid4().hex[:8].upper()}"
+    started_at = datetime.utcnow()
+    try:
+        await db["ramp_intents"].insert_one({
+            "_id": trade_id, "status": "started", "userId": user_key,
+            "direction": body.direction, "channel": body.channel,
+            "fromAsset": body.from_asset, "toAsset": body.to_asset, "amount": body.amount,
+            "createdAt": started_at,
+        })
+    except Exception as exc:
+        # Never block trading on the audit write, but make the gap visible.
+        print(f"⚠️ ramp_intents insert failed for {trade_id}: {exc}")
+
+    async def _close(status: str, **fields):
+        try:
+            await db["ramp_intents"].update_one(
+                {"_id": trade_id}, {"$set": {"status": status, "finishedAt": datetime.utcnow(), **fields}}
+            )
+        except Exception:
+            pass
+
+    try:
+        result = await _execute_ramp_impl(body, db, current_user, trade_id)
+        await _close("finished", resultStatus=(result or {}).get("status") if isinstance(result, dict) else None)
+        return result
+    except HTTPException as exc:
+        # 4xx = refused before/without lasting effect; 5xx = failed mid-flight.
+        await _close("rejected" if exc.status_code < 500 else "failed", httpStatus=exc.status_code, detail=str(exc.detail)[:500])
+        raise
+    except Exception as exc:
+        await _close("error", detail=str(exc)[:500])
+        raise
+    finally:
+        await release_user_lock(db, user_key, MONEY_OUT, lock_token)
+
+
+async def _execute_ramp_impl(body: RampExecute, db, current_user, trade_id: str):
     user_id_raw = current_user["_id"]
     user_id = safe_object_id(user_id_raw)
     user_id_candidates = build_user_id_candidates(user_id_raw)
-    trade_id = f"TRADE_{uuid.uuid4().hex[:8].upper()}"
     provider_reference = f"LIVE-{uuid.uuid4().hex[:8].upper()}"
 
     if body.direction in ("on", "off") and body.channel == "Mobile Money":
@@ -769,9 +917,15 @@ async def execute_ramp(body: RampExecute, db=Depends(get_db), current_user=Depen
         rate_book = await get_or_create_rate_book(db)
         if not bool(rate_book.get("active", True)):
             raise HTTPException(status_code=503, detail="Trading is currently paused by treasury.")
+        assert_rate_book_fresh(rate_book)
 
         live_swap_quote = compute_swap_quote_from_book(body.from_asset, body.to_asset, body.amount, rate_book)
         receive = live_swap_quote["receive_amount"]
+        if body.min_receive is not None and receive < body.min_receive:
+            raise HTTPException(
+                status_code=409,
+                detail=f"The price changed. You would now receive {receive:g} {body.to_asset}, below your minimum of {body.min_receive:g}. Please review the new quote.",
+            )
         profit_amount = live_swap_quote["fee_amount"]
         profit_currency = live_swap_quote.get("fee_currency", body.to_asset)
 
@@ -809,33 +963,46 @@ async def execute_ramp(body: RampExecute, db=Depends(get_db), current_user=Depen
         if current_balance < debit_amount:
             raise HTTPException(status_code=400, detail=f"Insufficient {body.from_asset} balance. You need {debit_amount:.4f}; you have {current_balance:.4f}.")
 
-        user_doc = await db["users"].find_one({"_id": safe_object_id(user_id_raw)})
+        # A swap is a custodial LEDGER move: the customer's from-asset is debited
+        # and their to-asset is credited on the internal ledger (and the customer
+        # takes it out later through the 2FA-gated withdraw endpoints). The
+        # on-chain leg below is therefore a platform-internal movement and must
+        # NEVER be pointed at an address the customer controls.
+        #
+        # It used to honour body.destination_address (and the user's saved
+        # wallet address): a verified user calling the API directly could name
+        # their own address, receive the real crypto on-chain AND the same
+        # amount on their ledger, then withdraw the ledger balance again --
+        # being paid twice. The retail UI never sends destination_address, so
+        # normal customers are unaffected; only the destination is changed here.
         destination_address = None
         if body.to_asset.upper() in {"CUSD", "USDC", "USDT", "USD"}:
             try:
-                destination_address = resolve_crypto_destination_address(body.destination_address or user_doc.get("walletAddress") if user_doc else body.destination_address, user_doc)
+                # No candidate address, no user doc -> platform-owned
+                # CELO_HOT_WALLET_ADDRESS / CELO_EXIT_ADDRESS only.
+                destination_address = resolve_crypto_destination_address(None, None)
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
         elif body.to_asset.upper() == "USDA":
-            # Resolve Cardano destination address from user document or provided address
-            if body.destination_address and body.destination_address.strip():
-                destination_address = body.destination_address.strip()
-            elif user_doc and user_doc.get("cardanoAddress"):
-                destination_address = user_doc.get("cardanoAddress").strip()
-            else:
-                # Generate a new Cardano address for the user if not present
-                try:
-                    idx = await get_or_create_wallet_index(db, current_user.get("workspaceId", "demo_workspace"))
-                    cardano_wallet = CardanoWallet(idx)
-                    destination_address = cardano_wallet.address_str
-                except Exception as exc:
-                    raise HTTPException(status_code=400, detail=f"Unable to resolve Cardano address: {exc}") from exc
+            try:
+                destination_address = (
+                    os.getenv("MASTER_WALLET_ADDRESS", "").strip()
+                    or CardanoWallet(0).address_str
+                )
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=f"Unable to resolve Cardano treasury address: {exc}") from exc
 
         if body.from_asset.upper() == "KES" and body.to_asset.upper() == "AIRT":
             wallet_owner_id = wallet.get("userId") if wallet else user_id
             receive_amount = math.floor(receive_amount)
             if receive_amount <= 0:
                 raise HTTPException(status_code=400, detail="KES amount is too small to mint whole AIRT units.")
+            # Only whole AIRT can be minted, so charge for exactly that many:
+            # re-price on the whole amount instead of debiting the fractional
+            # KES the customer typed and minting fewer tokens than they paid for.
+            whole_quote = compute_swap_quote_from_book("KES", "AIRT", receive_amount, rate_book)
+            debit_amount = float(whole_quote["debit_amount"])
+            profit_amount = whole_quote["fee_amount"]
             reserve_snapshot = await _get_airtime_reserve_snapshot(db)
             available_before = max(
                 reserve_snapshot["providerBalanceSnapshot"] - reserve_snapshot["circulatingAirt"],
@@ -921,6 +1088,12 @@ async def execute_ramp(body: RampExecute, db=Depends(get_db), current_user=Depen
             burn_amount = math.floor(body.amount) # Round down to whole AIRT units for burn
             if burn_amount <= 0:
                 raise HTTPException(status_code=400, detail="AIRT redemption must be at least 1 whole token.")
+            # receive_amount was priced on the full (possibly fractional) amount
+            # but only floor(amount) tokens are burned -- the customer was being
+            # paid KES for a fraction of a token that was never taken from them.
+            burn_quote = compute_swap_quote_from_book("AIRT", "KES", burn_amount, rate_book)
+            receive_amount = float(burn_quote["receive_amount"])
+            profit_amount = burn_quote["fee_amount"]
             custody_balance = await _get_custody_airt_balance()
             if custody_balance < burn_amount:
                 raise HTTPException(
@@ -1140,7 +1313,7 @@ async def execute_ramp(body: RampExecute, db=Depends(get_db), current_user=Depen
                 if use_portal_callback else ""
             )
             if collection_callback or portal_callback:
-                payload["callbackUrl"] = portal_callback or collection_callback
+                payload["callbackUrl"] = _with_callback_token(portal_callback or collection_callback)
 
             # 3. Authenticate to Mamlaka, then request the Airtel STK push.
             async with httpx.AsyncClient() as client:
@@ -1404,6 +1577,30 @@ async def execute_ramp(body: RampExecute, db=Depends(get_db), current_user=Depen
             "createdAt": datetime.utcnow(),
         })
 
+        # Refund bookkeeping. Every path that returns the customer's KES must
+        # ALSO move this row to a terminal "failed" state. Previously a
+        # synchronous refund left the row "processing", so a later provider
+        # failure callback refunded the same withdrawal a second time
+        # (_apply_wallet_delta_once's marker is separate from credit_wallet).
+        payout_post_started = False
+        refunded = False
+
+        async def _refund_and_fail(reason: str, source: str):
+            nonlocal refunded
+            if refunded:
+                return
+            refunded = True
+            await credit_wallet(db, wallet_owner_id, "KES", body.amount)
+            await db["ramp_entries"].update_one(
+                {"_id": trade_id, "status": {"$in": ["pending", "processing"]}},
+                {
+                    "$set": {"status": "failed", "error_reason": reason[:500], "refundedAt": datetime.utcnow(),
+                             "updatedAt": datetime.utcnow()},
+                    "$addToSet": {"appliedRampRefunds": "sync"},
+                    "$push": {"statusHistory": {"state": "failed", "at": datetime.utcnow(), "source": source}},
+                },
+            )
+
         try:
             # --- MAMLAKA SANDBOX GATEWAY INTEGRATION ---
             gateway_url = os.environ.get("AIRTEL_API_BASE_URL", "").rstrip("/")
@@ -1448,8 +1645,8 @@ async def execute_ramp(body: RampExecute, db=Depends(get_db), current_user=Depen
                 if callback_base_url else None
             )
             if disburse_callback:
-                payload["callback_url"] = disburse_callback
-                payload["callbackUrl"] = disburse_callback
+                payload["callback_url"] = _with_callback_token(disburse_callback)
+                payload["callbackUrl"] = _with_callback_token(disburse_callback)
 
             async with httpx.AsyncClient() as client:
                 auth_response = await client.get(f"{gateway_url}/", auth=(api_username, api_password), timeout=15.0)
@@ -1459,12 +1656,19 @@ async def execute_ramp(body: RampExecute, db=Depends(get_db), current_user=Depen
                 if not access_token:
                     raise HTTPException(status_code=502, detail="Airtel sandbox authentication response did not include a token.")
                 headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+                # From here on the provider may act on the request even if we never
+                # see a response -- a failure after this point is NOT a safe refund.
+                payout_post_started = True
                 response = await client.post(payout_url, json=payload, headers=headers, timeout=15.0)
                 if response.is_error:
                     response_text = response.text
                     print(f"Airtel Gateway Rejected: {response_text}")
-                    await credit_wallet(db, wallet_owner_id, "KES", body.amount)
-                    raise HTTPException(status_code=400, detail=response_text)
+                    if 400 <= response.status_code < 500:
+                        # A definite refusal: the payout did not happen.
+                        await _refund_and_fail(f"Provider rejected payout ({response.status_code}): {response_text}", "provider_rejected")
+                        raise HTTPException(status_code=400, detail="The payment provider rejected this payout. Your funds were returned.")
+                    # 5xx: the provider may have forwarded it before failing.
+                    raise RuntimeError(f"ambiguous provider error {response.status_code}")
                 response.raise_for_status()
 
                 # Some gateways return HTTP 200 but business failure in body.status.success=false.
@@ -1477,15 +1681,41 @@ async def execute_ramp(body: RampExecute, db=Depends(get_db), current_user=Depen
                     status_success = _is_success_from_status_object(status_obj)
                     if status_success is False:
                         response_text = response.text
-                        await credit_wallet(db, wallet_owner_id, "KES", body.amount)
-                        raise HTTPException(status_code=400, detail=f"Airtel gateway business rejection: {response_text}")
+                        await _refund_and_fail(f"Provider business rejection: {response_text}", "provider_business_rejection")
+                        raise HTTPException(status_code=400, detail="The payment provider declined this payout. Your funds were returned.")
 
         except HTTPException:
+            # Raised before the payout request was sent (bad number, missing
+            # credentials, no auth token): nothing was paid out, but the KES was
+            # already debited above. This path used to just re-raise and leave
+            # the customer's money debited with no refund -- e.g. a mistyped
+            # phone number cost the user the full amount.
+            if not payout_post_started:
+                await _refund_and_fail("Withdrawal could not be submitted to the provider.", "pre_send_failure")
             raise
         except Exception as e:
             print(f"Gateway Connection Error: {e}")
-            await credit_wallet(db, wallet_owner_id, "KES", body.amount)
-            raise HTTPException(status_code=502, detail="Failed to connect to Airtel Gateway. Funds refunded.")
+            if not payout_post_started:
+                # Never reached the payout call (e.g. auth/connection failure): safe to refund.
+                await _refund_and_fail(f"Gateway unreachable before payout: {e}", "pre_send_failure")
+                raise HTTPException(status_code=502, detail="Could not reach the payment provider. Your funds were returned.")
+
+            # The payout request was (or may have been) sent and we don't know
+            # the outcome (timeout, dropped connection, provider 5xx). Refunding
+            # here can pay the customer twice if the money did go out, so keep
+            # the funds held, flag the row, and let the provider callback or an
+            # admin reconciliation settle it.
+            await db["ramp_entries"].update_one(
+                {"_id": trade_id},
+                {
+                    "$set": {"ambiguousProvider": True, "ambiguousReason": str(e)[:500], "updatedAt": datetime.utcnow()},
+                    "$push": {"statusHistory": {"state": "processing", "at": datetime.utcnow(), "source": "provider_outcome_unknown"}},
+                },
+            )
+            raise HTTPException(
+                status_code=202,
+                detail=f"We could not confirm this payout yet. Your funds are on hold, please do not retry. Reference {trade_id}.",
+            )
 
         # The callback may already have completed this row. Only enrich it
         # with provider request metadata and preserve its current status.
@@ -1503,90 +1733,6 @@ async def execute_ramp(body: RampExecute, db=Depends(get_db), current_user=Depen
 
     return {"id": trade_id, "receive": receive, "status": "processing"}
         
-"""
-# ========================================================
-# 🟢 SECURE WEBHOOK RECEIVER (ROBUST VERSION)
-# ========================================================
-@router.post("/b2c/result") 
-async def mamlaka_stk_callback(payload: dict, db=Depends(get_db)):
-    # 1. LOG RAW PAYLOAD (Crucial for debugging African APIs)
-    print(f"📦 [WEBHOOK INCOMING] Raw Payload: {payload}")
-    
-    # 2. CHECK MULTIPLE POSSIBLE KEYS FOR THE STATUS
-    # Different African gateways use different keys (status, transactionStatus, state)
-    tx_status = str(payload.get("transactionStatus", "")).strip().upper()
-    tx_state = str(payload.get("status", "")).strip().upper()
-    tx_report = str(payload.get("transactionReport", "")).strip().upper()
-    tx_message = str(payload.get("message", "")).strip().upper()
-
-    # 3. SMART SUCCESS DETECTION
-    # If ANY of the keys contain "SUCCESS" or the report says "PROCESSED SUCCESSFULLY", it's a win!
-    is_success = (
-        "SUCCESS" in tx_status or 
-        "SUCCESS" in tx_state or 
-        "COMPLETED" in tx_state or
-        "PROCESSED SUCCESSFULLY" in tx_report or 
-        "SUCCESS" in tx_message
-    )
-
-    external_id = payload.get("externalId", "") 
-    
-    if not external_id:
-        return {"status": "ignored"}
-
-    if external_id.startswith("TRADE_") or external_id.startswith("SWEEP_") or external_id.startswith("REV_"):
-        trade = await db["ramp_entries"].find_one({"_id": external_id})
-        
-        if not trade:
-            print(f"⚠️ [WEBHOOK] Trade {external_id} not found in database.")
-            return {"status": "ignored"}
-
-        # Prevent double-processing if M-Pesa sends the webhook twice
-        if trade.get("status") not in ["processing", "pending"]:
-            print(f"⏭️ [WEBHOOK] Trade {external_id} already processed ({trade.get('status')}). Ignoring duplicate.")
-            return {"status": "already_processed"}
-            
-        # --- HANDLE SUCCESS ---
-        if is_success:
-            await db["ramp_entries"].update_one(
-                {"_id": external_id}, 
-                {"$set": {"status": "completed", "report": payload}}
-            )
-            
-            if trade.get("direction") == "on":
-                user_id = trade.get("userId")
-                asset = trade.get("fromAsset", "KES")
-                amount = float(trade.get("fromAmount", 0))
-                
-                await db["retail_wallets"].update_one(
-                    {"userId": user_id},
-                    {"$inc": {asset: amount}},
-                    upsert=True
-                )
-                print(f"🟢 [WEBHOOK] SUCCESS! Credited {amount} {asset} to user {user_id}")
-                
-        # --- HANDLE FAILURE ---
-        else:
-            await db["ramp_entries"].update_one(
-                {"_id": external_id}, 
-                {"$set": {"status": "failed", "report": payload}}
-            )
-            print(f"🔴 [WEBHOOK] FAILED! Trade {external_id} rejected. Full payload saved to DB.")
-            
-            # If it was a withdrawal, give the money back
-            if trade.get("direction") == "off":
-                user_id = trade.get("userId")
-                asset = trade.get("fromAsset", "KES")
-                amount = float(trade.get("fromAmount", 0))
-                await db["retail_wallets"].update_one(
-                    {"userId": user_id}, 
-                    {"$inc": {asset: amount}}
-                )
-                print(f"🔄 [WEBHOOK] Refunded {amount} {asset} back to user {user_id}")
-
-    return {"status": "acknowledged"}
-
-    """   
 def _resolve_tx_explorer(e: dict) -> tuple[str | None, str | None, str | None]:
     """Return (tx_hash, network, explorer_url) for a ramp_entries doc.
 
@@ -2444,11 +2590,6 @@ async def _process_airtel_c2b_payload(payload: dict, db):
             )
 
     return {"message": "C2B webhook processed"}
-
-
-@router.post("/c2b/result")
-async def airtel_c2b_webhook(request: Request, db=Depends(get_db)):
-    return await _handle_airtel_callback(request, db, "legacy_c2b")
 
 
 @callback_router.get("/health")

@@ -20,6 +20,7 @@ from bson import ObjectId
 
 from database import get_db
 from config import settings
+from rate_limit import rate_limit
 from cardano.wallet import CardanoWallet, get_or_create_wallet_index
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -472,8 +473,21 @@ async def get_verified_current_user(
 # --- Auth routes (signup / login) ------------------------------------------
 
 
-@router.post("/signup")
+def _require_legacy_password_auth() -> None:
+    """POST /signup and POST /login hand out a session token on email+password
+    alone -- no email OTP. The app's real sign-in/sign-up (Login.tsx, Signup.tsx)
+    uses /login/request-otp + /login/verify-otp and /signup/request-otp +
+    /signup/verify-otp, so these two routes were a way around that second factor
+    (and /signup let anyone register an address they do not own). They are only
+    used by the unrouted legacy OnOffRampPage. Off by default; set
+    ALLOW_LEGACY_PASSWORD_AUTH=true to bring them back (dev/testing only)."""
+    if os.getenv("ALLOW_LEGACY_PASSWORD_AUTH", "false").strip().lower() != "true":
+        raise HTTPException(status_code=410, detail="This sign-in method is no longer available. Please use the verification-code sign-in.")
+
+
+@router.post("/signup", dependencies=[Depends(rate_limit("legacy_signup", 5, 600))])
 async def signup(data: dict, request: Request, db=Depends(get_db)):
+    _require_legacy_password_auth()
     email = data.get("email")
     password = data.get("password")
     display = data.get("displayName") or data.get("display") or email
@@ -554,7 +568,7 @@ async def signup(data: dict, request: Request, db=Depends(get_db)):
     }
 
 
-@router.post("/signup/request-otp")
+@router.post("/signup/request-otp", dependencies=[Depends(rate_limit("signup_otp", 5, 600))])
 async def signup_request_otp(data: dict, db=Depends(get_db)):
     """
     Start signup OTP challenge by validating input and emailing code.
@@ -628,7 +642,7 @@ async def signup_request_otp(data: dict, db=Depends(get_db)):
     }
 
 
-@router.post("/signup/verify-otp")
+@router.post("/signup/verify-otp", dependencies=[Depends(rate_limit("signup_verify", 15, 600))])
 async def signup_verify_otp(data: dict, request: Request, db=Depends(get_db)):
     """Complete signup after OTP verification and issue token."""
     session_id = data.get("otp_session_id")
@@ -700,7 +714,7 @@ async def signup_verify_otp(data: dict, request: Request, db=Depends(get_db)):
     return await issue_auth_payload(db, user_doc, request)
 
 # Resend OTP routes for both signup and login, with cooldown and max resend limits enforced.
-@router.post("/signup/resend-otp")
+@router.post("/signup/resend-otp", dependencies=[Depends(rate_limit("signup_resend", 5, 600))])
 async def signup_resend_otp(data: dict, db=Depends(get_db)):
     session_id = data.get("otp_session_id")
     if not session_id:
@@ -709,8 +723,38 @@ async def signup_resend_otp(data: dict, db=Depends(get_db)):
     return await resend_otp_for_session(db, session_id, purpose="signup")
 
 
-@router.post("/login")
+# Strict allowlist (unlike is_admin_role's denylist) -- this path skips the OTP,
+# so only roles we explicitly name may use it.
+_ADMIN_API_LOGIN_ROLES = {"admin", "super_admin"}
+
+
+def _require_admin_api_login_enabled(request: Request) -> None:
+    """Gate for POST /login/admin-api (Postman/API testing for admins).
+
+    Skips the email OTP, so it is off unless ALLOW_ADMIN_API_LOGIN=true and the
+    request comes from the local machine. Reports 410 when disabled, same as the
+    legacy route, so it doesn't advertise itself."""
+    if os.getenv("ALLOW_ADMIN_API_LOGIN", "false").strip().lower() != "true":
+        raise HTTPException(status_code=410, detail="This sign-in method is no longer available. Please use the verification-code sign-in.")
+    client_host = request.client.host if request.client else ""
+    if client_host not in {"127.0.0.1", "::1", "localhost"}:
+        raise HTTPException(status_code=403, detail="Admin API login is only allowed from localhost")
+
+# Admin login acess
+@router.post("/login/admin-api", dependencies=[Depends(rate_limit("admin_api_login", 5, 300))])
+async def login_admin_api(data: dict, request: Request, db=Depends(get_db)):
+    """Password-only login for admin accounts, for Postman testing. Only for Development."""
+    _require_admin_api_login_enabled(request)
+    return await _password_login(data, request, db, allowed_roles=_ADMIN_API_LOGIN_ROLES)
+
+
+@router.post("/login", dependencies=[Depends(rate_limit("legacy_login", 10, 300))])
 async def login(data: dict, request: Request, db=Depends(get_db)):
+    _require_legacy_password_auth()
+    return await _password_login(data, request, db)
+
+
+async def _password_login(data: dict, request: Request, db, allowed_roles: Optional[set] = None):
     email = data.get("email")
     password = data.get("password")
     if not email or not password:
@@ -720,6 +764,8 @@ async def login(data: dict, request: Request, db=Depends(get_db)):
     user = await users.find_one({"email": email.lower()})
     if not user or not verify_password(password, user.get("password", "")):
         raise HTTPException(status_code=401, detail="Invalid credentials")
+    if allowed_roles is not None and (user.get("role") or "").lower() not in allowed_roles:
+        raise HTTPException(status_code=403, detail="Admin accounts only")
 
     uid = str(user.get("_id"))
     
@@ -762,7 +808,7 @@ async def login(data: dict, request: Request, db=Depends(get_db)):
     }
 
 
-@router.post("/login/request-otp")
+@router.post("/login/request-otp", dependencies=[Depends(rate_limit("login_otp", 10, 300))])
 async def login_request_otp(data: dict, db=Depends(get_db)):
     """Start login OTP challenge after verifying password."""
     email = normalize_email(data.get("email") or "")
@@ -788,7 +834,7 @@ async def login_request_otp(data: dict, db=Depends(get_db)):
     }
 
 
-@router.post("/login/verify-otp")
+@router.post("/login/verify-otp", dependencies=[Depends(rate_limit("login_verify", 15, 300))])
 async def login_verify_otp(data: dict, request: Request, db=Depends(get_db)):
     """Complete login after OTP verification and issue token."""
     session_id = data.get("otp_session_id")
@@ -831,7 +877,7 @@ async def login_verify_otp(data: dict, request: Request, db=Depends(get_db)):
     return await issue_auth_payload(db, user, request)
 
 
-@router.post("/login/resend-otp")
+@router.post("/login/resend-otp", dependencies=[Depends(rate_limit("login_resend", 5, 600))])
 async def login_resend_otp(data: dict, db=Depends(get_db)):
     session_id = data.get("otp_session_id")
     if not session_id:
@@ -856,7 +902,7 @@ def _hash_reset_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-@router.post("/forgot-password")
+@router.post("/forgot-password", dependencies=[Depends(rate_limit("forgot_pw", 5, 600))])
 async def forgot_password(data: dict, db=Depends(get_db)):
     """Start a password-reset flow. Always returns the same generic response
     whether or not the email matches an account — ForgotPasswordPage.tsx
@@ -921,7 +967,7 @@ async def forgot_password(data: dict, db=Depends(get_db)):
     return generic_response
 
 
-@router.post("/reset-password")
+@router.post("/reset-password", dependencies=[Depends(rate_limit("reset_pw", 10, 600))])
 async def reset_password(data: dict, db=Depends(get_db)):
     """Complete a password reset using the token from the emailed link."""
     token = str(data.get("token") or "").strip()
@@ -1067,7 +1113,7 @@ async def admin_recovery_change_email(
 # endpoint (ramp.py, cardano.py, valora.py, treasury.py) before any funds move.
 #=============================================
 
-@router.post("/withdrawal/request-otp")
+@router.post("/withdrawal/request-otp", dependencies=[Depends(rate_limit("withdraw_otp", 5, 600))])
 async def withdrawal_request_otp(
     current_user: dict = Depends(get_current_user_with_role),
     db=Depends(get_db),

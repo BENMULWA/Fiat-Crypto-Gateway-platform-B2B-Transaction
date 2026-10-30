@@ -38,6 +38,7 @@ from pymongo.errors import DuplicateKeyError
 from broadcast import broadcast_manager
 from notifications import notify_user
 from celo_audit import log_celo_audit_event
+from celo_nonce import reserve_treasury_nonce
 from celo_wallet import derive_celo_account
 
 logger = logging.getLogger("celo.deposit_watcher")
@@ -194,7 +195,7 @@ def _sweep_deposit_sync(w3: Web3, asset: str, wallet_index: int) -> dict:
             "from": treasury.address,
             "to": deposit_account.address,
             "value": topup_wei,
-            "nonce": w3.eth.get_transaction_count(treasury.address),
+            "nonce": reserve_treasury_nonce(w3, treasury.address),
             "gas": 21000,
             "gasPrice": gas_price,
             "chainId": w3.eth.chain_id,

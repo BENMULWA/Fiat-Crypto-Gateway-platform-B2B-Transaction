@@ -9,9 +9,21 @@ plain find_one — looking at only one row — so a user could see "1.5177 USDC"
 on screen and still get rejected with "you have 0.0177" at withdrawal time.
 These helpers make the check and the debit agree with what's displayed.
 """
+import math
+
 from fastapi import HTTPException
 
 from routes.retail import build_user_id_candidates
+
+
+def _require_valid_amount(amount, *, allow_zero: bool = False) -> None:
+    """Last line of defence for every balance mutation. A negative amount
+    through $inc + a `$gte: <negative>` guard silently flips a debit into a
+    credit (and vice versa), so the wallet primitives refuse it themselves
+    instead of trusting every caller to have validated first."""
+    ok = isinstance(amount, (int, float)) and math.isfinite(amount) and (amount >= 0 if allow_zero else amount > 0)
+    if not ok:
+        raise HTTPException(status_code=400, detail="Invalid amount.")
 
 
 async def get_summed_balance(db, user_id_raw, asset: str) -> float:
@@ -28,6 +40,7 @@ async def debit_wallet(db, user_id_raw, asset: str, amount: float) -> None:
     is insufficient. Must be called before any provider/on-chain call — the
     debit happening first is what lets a failed send be safely refunded.
     """
+    _require_valid_amount(amount)
     candidates = build_user_id_candidates(user_id_raw)
     wallets = await db["retail_wallets"].find({"userId": {"$in": candidates}}).to_list(length=100)
 
@@ -83,6 +96,9 @@ async def credit_wallet(db, user_id_raw, asset: str, amount: float) -> None:
     """Refund/credit `amount` back onto whichever row already represents this
     user, to undo a debit_wallet() call after a downstream failure. Prefers
     an existing row over creating a new one, matching how debit reads rows."""
+    _require_valid_amount(amount, allow_zero=True)
+    if amount == 0:
+        return
     candidates = build_user_id_candidates(user_id_raw)
     result = await db["retail_wallets"].update_one(
         {"userId": {"$in": candidates}},

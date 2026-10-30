@@ -8,6 +8,7 @@ from typing import Optional
 from database import get_db
 from routes.auth import get_verified_current_user
 from notifications import notify_user
+from celo_nonce import reserve_treasury_nonce
 from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware
 from dotenv import load_dotenv
@@ -112,7 +113,7 @@ async def settle_crypto_on_celo(to_address: str, asset: str, amount: float) -> d
         
         # Build and execute transfer
         contract = w3_celo.eth.contract(address=CELO_ASSET_CONTRACTS[asset], abi=CELO_ERC20_ABI)
-        nonce = w3_celo.eth.get_transaction_count(account.address)
+        nonce = reserve_treasury_nonce(w3_celo, account.address)
         
         tx = contract.functions.transfer(to_address, amount_base).build_transaction({
             'chainId': CELO_CHAIN_ID,

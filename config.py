@@ -128,3 +128,31 @@ class Settings(BaseSettings):
     )
 
 settings = Settings()
+
+
+# ── Startup safety check ───────────────────────────────────────────────────
+# Every session token is signed with JWT_SECRET. If it is unset, the code
+# silently falls back to a string that is in this repository -- anyone who has
+# read the source can then mint a valid token for any user id, admin included.
+# Set APP_ENV=production on the deployed API to make this a hard startup
+# failure; in any other environment it is a loud warning.
+_KNOWN_DEFAULT_SECRETS = {
+    "changeme-super-secret-jwt-key-32chars",
+    "a-secure-32-character-fallback-key-string",
+}
+
+
+def _check_jwt_secret(s: "Settings") -> None:
+    weak = s.jwt_secret in _KNOWN_DEFAULT_SECRETS or len(s.jwt_secret) < 32
+    if not weak:
+        return
+    message = (
+        "JWT_SECRET is unset, a known default, or shorter than 32 characters. "
+        "Generate one with: python -c \"import secrets; print(secrets.token_urlsafe(48))\""
+    )
+    if os.getenv("APP_ENV", "development").strip().lower() in {"production", "prod"}:
+        raise RuntimeError(f"Refusing to start in production: {message}")
+    print(f"⚠️  SECURITY WARNING: {message}")
+
+
+_check_jwt_secret(settings)

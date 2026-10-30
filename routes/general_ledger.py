@@ -1,38 +1,58 @@
-from fastapi import APIRouter, Depends
+import re
+
+from fastapi import APIRouter, Depends, HTTPException
 from database import get_db
+from routes.auth import get_current_user_with_role, is_admin_role
 
 # This prefix matches exactly what React is looking for: /api/ledger
 router = APIRouter(prefix="/api/ledger", tags=["General Ledger"])
 
+
+def _ensure_admin(current_user: dict):
+    if not is_admin_role(current_user.get("role")):
+        raise HTTPException(status_code=403, detail="Admin role required")
+
+
 @router.get("/feed")
-async def get_live_ledger_feed(limit: int = 50, search: str = None, db = Depends(get_db)):
+async def get_live_ledger_feed(
+    limit: int = 50,
+    search: str = None,
+    db=Depends(get_db),
+    current_user=Depends(get_current_user_with_role),
+):
     """
     Fetches the most recent transactions from the MongoDB Immutable Ledger.
     Includes server-side searching to find old transactions that fell off the top 50.
     """
+    _ensure_admin(current_user)
+    limit = max(1, min(int(limit or 50), 500))
     query = {}
     if search:
+        # re.escape: `search` is user-supplied and was previously passed to
+        # $regex raw, so a crafted pattern could be used for regex injection
+        # / catastrophic-backtracking against the ledger collection.
+        pattern = re.escape(search[:100])
         # Search across multiple columns case-insensitively
         query = {
             "$or": [
-                {"txn_id": {"$regex": search, "$options": "i"}},
-                {"from_node": {"$regex": search, "$options": "i"}},
-                {"to_node": {"$regex": search, "$options": "i"}},
-                {"txn_type": {"$regex": search, "$options": "i"}}
+                {"txn_id": {"$regex": pattern, "$options": "i"}},
+                {"from_node": {"$regex": pattern, "$options": "i"}},
+                {"to_node": {"$regex": pattern, "$options": "i"}},
+                {"txn_type": {"$regex": pattern, "$options": "i"}}
             ]
         }
 
     # Query MongoDB: Get top transactions matching query, sorted by newest first
     cursor = db["transactions"].find(query).sort("timestamp", -1).limit(limit)
     records = await cursor.to_list(length=limit)
-    
+
     formatted_feed = []
     for r in records:
         # 1. Determine the color of the text based on the transaction type
         type_color = "text-blue-400"
         # Handle both 'txn_type' and 'type' depending on how it was saved
         txn_type = r.get("txn_type", r.get("type", "TRANSFER"))
-        
+
         if txn_type in ["MINT", "SYSTEM_FUND"]:
             type_color = "text-emerald-400"
         elif txn_type in ["LIQUIDATE", "PROCURE"]:
@@ -43,7 +63,7 @@ async def get_live_ledger_feed(limit: int = 50, search: str = None, db = Depends
         # 2. Format time safely
         timestamp = r.get("timestamp")
         time_str = timestamp.strftime("%H:%M:%S.%f")[:-3] if timestamp else "00:00:00"
-        
+
         # 3. Format value safely
         int_val = r.get('internal_usd_value', 0)
         amount_val = r.get('amount', 0)
@@ -61,7 +81,7 @@ async def get_live_ledger_feed(limit: int = 50, search: str = None, db = Depends
             "typeColor": type_color,
             "externalRef": r.get("external_ref"),
         })
-        
+
     return {"status": "success", "feed": formatted_feed}
 
 # --- Legacy fallback routes to prevent other 404s ---

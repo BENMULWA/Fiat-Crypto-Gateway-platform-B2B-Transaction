@@ -12,6 +12,7 @@ from routes.auth import get_current_user, get_current_user_with_role, get_verifi
 from config import settings
 from two_factor import verify_withdrawal_2fa
 from wallet_utils import debit_wallet, credit_wallet
+from request_lock import single_flight
 
 try:
     from bson import ObjectId
@@ -41,17 +42,20 @@ def _cardano_guard():
         )
 
 # --- 2. SCHEMAS ---
+
+
 class WithdrawRequest(BaseModel):
     amount: float
     to_address: Optional[str] = None
     toAddress: Optional[str] = None
     address: Optional[str] = None
-    asset: str = "USDA"
+    asset: str = "USDA"  # Accept "ADA" or "USDA"
     idempotency_key: str = ""
     counterparty: str = ""
     otp_session_id: str = ""
     otp_code: str = ""
     totp_code: Optional[str] = None
+
 
     def get_destination(self) -> str:
         dest = self.to_address or self.toAddress or self.address
@@ -142,7 +146,7 @@ async def estimate_fee(body: FeeEstimateRequest = Body(...), db=Depends(get_db),
         "estimated_fee_usd": fee_usd,
         "network_fee_usda": standard_usda_fee
     }
-@router.post("/withdraw", status_code=201)
+@router.post("/withdraw", status_code=201, dependencies=[Depends(single_flight())])
 async def withdraw_usda(body: WithdrawRequest, db=Depends(get_db), current_user=Depends(get_verified_current_user)):
     # Verified before anything else touches the balance — a failed 2FA check
     # must never have already moved funds.
@@ -203,6 +207,9 @@ async def withdraw_usda(body: WithdrawRequest, db=Depends(get_db), current_user=
         "message": f"Successfully sent {withdraw_amount} USDA to {dest_address[:10]}…"
     }
 
+import math
+
+# ...existing code...
 
 @router.post("/master-wallet/withdraw", status_code=201)
 async def withdraw_from_master_wallet(
@@ -210,33 +217,66 @@ async def withdraw_from_master_wallet(
     db=Depends(get_db),
     current_user=Depends(get_current_user_with_role),
 ):
-    """Send USDA directly from the custodial master wallet to an external address."""
+    """Send ADA or USDA from the custodial master wallet."""
     if not is_admin_role(current_user.get("role")):
         raise HTTPException(status_code=403, detail="Admin role required")
-    if body.asset.upper() != "USDA":
-        raise HTTPException(status_code=400, detail="Only USDA master-wallet withdrawals are supported.")
+
+    asset = (body.asset or "").strip().upper()
+    if asset not in {"ADA", "USDA"}:
+        raise HTTPException(status_code=400, detail="asset must be ADA or USDA")
 
     withdraw_amount = float(body.amount)
-    if withdraw_amount <= 0:
-        raise HTTPException(status_code=400, detail="Withdrawal amount must be greater than zero.")
+    if not math.isfinite(withdraw_amount) or withdraw_amount <= 0:
+        raise HTTPException(status_code=400, detail="Withdrawal amount must be a positive finite number.")
 
     dest_address = body.get_destination()
+
     try:
         _cardano_guard()
         CardanoWallet, _, usda_ops = _import_cardano()
         platform_idx = getattr(settings, "cardano_platform_account_index", 0)
         platform_wallet = CardanoWallet(platform_idx)
-        master_balance = usda_ops.get_balance(platform_wallet.address_str)
-        available_usda = float(master_balance.get("usda", 0.0))
-        if available_usda < withdraw_amount:
+
+        configured_address = os.getenv("MASTER_WALLET_ADDRESS")
+        if not configured_address or configured_address != platform_wallet.address_str:
             raise HTTPException(
-                status_code=400,
-                detail=f"Insufficient master-wallet USDA balance. Available: {available_usda:.4f} USDA, Requested: {withdraw_amount:.4f} USDA.",
+                status_code=503,
+                detail="MASTER_WALLET_ADDRESS must match the address derived by the signing wallet.",
             )
 
-        tx_hash = usda_ops.send_usda(platform_wallet, dest_address, withdraw_amount)
+        balances = usda_ops.get_balance(platform_wallet.address_str)
+
+        if asset == "ADA":
+            available = float(balances["ada"])
+            if available < withdraw_amount:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Insufficient master-wallet ADA. Available: {available:.6f} ADA; requested: {withdraw_amount:.6f} ADA. Network fee is additional.",
+                )
+            result = usda_ops.send_ada(
+                platform_wallet,
+                dest_address,
+                withdraw_amount,
+                available_lovelace=int(round(available * 1_000_000)),
+            )
+            tx_hash = result["tx_hash"]
+            fee_amount = result["fee_lovelace"] / 1_000_000
+            to_amount = withdraw_amount
+        else:
+            available = float(balances["usda"])
+            if available < withdraw_amount:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Insufficient master-wallet USDA. Available: {available:.6f} USDA; requested: {withdraw_amount:.6f} USDA.",
+                )
+            tx_hash = usda_ops.send_usda(platform_wallet, dest_address, withdraw_amount)
+            fee_amount = 0.17
+            to_amount = max(0.0, withdraw_amount - fee_amount)
+
     except HTTPException:
         raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Cardano on-chain error: {str(exc)}")
 
@@ -245,12 +285,12 @@ async def withdraw_from_master_wallet(
         "_id": f"TRADE_{uuid.uuid4().hex[:8].upper()}",
         "direction": "off",
         "channel": "Cardano Master Wallet",
-        "fromAsset": "USDA",
-        "toAsset": "USDA",
+        "fromAsset": asset,
+        "toAsset": asset,
         "fromAmount": withdraw_amount,
-        "toAmount": max(0.0, withdraw_amount - 0.17),
+        "toAmount": to_amount,
         "rate": 1.0,
-        "fee": 0.17,
+        "fee": fee_amount,
         "counterparty": body.counterparty or dest_address[:15] + "…" + dest_address[-6:],
         "status": "COMPLETED",
         "cardanoTxHash": tx_hash,
@@ -263,11 +303,15 @@ async def withdraw_from_master_wallet(
 
     return {
         "tx_hash": tx_hash,
+        "asset": asset,
         "amount_sent": withdraw_amount,
+        "fee": fee_amount,
+        "fee_asset": "ADA" if asset == "ADA" else "USDA",
         "status": "COMPLETED",
         "source": "master_wallet",
-        "message": f"Successfully sent {withdraw_amount} USDA to {dest_address[:10]}…",
+        "message": f"Successfully sent {withdraw_amount} {asset} to {dest_address[:10]}…",
     }
+
     
     
 @router.post("/on-ramp/verify", status_code=201)

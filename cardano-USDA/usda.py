@@ -32,20 +32,29 @@ def _from_usda(amount: float) -> int:
 
 def get_balance(address: str) -> dict:
     """Return ADA (in ADA) and USDA balance for an address."""
+    from blockfrost.utils import ApiError
+
     api = get_blockfrost_api()
     asset_id = _usda_asset_id()
-
     try:
         addr_info = api.address(address)
-        ada_lovelace = int(addr_info.amount[0].quantity) if addr_info.amount else 0
-        usda_raw = 0
-        for a in addr_info.amount:
-            if a.unit == asset_id:
-                usda_raw = int(a.quantity)
-                break
-    except Exception:
-        ada_lovelace = 0
-        usda_raw = 0
+    except ApiError as exc:
+        if exc.status_code != 404:
+            raise
+        return {
+            "address": address,
+            "ada": 0.0,
+            "usda": 0.0,
+            "usda_raw": 0,
+        }
+
+    ada_lovelace = 0
+    usda_raw = 0
+    for asset in addr_info.amount:
+        if asset.unit == "lovelace":
+            ada_lovelace = int(asset.quantity)
+        elif asset.unit == asset_id:
+            usda_raw = int(asset.quantity)
 
     return {
         "address": address,
@@ -139,56 +148,119 @@ def verify_deposit(tx_hash: str, expected_address: str) -> dict:
     }
 
 # ── withdrawal (off-ramp) ─────────────────────────────────────────────────────
+from decimal import Decimal
 
-def send_usda(wallet: CardanoWallet, to_address_str: str, amount: float) -> str:
-    """
-    Build, sign, and submit a USDA transfer from the workspace hot wallet.
-    Returns the transaction hash.
-    """
-    try:
-        from pycardano import (
-            TransactionBuilder,
-            TransactionOutput,
-            Address,
-            Value,
-            MultiAsset,
-            Asset,
-            AssetName,
-            ScriptHash,
-        )
-    except ImportError:
-        raise RuntimeError("pycardano is not installed. Run: pip install pycardano")
 
+
+def send_ada(
+    wallet: CardanoWallet,
+    to_address_str: str,
+    amount: float,
+    available_lovelace: int | None = None,
+) -> dict:
+    """Build, sign, and submit an ADA transfer. Amount excludes the network fee."""
+    from pycardano import Address, TransactionBuilder, TransactionOutput, Value, min_lovelace
+
+    ada_amount = Decimal(str(amount))
+    lovelace_decimal = ada_amount * Decimal(1_000_000)
+    if ada_amount <= 0 or lovelace_decimal != lovelace_decimal.to_integral_value():
+        raise ValueError("ADA amount must be positive and have at most 6 decimal places")
+
+    lovelace = int(lovelace_decimal)
     context = get_chain_context()
-    to_address = Address.from_primitive(to_address_str)
-    usda_amount = _from_usda(amount)
-
-    policy_bytes = bytes.fromhex(settings.usda_policy_id)
-    asset_name_bytes = bytes.fromhex(settings.usda_asset_name_hex)
-
-    script_hash = ScriptHash(policy_bytes)
-    asset_name = AssetName(asset_name_bytes)
-
-    multi_asset = MultiAsset()
-    multi_asset[script_hash] = Asset()
-    multi_asset[script_hash][asset_name] = usda_amount
-
-    value = Value(
-        coin=settings.cardano_min_utxo_lovelace,
-        multi_asset=multi_asset,
-    )
+    recipient = Address.from_primitive(to_address_str)
+    output = TransactionOutput(recipient, Value(coin=lovelace))
+    minimum_lovelace = min_lovelace(context, output=output)
+    if lovelace < minimum_lovelace:
+        minimum_ada = minimum_lovelace / 1_000_000
+        raise ValueError(
+            f"ADA withdrawal is below the minimum output for this address. "
+            f"Send at least {minimum_ada:.6f} ADA."
+        )
 
     builder = TransactionBuilder(context)
     builder.add_input_address(wallet.address)
-    builder.add_output(TransactionOutput(to_address, value))
+    builder.add_output(output)
 
     signed_tx = builder.build_and_sign(
         signing_keys=[wallet.signing_key],
         change_address=wallet.address,
     )
 
+    fee_lovelace = int(signed_tx.transaction_body.fee)
+    if available_lovelace is not None and lovelace + fee_lovelace > available_lovelace:
+        required_ada = (lovelace + fee_lovelace) / 1_000_000
+        available_ada = available_lovelace / 1_000_000
+        raise ValueError(
+            f"Insufficient master-wallet ADA to cover withdrawal and network fee. "
+            f"Required: {required_ada:.6f} ADA; available: {available_ada:.6f} ADA."
+        )
+
+    context.submit_tx(signed_tx.to_cbor())
+
+    return {
+        "tx_hash": str(signed_tx.id),
+        "fee_lovelace": fee_lovelace,
+    }
+
+
+def send_usda(wallet: CardanoWallet, to_address_str: str, amount: float) -> str:
+    """Build, sign, and submit a USDA transfer from the custodial wallet."""
+    try:
+        from pycardano import (
+            Address,
+            Asset,
+            AssetName,
+            LargestFirstSelector,
+            MultiAsset,
+            ScriptHash,
+            TransactionBuilder,
+            TransactionOutput,
+            UTxOSelectionException,
+            Value,
+        )
+    except ImportError as exc:
+        raise RuntimeError("pycardano is not installed. Run: pip install pycardano") from exc
+
+    context = get_chain_context()
+    recipient = Address.from_primitive(to_address_str)
+    usda_amount = _from_usda(amount)
+    script_hash = ScriptHash(bytes.fromhex(settings.usda_policy_id))
+    asset_name = AssetName(bytes.fromhex(settings.usda_asset_name_hex))
+
+    multi_asset = MultiAsset()
+    multi_asset[script_hash] = Asset({asset_name: usda_amount})
+    output_value = Value(
+        coin=settings.cardano_min_utxo_lovelace,
+        multi_asset=multi_asset,
+    )
+
+    output = TransactionOutput(recipient, output_value)
+    try:
+        selected_utxos, _ = LargestFirstSelector().select(
+            context.utxos(wallet.address),
+            [output],
+            context,
+            include_max_fee=False,
+        )
+    except UTxOSelectionException as exc:
+        raise ValueError(
+            "Master-wallet spendable UTxOs cannot cover the USDA amount, "
+            "minimum ADA output, network fee, and required change."
+        ) from exc
+
+    builder = TransactionBuilder(context)
+    for utxo in selected_utxos:
+        builder.add_input(utxo)
+    builder.add_input_address(wallet.address)
+    builder.add_output(output)
+    signed_tx = builder.build_and_sign(
+        signing_keys=[wallet.signing_key],
+        change_address=wallet.address,
+    )
     context.submit_tx(signed_tx.to_cbor())
     return str(signed_tx.id)
+
 
 
 def estimate_usda_fee(wallet: CardanoWallet, to_address_str: str, amount: float) -> int:

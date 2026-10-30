@@ -9,6 +9,8 @@ from web3.middleware import ExtraDataToPOAMiddleware
 from dotenv import load_dotenv
 from eth_account import Account
 
+from celo_nonce import reserve_treasury_nonce
+
 
 # load environment variables from .env file
 load_dotenv()
@@ -102,7 +104,7 @@ class CorridorIntegrations:
         amount_base_units = int(amount_usd * (10 ** decimals))
 
         # 4. Get the latest Nonce (Transaction count) to prevent replay attacks
-        nonce = self.w3.eth.get_transaction_count(account.address)
+        nonce = reserve_treasury_nonce(self.w3, account.address)
 
         print(f"   ↳ Building Smart Contract Payload...")
 

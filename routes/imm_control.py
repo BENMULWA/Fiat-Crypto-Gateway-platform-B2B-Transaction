@@ -15,8 +15,15 @@ from Brain_Engine.node_registry import (
 )
 from Brain_Engine.state_engine import ImmutableLedger
 from database import get_db, get_imm_switches_col
+from routes.auth import get_current_user_with_role, is_admin_role
+from admin_audit import log_admin_action
 
 router = APIRouter(prefix="/api/imm", tags=["Internal Market Maker Control"])
+
+
+def _ensure_admin(current_user: dict):
+    if not is_admin_role(current_user.get("role")):
+        raise HTTPException(status_code=403, detail="Admin role required")
 
 
 class ToggleRequest(BaseModel):
@@ -36,8 +43,9 @@ async def _persist_switch(kind: str, entity_id: str, enabled: bool) -> None:
 
 
 @router.get("/nodes")
-async def list_nodes():
+async def list_nodes(current_user=Depends(get_current_user_with_role)):
     """Admin view of every node (N1-N10) and whether it's currently enabled."""
+    _ensure_admin(current_user)
     return [
         {
             "id": node.id,
@@ -52,19 +60,27 @@ async def list_nodes():
 
 
 @router.post("/nodes/{node_id}/enabled")
-async def toggle_node(node_id: str, body: ToggleRequest):
+async def toggle_node(
+    node_id: str,
+    body: ToggleRequest,
+    db=Depends(get_db),
+    current_user=Depends(get_current_user_with_role),
+):
     """Admin pulls a node in/out of service without touching the registry."""
+    _ensure_admin(current_user)
     try:
         set_node_enabled(node_id, body.enabled)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     await _persist_switch("node", node_id, body.enabled)
+    await log_admin_action(db, current_user, "imm_node_toggled", nodeId=node_id, enabled=body.enabled)
     return {"status": "success", "nodeId": node_id, "enabled": body.enabled}
 
 
 @router.get("/corridors")
-async def list_corridors():
+async def list_corridors(current_user=Depends(get_current_user_with_role)):
     """Admin view of every IMM rollover strategy and whether it's eligible to run."""
+    _ensure_admin(current_user)
     return [
         {
             "id": corridor_id,
@@ -77,18 +93,25 @@ async def list_corridors():
 
 
 @router.post("/corridors/{corridor_id}/enabled")
-async def toggle_corridor(corridor_id: str, body: ToggleRequest):
+async def toggle_corridor(
+    corridor_id: str,
+    body: ToggleRequest,
+    db=Depends(get_db),
+    current_user=Depends(get_current_user_with_role),
+):
     """Admin parks/resumes a whole strategy (e.g. disable TELKOM, keep AIRTEL_LIVE)."""
+    _ensure_admin(current_user)
     try:
         set_corridor_enabled(corridor_id, body.enabled)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     await _persist_switch("corridor", corridor_id, body.enabled)
+    await log_admin_action(db, current_user, "imm_corridor_toggled", corridorId=corridor_id, enabled=body.enabled)
     return {"status": "success", "corridorId": corridor_id, "enabled": body.enabled}
 
 
 @router.get("/health")
-async def get_node_health(db=Depends(get_db)):
+async def get_node_health(db=Depends(get_db), current_user=Depends(get_current_user_with_role)):
     """Read-only node health report — same spirit as Comet IMM's
     rebalance/check: it tells you which nodes have breached their floor or
     exposure cap, it never moves anything on its own. Every balance here is
@@ -97,6 +120,7 @@ async def get_node_health(db=Depends(get_db)):
     A node with no entry in NODE_LEDGER_ASSET (N8, N10 today) has never
     been credited/debited by any code path — reported with
     balance: null, not a fabricated 0."""
+    _ensure_admin(current_user)
     ledger = ImmutableLedger(db_collection=db["transactions"])
 
     nodes_report = []

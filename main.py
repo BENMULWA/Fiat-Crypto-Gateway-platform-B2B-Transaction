@@ -55,7 +55,8 @@ from routes import (
     cardano, treasury, retail, otc_admin, otc_merchant, swap_engine, valora, stellar,
     imm_control, base_rate, impala_float, imc_receipts, imc_booking, holdings
 )
-from routes import realtime
+from routes import realtime, admin_audit_view
+from routes import cards as cards_routes
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -69,6 +70,7 @@ async def lifespan(app: FastAPI):
     airtel_timeout_task = None
     celo_watcher_task = None
     celo_watcher_stop = None
+    card_settle_task = None
     imc_watcher_task = None
     imc_watcher_stop = None
     cardano_watcher_task = None
@@ -160,9 +162,42 @@ async def lifespan(app: FastAPI):
             timeout_minutes = max(5, int(os.getenv("AIRTEL_PENDING_TIMEOUT_MINUTES", "15")))
             while True:
                 cutoff = datetime.utcnow() - timedelta(minutes=timeout_minutes)
+
+                # Withdrawals (direction "off") have ALREADY been debited. Marking
+                # one "failed" here without refunding strands the customer's money
+                # (and would hide a payout that actually went out). So never
+                # auto-fail them: flag for human review, leave the status alone so
+                # a late provider callback can still settle (pay out / refund) it.
                 await db["ramp_entries"].update_many(
                     {
                         "channel": "Mobile Money",
+                        "direction": "off",
+                        "status": {"$in": ["pending", "processing"]},
+                        "providerReference": {"$exists": True, "$ne": ""},
+                        "createdAt": {"$lte": cutoff},
+                        "needsReview": {"$ne": True},
+                    },
+                    {
+                        "$set": {
+                            "needsReview": True,
+                            "providerStatus": "NO_CALLBACK_TIMEOUT",
+                            "updatedAt": datetime.utcnow(),
+                        },
+                        "$push": {
+                            "statusHistory": {
+                                "state": "processing",
+                                "at": datetime.utcnow(),
+                                "source": "no_callback_flagged_for_review",
+                            }
+                        },
+                    },
+                )
+
+                # Deposits (direction "on") moved no money yet, so expiring them is safe.
+                await db["ramp_entries"].update_many(
+                    {
+                        "channel": "Mobile Money",
+                        "direction": {"$ne": "off"},
                         "status": {"$in": ["pending", "processing"]},
                         "providerReference": {"$exists": True, "$ne": ""},
                         "createdAt": {"$lte": cutoff},
@@ -186,6 +221,19 @@ async def lifespan(app: FastAPI):
                 await asyncio.sleep(60)
 
         airtel_timeout_task = asyncio.create_task(expire_silent_airtel_entries())
+
+        # Virtual cards: read back every charge still holding wallet money (webhook safety net).
+        async def settle_card_operations():
+            from services import card_ops
+            while True:
+                await asyncio.sleep(60)
+                try:
+                    if card_ops.enabled():
+                        await card_ops.settle_open_operations(db)
+                except Exception as exc:  # never let one bad pass stop the loop
+                    print(f"⚠ card settlement pass failed: {exc}")
+
+        card_settle_task = asyncio.create_task(settle_card_operations())
 
         # Comet's KES/IMC IMM rate. IMC is pegged 1 IMC = 1 USD, NOT 1:1 to
         # KES — this used to call set_imm_rate("KES", "IMC", 1.0), a literal
@@ -271,6 +319,13 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
 
+    if card_settle_task:
+        card_settle_task.cancel()
+        try:
+            await card_settle_task
+        except asyncio.CancelledError:
+            pass
+
     if comet_rate_task:
         comet_rate_task.cancel()
         try:
@@ -313,6 +368,8 @@ app.include_router(holdings.router)
 app.include_router(trade.router)
 app.include_router(ramp.router)
 app.include_router(ramp.callback_router)
+app.include_router(cards_routes.router)
+app.include_router(cards_routes.webhook_router)
 app.include_router(realtime.router)
 app.include_router(airtime_ledger.router)
 app.include_router(general_ledger.router)
@@ -322,6 +379,7 @@ app.include_router(cardano.router)
 app.include_router(treasury.router)
 app.include_router(retail.router)
 app.include_router(otc_admin.router)
+app.include_router(admin_audit_view.router)
 app.include_router(otc_merchant.router)
 app.include_router(swap_engine.router)
 app.include_router(valora.router)
