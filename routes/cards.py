@@ -94,6 +94,7 @@ async def card_status(user: dict = Depends(get_current_user), db=Depends(get_db)
                 "approved": (profile or {}).get("kycStatus") == ops.KYC_APPROVED,
                 "reason": (profile or {}).get("kycReason")},
         "cards": [{"cardNo": c.get("card_no"), "status": c.get("status"), "createdAt": c.get("created_at")} for c in cards],
+        "holderName": await ops.holder_name(db, user_id, profile) if cards else None,
         "operations": recent,
         "limits": {"minUsd": str(low), "maxUsd": str(high), "marginPct": str(ops.margin_pct())},
         "cardTypeId": ops.card_type_id(),

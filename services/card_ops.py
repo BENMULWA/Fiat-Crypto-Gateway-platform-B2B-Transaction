@@ -158,7 +158,8 @@ async def submit_kyc(db, user: dict, details: dict, files: dict, idempotency_key
     await db[PROFILES].update_one(
         {"_id": user_id},
         {"$set": {"holderId": holder_id, "kycStatus": data.get("status") or "wait_audit", "kycReason": None,
-                  "cardTypeId": payload["cardTypeId"], "updatedAt": now, "kycCheckedAt": now},
+                  "cardTypeId": payload["cardTypeId"], "holderName": f"{first} {last}".strip(),
+                  "updatedAt": now, "kycCheckedAt": now},
          "$setOnInsert": {"createdAt": now}},
         upsert=True)
     await notify(user_id, "kyc_submitted")
@@ -284,6 +285,22 @@ async def start_operation(db, user_id: str, kind: str, usd: Decimal, idempotency
     await _set(db, op_id, status=SUBMITTED, partnerRef=reference, cardNo=card or card_no)
     op = await db[OPS].find_one({"_id": op_id})
     return await apply_result(db, op, res.get("status", "PENDING"), reference, card)
+
+
+async def holder_name(db, user_id: str, profile: Optional[dict]) -> Optional[str]:
+    """The name printed on the card: as submitted for KYC (it matches the ID). Profiles from before it was
+    stored are filled once from the name Mamlaka holds for the customer."""
+    if not profile:
+        return None
+    if profile.get("holderName"):
+        return profile["holderName"]
+    try:
+        name = ((await partner.get_customer(user_id)) or {}).get("fullName")
+    except (partner.MamlakaCardsError, partner.MamlakaCardsUnavailable):
+        return None
+    if name:
+        await db[PROFILES].update_one({"_id": user_id}, {"$set": {"holderName": name}})
+    return name
 
 
 async def settle(db, op: dict, force: bool = False) -> dict:

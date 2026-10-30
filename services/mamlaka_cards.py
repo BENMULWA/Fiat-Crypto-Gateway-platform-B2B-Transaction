@@ -80,6 +80,10 @@ async def ensure_customer(external_id: str, full_name: str, email: str, phone: s
         "externalId": external_id, "fullName": full_name, "email": email, "phone": phone})
 
 
+async def get_customer(external_id: str) -> dict:
+    return await _request("GET", f"/customers/{external_id}")
+
+
 async def upload_document(external_id: str, kind: str, filename: str, content: bytes, content_type: str) -> dict:
     return await _request("POST", f"/customers/{external_id}/kyc/documents", data={"kind": kind},
                           files={"file": (filename, content, content_type)}, timeout=60.0)
